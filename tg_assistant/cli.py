@@ -802,6 +802,42 @@ def _example_config() -> AccountConfig:
     )
 
 
+# --------------------------------------------------------------------------- #
+# web
+# --------------------------------------------------------------------------- #
+@cli.command("web")
+@click.option("--host", default="0.0.0.0", help="监听地址")
+@click.option("--port", "-p", default=8080, type=int, help="监听端口")
+@click.option("--log-level", "-l", default=None, help="日志级别")
+@click.option("--secret", "-s", default=None, help="Web 鉴权密钥（留空不校验）")
+@pass_ctx
+def web_cmd(
+    ctx: Context,
+    host: str,
+    port: int,
+    log_level: str | None,
+    secret: str | None,
+) -> None:
+    """启动 Web 控制台（FastAPI + WebSocket）。"""
+    import uvicorn
+
+    from tg_assistant.web import create_app
+
+    app = create_app(
+        data_dir=ctx.paths.data_dir,
+        api_id=ctx.settings.api_id,
+        api_hash=ctx.settings.api_hash,
+        proxy_url=ctx.settings.proxy.to_url() if ctx.settings.proxy else None,
+        log_level=log_level or ctx.settings.log_level,
+    )
+    if secret:
+        app.state.web_settings.secret_key = secret
+
+    click.secho(f"🌐 Web 控制台启动：http://{host}:{port}", fg="cyan")
+    click.secho(f"   数据目录：{ctx.paths.data_dir}", fg="cyan")
+    uvicorn.run(app, host=host, port=port, log_level=(log_level or ctx.settings.log_level).lower())
+
+
 def main() -> None:
     cli()
 

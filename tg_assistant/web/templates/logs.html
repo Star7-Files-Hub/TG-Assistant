@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}实时日志 · TG-Assistant{% endblock %}
+
+{% block content %}
+<h1>实时日志</h1>
+
+<section class="card">
+    <div class="row">
+        <span class="muted">自动滚动</span>
+        <label><input type="checkbox" id="autoscroll" checked /></label>
+        <span class="muted">过滤级别：</span>
+        <select id="log-level">
+            <option value="">全部</option>
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO">INFO</option>
+            <option value="WARNING">WARNING</option>
+            <option value="ERROR">ERROR</option>
+        </select>
+        <button class="btn btn-sm" onclick="clearLogs()">清空</button>
+    </div>
+    <div id="log-full" class="log-box log-box-full"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const logBox = document.getElementById('log-full');
+    function appendLog(log) {
+        const level = document.getElementById('log-level').value;
+        if (level && log.level !== level) return;
+        const div = document.createElement('div');
+        div.className = 'log-line log-' + (log.level || 'info').toLowerCase();
+        div.textContent = `[${log.time}] [${log.account || '-'}] [${log.level}] ${log.msg}`;
+        logBox.appendChild(div);
+        if (logBox.children.length > 1000) logBox.removeChild(logBox.firstChild);
+        if (document.getElementById('autoscroll').checked) {
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+    }
+    function clearLogs() { logBox.innerHTML = ''; }
+    connectLogWs(appendLog);
+</script>
+{% endblock %}

@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}扫码登录 · TG-Assistant{% endblock %}
+
+{% block content %}
+<h1>扫码登录</h1>
+
+<section class="card">
+    <h2>新账号登录</h2>
+    <div class="form-row">
+        <label>账号名</label>
+        <input id="login-account" type="text" placeholder="如 main、alt1" />
+    </div>
+    <div class="form-row">
+        <label>代理（可选，覆盖全局）</label>
+        <input id="login-proxy" type="text" placeholder="socks5://127.0.0.1:1080" />
+    </div>
+    <div class="form-row">
+        <label>
+            <input id="login-force" type="checkbox" /> 强制重新登录（即使已有会话）
+        </label>
+    </div>
+    <button class="btn btn-primary" onclick="startLogin()">📱 获取二维码</button>
+</section>
+
+<section class="card" id="qr-section" style="display:none;">
+    <h2>扫描二维码</h2>
+    <div id="qr-status" class="muted">正在连接...</div>
+    <div class="qr-container">
+        <pre id="qr-ascii" class="qr-ascii"></pre>
+    </div>
+    <div id="qr-result"></div>
+</section>
+
+<section class="card">
+    <h2>已登录账号</h2>
+    <div id="account-list">加载中...</div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let ws = null;
+
+    async function startLogin() {
+        const account = document.getElementById('login-account').value.trim();
+        if (!account) { toast('请输入账号名', false); return; }
+        const proxy = document.getElementById('login-proxy').value.trim();
+        const force = document.getElementById('login-force').checked;
+
+        const resp = await fetch('/api/accounts/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams({account, proxy, force: force ? 'true' : 'false'}),
+        });
+        const data = await resp.json();
+        if (!data.ok) { toast(data.detail || '登录失败', false); return; }
+
+        document.getElementById('qr-section').style.display = 'block';
+        document.getElementById('qr-status').textContent = '正在连接...';
+
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}${data.ws_url}`);
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'qr') {
+                document.getElementById('qr-ascii').textContent = msg.ascii;
+                document.getElementById('qr-status').textContent = `二维码有效期 ${msg.expires_in} 秒，请用 Telegram 扫描`;
+            } else if (msg.type === 'status') {
+                document.getElementById('qr-status').textContent = msg.message;
+            } else if (msg.type === 'done') {
+                document.getElementById('qr-status').textContent = '';
+                document.getElementById('qr-result').innerHTML = `<span class="badge badge-green">✓ 登录成功：${msg.display_name || ''} @${msg.username || ''} (id=${msg.user_id})</span>`;
+                loadAccounts();
+            } else if (msg.type === 'error') {
+                document.getElementById('qr-status').textContent = '';
+                document.getElementById('qr-result').innerHTML = `<span class="badge badge-red">✗ ${msg.message}</span>`;
+            }
+        };
+    }
+
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const div = document.getElementById('account-list');
+        if (!data.accounts.length) {
+            div.innerHTML = '<span class="muted">还没有账号</span>';
+            return;
+        }
+        div.innerHTML = data.accounts.map(a => `
+            <div class="account-item">
+                <strong>${a.name}</strong>
+                <span class="muted">${a.user || ''}</span>
+                <span class="badge ${a.session_exists ? 'badge-green' : 'badge-red'}">${a.session_exists ? '已登录' : '未登录'}</span>
+                <a href="/config/${a.name}" class="btn btn-sm">配置</a>
+            </div>
+        `).join('');
+    }
+    loadAccounts();
+</script>
+{% endblock %}

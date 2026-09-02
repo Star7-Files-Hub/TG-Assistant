@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}TG-Assistant{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <nav class="topbar">
+        <div class="brand">🤖 TG-Assistant</div>
+        <div class="nav-links">
+            <a href="/" class="{% if page == 'dashboard' %}active{% endif %}">仪表盘</a>
+            <a href="/login" class="{% if page == 'login' %}active{% endif %}">扫码登录</a>
+            <a href="/accounts" class="{% if page == 'accounts' %}active{% endif %}">账号管理</a>
+            <a href="/logs" class="{% if page == 'logs' %}active{% endif %}">实时日志</a>
+            <a href="/proxy" class="{% if page == 'proxy' %}active{% endif %}">代理检查</a>
+        </div>
+        <div class="nav-status">
+            <span id="run-status" class="badge">● 未运行</span>
+        </div>
+    </nav>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="toast" class="toast-hidden"></div>
+
+    <script src="/static/js/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

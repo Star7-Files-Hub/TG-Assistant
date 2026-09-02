@@ -25,7 +25,27 @@ Telegram 限制单账号最多加入 **500 个群+频道**。当你需要监听/
 
 ## 快速开始
 
-### Docker 部署（推荐）
+### Web 界面（推荐）
+
+```bash
+# 安装依赖
+pip install -e ".[speed]"
+
+# 启动 Web 控制台
+tg-assistant web --port 8080
+# 打开 http://localhost:8080
+```
+
+Web 界面包含所有 CLI 功能：
+- 📱 **扫码登录**：WebSocket 实时显示二维码
+- 📊 **仪表盘**：账号状态、运行控制、实时日志
+- 👥 **账号管理**：添加/删除/启用/禁用/设置代理
+- ⚙️ **配置编辑**：在线编辑 JSON 配置，实时校验
+- 📋 **实时日志**：WebSocket 流式日志，按级别过滤
+- 🔍 **代理检查**：一键诊断代理连通性
+- 💬 **通知测试**：发送测试通知验证配置
+
+### Docker 部署
 
 ```bash
 git clone https://github.com/Star7-Files-Hub/TG-Assistant.git
@@ -119,6 +139,7 @@ tg-assistant run
 ## 命令速查
 
 ```bash
+tg-assistant web --port 8080         # 启动 Web 控制台
 tg-assistant login -a main              # 扫码登录
 tg-assistant accounts list              # 查看账号
 tg-assistant config init -a main --example   # 生成配置模板

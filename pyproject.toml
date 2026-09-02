@@ -32,6 +32,12 @@ dependencies = [
     "PyYAML>=6,<7",
     # SOCKS5 支持；上限跟随 kurigram 的约束，避免解析冲突
     "python-socks[asyncio]>=2.4,<=2.8.1",
+    # Web 界面
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "jinja2>=3.1,<4",
+    "python-multipart>=0.0.9",
+    "aiofiles>=23.2,<24",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +49,7 @@ dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+    "httpx>=0.27",  # 用于测试 FastAPI
 ]
 
 [project.urls]
@@ -54,7 +61,7 @@ tg-assistant = "tg_assistant.cli:main"
 tga = "tg_assistant.cli:main"
 
 [tool.setuptools]
-packages = ["tg_assistant"]
+packages = ["tg_assistant", "tg_assistant.web", "tg_assistant.web.routers"]
 
 [tool.setuptools.package-data]
 tg_assistant = ["py.typed"]

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ account.name }} · 会话列表{% endblock %}
+
+{% block content %}
+<h1>账号：{{ account.name }} — 会话列表</h1>
+
+<section class="card">
+    <h2>会话（用于找 chat_id）</h2>
+    <div class="form-row">
+        <input id="chat-keyword" type="text" placeholder="按标题/用户名过滤" oninput="filterChats()" />
+    </div>
+    <table id="chat-table">
+        <thead>
+            <tr>
+                <th>chat_id</th>
+                <th>类型</th>
+                <th>名称</th>
+                <th>用户名</th>
+            </tr>
+        </thead>
+        <tbody id="chat-rows">
+            <tr><td colspan="4" class="muted">加载中...</td></tr>
+        </tbody>
+    </table>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const ACCOUNT = "{{ account.name }}";
+    let allChats = [];
+    async function loadChats() {
+        const res = await fetch(`/api/chats/${ACCOUNT}`);
+        const data = await res.json();
+        if (!res.ok) {
+            document.getElementById('chat-rows').innerHTML = `<tr><td colspan="4" class="muted">加载失败：${data.detail || ''}</td></tr>`;
+            return;
+        }
+        allChats = data.chats || [];
+        renderChats();
+    }
+    function renderChats() {
+        const keyword = (document.getElementById('chat-keyword')?.value || '').toLowerCase();
+        const rows = allChats.filter(c => !keyword || `${c.title} ${c.username || ''}`.toLowerCase().includes(keyword));
+        const tbody = document.getElementById('chat-rows');
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="muted">没有匹配的会话</td></tr>';
+            return;
+        }
+        tbody.innerHTML = rows.map(c => `
+            <tr>
+                <td><code>${c.chat_id}</code></td>
+                <td>${c.type}</td>
+                <td>${c.title}</td>
+                <td>${c.username || '-'}</td>
+            </tr>
+        `).join('');
+    }
+    function filterChats() { renderChats(); }
+    loadChats();
+</script>
+{% endblock %}

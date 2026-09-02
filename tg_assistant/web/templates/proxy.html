@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}代理检查 · TG-Assistant{% endblock %}
+
+{% block content %}
+<h1>代理检查</h1>
+
+<section class="card">
+    <h2>诊断代理到 Telegram 的连通性</h2>
+    <div class="form-row">
+        <label>代理地址</label>
+        <input id="proxy-url" type="text" placeholder="socks5://127.0.0.1:1080" />
+    </div>
+    <div class="form-row">
+        <label>超时（秒）</label>
+        <input id="proxy-timeout" type="number" value="8" min="1" max="30" />
+    </div>
+    <button class="btn btn-primary" onclick="checkProxy()">🔍 检测</button>
+    <div id="proxy-result" class="report-box"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    async function checkProxy() {
+        const proxy = document.getElementById('proxy-url').value.trim();
+        const timeout = document.getElementById('proxy-timeout').value;
+        const box = document.getElementById('proxy-result');
+        box.innerHTML = '<span class="muted">检测中...</span>';
+        const res = await fetch('/api/proxy/check', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({proxy, timeout: parseFloat(timeout)}),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            box.innerHTML = `<span class="badge badge-red">✗ ${data.detail || '请求失败'}</span>`;
+            return;
+        }
+        const lines = (data.report || '').split('\n');
+        box.innerHTML = lines.map(l => {
+            if (l.includes('[OK]')) return `<div class="log-line log-success">✓ ${l}</div>`;
+            if (l.includes('[FAIL]')) return `<div class="log-line log-error">✗ ${l}</div>`;
+            return `<div class="log-line">${l}</div>`;
+        }).join('');
+    }
+</script>
+{% endblock %}

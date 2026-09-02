@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}账号管理 · TG-Assistant{% endblock %}
+
+{% block content %}
+<h1>账号管理</h1>
+
+<section class="card">
+    <h2>全部账号</h2>
+    <table id="account-table">
+        <thead>
+            <tr>
+                <th>账号</th>
+                <th>身份</th>
+                <th>状态</th>
+                <th>代理</th>
+                <th>最后登录</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody id="account-rows">
+            <tr><td colspan="6" class="muted">加载中...</td></tr>
+        </tbody>
+    </table>
+    <div class="row" style="margin-top:12px;">
+        <a href="/login" class="btn btn-primary">+ 扫码登录新账号</a>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const tbody = document.getElementById('account-rows');
+        if (!data.accounts.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="muted">还没有账号。<a href="/login">扫码登录</a></td></tr>';
+            return;
+        }
+        tbody.innerHTML = data.accounts.map(a => `
+            <tr>
+                <td><strong>${a.name}</strong></td>
+                <td>${a.user || '-'}</td>
+                <td>
+                    <span class="badge ${a.running ? 'badge-green' : (a.session_exists ? '' : 'badge-red')}">
+                        ${a.running ? '运行中' : (a.session_exists ? '已登录' : '未登录')}
+                    </span>
+                </td>
+                <td>${a.proxy || '直连'}</td>
+                <td>${a.last_login || '-'}</td>
+                <td>
+                    <button class="btn btn-sm" onclick="toggleEnable('${a.name}', ${!a.enabled})">${a.enabled ? '停用' : '启用'}</button>
+                    <a href="/config/${a.name}" class="btn btn-sm">配置</a>
+                    <button class="btn btn-sm btn-danger" onclick="deleteAccount('${a.name}')">删除</button>
+                </td>
+            </tr>
+        `).join('');
+    }
+    async function toggleEnable(name, enabled) {
+        const res = await fetch(`/api/accounts/${name}/${enabled ? 'enable' : 'disable'}`, {method: 'POST'});
+        const data = await res.json();
+        toast(data.ok ? (enabled ? '已启用' : '已停用') : '操作失败', data.ok);
+        loadAccounts();
+    }
+    async function deleteAccount(name) {
+        if (!confirm(`确定删除账号 ${name}？`)) return;
+        const purge = confirm('同时删除该账号的全部数据（会话、配置）？');
+        const res = await fetch(`/api/accounts/${name}?purge=${purge}`, {method: 'DELETE'});
+        const data = await res.json();
+        toast(data.ok ? '已删除' : '删除失败', data.ok);
+        loadAccounts();
+    }
+    loadAccounts();
+</script>
+{% endblock %}

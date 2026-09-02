@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ account.name }} · 配置{% endblock %}
+
+{% block content %}
+<h1>账号：{{ account.name }}</h1>
+
+<section class="card">
+    <h2>配置编辑</h2>
+    <div class="row">
+        <button class="btn btn-primary" onclick="saveConfig()">💾 保存</button>
+        <button class="btn" onclick="validateConfig()">✓ 校验</button>
+        <button class="btn" onclick="loadExample()">📋 加载示例</button>
+        <span id="save-status" class="muted"></span>
+    </div>
+    <textarea id="config-editor" class="code-editor"></textarea>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const ACCOUNT = "{{ account.name }}";
+    async function loadConfig() {
+        const res = await fetch(`/api/config/${ACCOUNT}`);
+        const data = await res.json();
+        document.getElementById('config-editor').textContent = JSON.stringify(data, null, 2);
+    }
+    async function saveConfig() {
+        let cfg;
+        try {
+            cfg = JSON.parse(document.getElementById('config-editor').textContent);
+        } catch (e) {
+            toast('JSON 格式错误：' + e.message, false);
+            return;
+        }
+        const res = await fetch(`/api/config/${ACCOUNT}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(cfg),
+        });
+        const data = await res.json();
+        document.getElementById('save-status').textContent = data.ok ? '✓ 保存成功' : `✗ ${data.detail || '失败'}`;
+        toast(data.ok ? '保存成功' : '保存失败', data.ok);
+    }
+    async function validateConfig() {
+        let cfg;
+        try {
+            cfg = JSON.parse(document.getElementById('config-editor').textContent);
+        } catch (e) {
+            toast('JSON 格式错误：' + e.message, false);
+            return;
+        }
+        const res = await fetch(`/api/config/${ACCOUNT}/validate`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(cfg),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            toast(`✓ 配置合法（监听 ${data.source_count} 个会话）`, true);
+        } else {
+            toast(`✗ ${data.detail}`, false);
+        }
+    }
+    async function loadExample() {
+        if (!confirm('加载示例配置将覆盖当前内容，确定？')) return;
+        const res = await fetch(`/api/config/${ACCOUNT}/init?example=true`, {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+            document.getElementById('config-editor').textContent = JSON.stringify(data.config, null, 2);
+            toast('已加载示例', true);
+        }
+    }
+    loadConfig();
+</script>
+{% endblock %}
