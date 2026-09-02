@@ -1,0 +1,34 @@
+services:
+  tg-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tg-assistant:latest
+    container_name: tg-assistant
+    restart: unless-stopped
+    # 让容器内能读到环境变量；敏感信息建议用 env_file
+    env_file:
+      - .env
+    environment:
+      - TGA_DATA_DIR=/app/data
+      # 下面这些会被 .env 覆盖；写在这里只是为了给出默认值
+      - TGA_LOG_LEVEL=INFO
+      - TGA_WORKERS=8
+      - TGA_SLEEP_THRESHOLD=30
+    volumes:
+      # 必须挂载：会话、配置、状态、日志全在里面
+      - ./data:/app/data
+    # 默认前台运行（CMD 即 `tg-assistant run`），docker logs 直接看
+    # 多账号：不传 --account 则运行全部启用的账号
+    # command: ["run", "-a", "main"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # 资源限制（按需调整）
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"

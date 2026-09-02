@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-assistant"
+version = "0.1.0"
+description = "多账号 Telegram 助手：扫码登录 / 秒级正则转发 / Bot 通知 / 自动抢红包"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Star7-Files-Hub" }]
+keywords = ["telegram", "pyrogram", "kurigram", "forward", "red-packet", "socks5"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: Chat",
+]
+
+dependencies = [
+    # kurigram 是仍在维护的 Pyrogram 分支，导入名仍是 pyrogram
+    "kurigram==2.2.25",
+    "pydantic>=2.5,<3",
+    "httpx[socks]>=0.27,<1",
+    "qrcode>=7.4,<9",
+    "click>=8.1,<9",
+    "PyYAML>=6,<7",
+    # SOCKS5 支持；上限跟随 kurigram 的约束，避免解析冲突
+    "python-socks[asyncio]>=2.4,<=2.8.1",
+]
+
+[project.optional-dependencies]
+# 加密加速：把 MTProto 的 AES-IGE 换成 C 实现，是"秒级"转发的前提。
+# 单独放进 extra 是因为它需要预编译 wheel，Python 3.13 目前还没有官方 wheel，
+# 缺失时 pyrogram 会自动回退到纯 Python 的 pyaes（能用，但明显更慢）。
+speed = ["TgCrypto-pyrofork==1.2.6"]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/Star7-Files-Hub/TG-Assistant"
+Issues = "https://github.com/Star7-Files-Hub/TG-Assistant/issues"
+
+[project.scripts]
+tg-assistant = "tg_assistant.cli:main"
+tga = "tg_assistant.cli:main"
+
+[tool.setuptools]
+packages = ["tg_assistant"]
+
+[tool.setuptools.package-data]
+tg_assistant = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # 行宽交给 formatter
+    "B008",   # click 的装饰器默认值
+    "SIM108", # 三元表达式并不总是更清晰
+    "SIM103", # 多条件判定写成逐条 early-return 更易读，也便于加注释
+    # 下面三条与 requires-python = ">=3.9" 冲突：
+    # pydantic v2 会在运行时求值注解字符串，py3.9 上 `int | None` 会直接抛
+    # TypeError，因此必须保留 typing.Optional / Union 写法。
+    "UP007",
+    "UP045",
+    "UP037",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
