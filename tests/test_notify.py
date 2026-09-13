@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
+import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from tg_assistant.config import NotifyConfig
@@ -23,11 +23,6 @@ def notify_config(**overrides) -> NotifyConfig:
     }
     base.update(overrides)
     return NotifyConfig.model_validate(base)
-
-
-import json
-
-import httpx
 
 
 class FakeResponse(httpx.Response):
@@ -72,7 +67,7 @@ class TestBuildNotifyText:
         assert text == "[-100123] hi"
 
     def test_missing_placeholder_kept(self):
-        config = notify_text = notify_config(template="{nope}")
+        config = notify_config(template="{nope}")
         assert build_notify_text(config, {}) == "{nope}"
 
     def test_includes_link_when_requested(self):

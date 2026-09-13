@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from tg_assistant.logging_setup import AccountLogger, get_logger
+from tg_assistant.logging_setup import get_logger
 
 log = get_logger("web.runtime")
+
+#: 停止账号时的优雅退出等待上限（秒），超过才强杀。
+STOP_TIMEOUT = 30.0
 
 
 @dataclass
@@ -141,33 +143,62 @@ class RuntimeManager:
             self._runner_task = asyncio.create_task(
                 self._supervise(names), name="web-runner"
             )
+            # 通知 /ws/status 订阅者：已开始运行。
+            self.push_event({"type": "status", "running": True, "accounts": names})
             return {"ok": True, "accounts": names}
 
     async def stop(self) -> dict[str, Any]:
+        """停止全部账号。
+
+        先请 MultiRunner 自己优雅退出（它要关 client、排空通知队列），
+        只有超时才强杀 —— 直接 cancel 会跳过它的清理逻辑，把 pyrogram client
+        和通知 worker 漏在后台，重新 start 时新旧 client 会争抢同一个 session 文件。
+        """
         async with self._lock:
-            if self._runner is not None:
-                self._runner.request_shutdown()
-            if self._runner_task is not None:
-                self._runner_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._runner_task
+            runner = self._runner
+            task = self._runner_task
             self._runner = None
             self._runner_task = None
-            self._shutdown_event.set()
-            return {"ok": True}
+
+        if runner is not None:
+            runner.request_shutdown()
+
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=STOP_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.warning("账号停止超时，已强制取消", timeout_s=STOP_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("账号停止过程中出现异常", error=str(exc))
+
+        self._shutdown_event.set()
+        # 通知 /ws/status 订阅者：已停止。
+        self.push_event({"type": "status", "running": False, "accounts": []})
+        return {"ok": True}
 
     async def _supervise(self, names: list[str]) -> None:
-        """在后台运行 MultiRunner，捕获异常。"""
+        """在后台运行 MultiRunner，捕获异常，并把结束状态广播出去。"""
         assert self._runner is not None
+        error: Optional[str] = None
         try:
             await self._runner.run(
                 names,
-                heartbeat=float(self.state.web_settings.log_history_size),
+                heartbeat=float(self.state.web_settings.heartbeat_interval),
+                # 信号由 uvicorn 接管，这里不能再抢注
+                install_signals=False,
             )
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            get_logger().exception("运行管理器异常退出", error=str(exc))
+            error = str(exc)
+            get_logger().exception("运行管理器异常退出", error=error)
+        finally:
+            # 正常退出和崩溃都要通知，否则前端会一直停在「运行中」。
+            self.push_event(
+                {"type": "runner", "running": False, "error": error, "accounts": names}
+            )
 
     def _running_accounts(self) -> set[str]:
         if self._runner is None:
@@ -226,10 +257,9 @@ class _BroadcastHandler(logging.Handler):
         self.callback = callback
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
+        # 日志系统不应因回调出错而中断（例如订阅队列已满）。
+        with contextlib.suppress(Exception):  # pragma: no cover
             self.callback(record)
-        except Exception:  # pragma: no cover - 日志系统不应因回调出错
-            pass
 
 
 __all__ = ["AccountRuntime", "RuntimeManager"]

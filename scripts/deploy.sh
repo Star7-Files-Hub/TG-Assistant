@@ -93,7 +93,7 @@ chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}"
 # ---------------- .env ----------------
 if [[ ! -f "${APP_DIR}/.env" ]]; then
     info "生成 .env 模板..."
-    cat > "${APP_DIR}/.env" <<'ENV'
+    cat > "${APP_DIR}/.env" <<ENV
 # ===== TG-Assistant 环境变量 =====
 # 从 https://my.telegram.org 获取
 TGA_API_ID=
@@ -104,6 +104,9 @@ TGA_API_HASH=
 
 # 通知 bot（可选）
 # TGA_BOT_TOKEN=
+
+# 数据目录：写成绝对路径，这样在任何目录下执行 CLI 都指向同一份数据
+TGA_DATA_DIR=${DATA_DIR}
 
 # 日志级别：DEBUG / INFO / WARNING / ERROR
 TGA_LOG_LEVEL=INFO
@@ -132,7 +135,10 @@ User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=-${APP_DIR}/.env
-ExecStart=${VENV_DIR}/bin/tini -- ${VENV_DIR}/bin/tg-assistant run
+# systemd 本身就是 init，不需要 tini 当 PID 1。
+# 注意：tini 由 apt 装在 /usr/bin，venv 里并没有 bin/tini，
+# 之前把 tini 写成 venv 下的路径会让 systemd 直接报 203/EXEC 起不来。
+ExecStart=${VENV_DIR}/bin/tg-assistant run
 Restart=always
 RestartSec=15
 StandardOutput=append:${LOG_DIR}/service.log
@@ -160,6 +166,7 @@ echo "  1. 编辑配置："
 echo "       nano ${APP_DIR}/.env"
 echo ""
 echo "  2. 扫码登录（会显示二维码，用 Telegram 扫）："
+echo "       cd ${APP_DIR}      # 重要：.env 是从当前目录加载的"
 echo "       sudo -u ${APP_USER} ${VENV_DIR}/bin/tg-assistant login -a main"
 echo ""
 echo "  3. 生成示例配置："

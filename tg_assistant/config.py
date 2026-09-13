@@ -18,6 +18,7 @@ import os
 import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
 from pydantic import (
@@ -729,6 +730,48 @@ class AccountRegistry(StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# .env 加载
+# --------------------------------------------------------------------------- #
+try:  # pragma: no cover - 依赖缺失时走下面的降级分支
+    from dotenv import load_dotenv as _load_dotenv
+except ImportError:  # pragma: no cover
+    _load_dotenv = None
+
+
+def load_env_file(path: Optional[Union[str, "os.PathLike[str]"]] = None) -> Optional[str]:
+    """加载 ``.env``，返回实际读取的文件路径；没读到则返回 ``None``。
+
+    查找顺序：显式 ``path`` → 环境变量 ``TGA_ENV_FILE`` → 当前工作目录下的 ``.env``。
+
+    **不覆盖已存在的环境变量**，与 docker compose 的 ``env_file`` / systemd 的
+    ``EnvironmentFile`` 语义保持一致，优先级为：
+    真实环境变量 > ``.env`` > 代码默认值。
+
+    这样做是为了 ``deploy.sh`` 里手工执行的 ``tg-assistant login`` /
+    ``config init``：它们不经过 systemd，读不到 ``EnvironmentFile``，
+    之前会直接报「缺少 api_id / api_hash」。
+    """
+    if path is not None:
+        candidate = Path(path).expanduser()
+    elif os.environ.get("TGA_ENV_FILE"):
+        candidate = Path(os.environ["TGA_ENV_FILE"]).expanduser()
+    else:
+        candidate = Path.cwd() / ".env"
+
+    if not candidate.is_file():
+        return None
+
+    if _load_dotenv is None:
+        raise RuntimeError(
+            f"发现环境变量文件 {candidate}，但缺少 python-dotenv 依赖，无法加载。"
+            '请重新安装：pip install -e ".[speed]"（或单独 pip install python-dotenv）'
+        )
+
+    _load_dotenv(dotenv_path=candidate, override=False)
+    return str(candidate)
+
+
+# --------------------------------------------------------------------------- #
 # 进程设置
 # --------------------------------------------------------------------------- #
 class Settings(StrictModel):
@@ -749,6 +792,8 @@ class Settings(StrictModel):
     @classmethod
     def from_env(cls, **overrides: Any) -> "Settings":
         """读取 ``TGA_*`` 环境变量；``overrides`` 中的非 None 值优先。"""
+        # 先补上 .env（已存在的环境变量优先），再统一从 os.environ 取值。
+        load_env_file()
         env = os.environ
         proxy: Optional[ProxyConfig] = None
         proxy_url = overrides.pop("proxy_url", None) or env.get("TGA_PROXY")
@@ -806,6 +851,7 @@ __all__ = [
     "StrictModel",
     "ValidationError",
     "expand_env",
+    "load_env_file",
     "mask_phone",
     "parse_chat_ref",
     "utc_now_iso",

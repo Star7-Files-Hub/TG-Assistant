@@ -23,10 +23,31 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `TGA_API_HASH` | ✅ | — | 从 https://my.telegram.org 获取 |
 | `TGA_PROXY` | 国内必填 | — | `socks5://user:pass@host:1080` |
 | `TGA_BOT_TOKEN` | — | — | 通知 bot 的 token |
+| `TGA_DATA_DIR` | — | `./data` | 数据目录（会话、配置、日志） |
 | `TGA_LOG_LEVEL` | — | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `TGA_PYROGRAM_LOG_LEVEL` | — | `WARNING` | pyrogram 自身日志级别 |
 | `TGA_WORKERS` | — | `8` | pyrogram worker 数，秒级转发建议 >= 4 |
 | `TGA_SLEEP_THRESHOLD` | — | `30` | FloodWait 低于此值直接 sleep |
 | `TGA_IPV6` | — | `0` | 是否使用 IPv6 |
+| `TGA_WEB_SECRET` | 远程访问必填 | — | Web 控制台访问密钥（等价于 `web --secret`） |
+| `TGA_ENV_FILE` | — | `./.env` | 指定要加载的环境变量文件路径 |
+
+### `.env` 是怎么加载的
+
+程序启动时会自动读取**当前工作目录下的 `.env`**（也可以用 `TGA_ENV_FILE` 指定别的路径），
+查找顺序和优先级如下：
+
+```
+真实环境变量  >  .env  >  代码默认值
+```
+
+也就是说 `.env` **不会覆盖**已经存在的环境变量。这跟 docker compose 的 `env_file`
+和 systemd 的 `EnvironmentFile` 语义一致，所以同一份 `.env` 在容器、systemd
+服务和手工执行的 CLI 命令下行为都一样。
+
+这点对裸机部署尤其重要：`deploy.sh` 只把 `.env` 挂给了 systemd 服务，
+但脚本提示你手工执行的 `tg-assistant login` / `config init` 不经过 systemd ——
+自动加载 `.env` 才能让它们也拿到 `api_id` / `api_hash` / 代理。
 
 ## 账号配置结构
 

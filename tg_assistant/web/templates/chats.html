@@ -33,7 +33,7 @@
         const res = await fetch(`/api/chats/${ACCOUNT}`);
         const data = await res.json();
         if (!res.ok) {
-            document.getElementById('chat-rows').innerHTML = `<tr><td colspan="4" class="muted">加载失败：${data.detail || ''}</td></tr>`;
+            document.getElementById('chat-rows').innerHTML = `<tr><td colspan="4" class="muted">加载失败：${escapeHtml(data.detail)}</td></tr>`;
             return;
         }
         allChats = data.chats || [];
@@ -47,12 +47,14 @@
             tbody.innerHTML = '<tr><td colspan="4" class="muted">没有匹配的会话</td></tr>';
             return;
         }
+        // c.title 是群/频道标题，任何群管理员都能改，属于第三方可控内容，
+        // 直接拼进 innerHTML 会形成存储型 XSS。
         tbody.innerHTML = rows.map(c => `
             <tr>
-                <td><code>${c.chat_id}</code></td>
-                <td>${c.type}</td>
-                <td>${c.title}</td>
-                <td>${c.username || '-'}</td>
+                <td><code>${escapeHtml(c.chat_id)}</code></td>
+                <td>${escapeHtml(c.type)}</td>
+                <td>${escapeHtml(c.title)}</td>
+                <td>${escapeHtml(c.username) || '-'}</td>
             </tr>
         `).join('');
     }

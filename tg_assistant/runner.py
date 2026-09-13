@@ -409,13 +409,20 @@ class MultiRunner:
         heartbeat: float = 300.0,
         restart_delay: float = 15.0,
         max_restarts: int = 5,
+        install_signals: bool = True,
     ) -> int:
-        """启动全部账号并阻塞直到收到退出信号。返回退出码。"""
+        """启动全部账号并阻塞直到收到退出信号。返回退出码。
+
+        ``install_signals=False`` 供 Web 模式使用：那里 SIGINT/SIGTERM 由
+        uvicorn 接管，再注册一次会把 uvicorn 的处理器顶掉，导致 Ctrl-C
+        只停账号、Web 服务赖着不走。
+        """
         if not names:
             log.error("没有要运行的账号。先执行 login，或用 --account 指定账号")
             return 2
 
-        self._install_signal_handlers()
+        if install_signals:
+            self._install_signal_handlers()
         log.info(
             "启动多账号运行",
             extra={
@@ -434,18 +441,30 @@ class MultiRunner:
                 name=f"account:{name}",
             )
 
-        await self._shutdown.wait()
-        log.info("收到退出信号，开始优雅关闭", extra={"account": "-", "extra_fields": {}})
+        try:
+            await self._shutdown.wait()
+            log.info("收到退出信号，开始优雅关闭", extra={"account": "-", "extra_fields": {}})
+            return 0
+        finally:
+            # 放在 finally 里：即使外层直接 cancel 这个任务（Web 停止运行时的兜底路径），
+            # 也必须把 client / 通知 worker 收干净，否则会泄漏，
+            # 而且下次启动时新旧 client 会争抢同一个 session 文件。
+            # shield 保证清理本身不会被二次取消打断。
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(self._cleanup())
 
+    async def _cleanup(self) -> None:
+        """取消在途账号任务并关闭所有 client。"""
         for task in self._tasks.values():
             task.cancel()
-        await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
 
-        await asyncio.gather(
-            *(runner.stop() for runner in self.runners.values()), return_exceptions=True
-        )
+        if self.runners:
+            await asyncio.gather(
+                *(runner.stop() for runner in self.runners.values()), return_exceptions=True
+            )
         log.info("全部账号已停止", extra={"account": "-", "extra_fields": {}})
-        return 0
 
     async def _supervise(
         self, name: str, heartbeat: float, restart_delay: float, max_restarts: int

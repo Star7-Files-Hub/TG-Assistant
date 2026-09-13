@@ -33,14 +33,16 @@
         });
         const data = await res.json();
         if (!res.ok) {
-            box.innerHTML = `<span class="badge badge-red">✗ ${data.detail || '请求失败'}</span>`;
+            box.innerHTML = `<span class="badge badge-red">✗ ${escapeHtml(data.detail) || '请求失败'}</span>`;
             return;
         }
+        // report 里含用户填写的代理地址与上游返回的错误文本，一律转义
         const lines = (data.report || '').split('\n');
         box.innerHTML = lines.map(l => {
-            if (l.includes('[OK]')) return `<div class="log-line log-success">✓ ${l}</div>`;
-            if (l.includes('[FAIL]')) return `<div class="log-line log-error">✗ ${l}</div>`;
-            return `<div class="log-line">${l}</div>`;
+            const safe = escapeHtml(l);
+            if (l.includes('[OK]')) return `<div class="log-line log-success">✓ ${safe}</div>`;
+            if (l.includes('[FAIL]')) return `<div class="log-line log-error">✗ ${safe}</div>`;
+            return `<div class="log-line">${safe}</div>`;
         }).join('');
     }
 </script>

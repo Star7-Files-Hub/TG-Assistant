@@ -18,6 +18,9 @@
         </div>
         <div class="nav-status">
             <span id="run-status" class="badge">● 未运行</span>
+            {% if request.app.state.web_settings.secret_key %}
+            <a href="/auth/logout" class="badge" title="清除访问密钥 Cookie">退出</a>
+            {% endif %}
         </div>
     </nav>
 

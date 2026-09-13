@@ -5,17 +5,15 @@
 """
 from __future__ import annotations
 
-import asyncio
-import json
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, Form, HTTPException, Query
 
 from tg_assistant.config import ProxyConfig
+from tg_assistant.paths import InvalidAccountName, validate_account_name
 from tg_assistant.proxy import probe_proxy, summarize
 
-from ..deps import get_paths, get_runtime, get_settings, get_store
+from ..deps import get_runtime, get_settings, get_store
 
 router = APIRouter()
 
@@ -106,11 +104,9 @@ async def api_account_login(
     runtime=Depends(get_runtime),
 ) -> dict[str, Any]:
     """登录入口：返回 WebSocket URL，前端通过 WS 接收二维码与进度。"""
-    from tg_assistant.paths import validate_account_name
-
     try:
         name = validate_account_name(account)
-    except Exception as exc:
+    except InvalidAccountName as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 实际登录在 WebSocket 里完成；这里只做参数校验并返回 ws 地址
     return {

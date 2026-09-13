@@ -1,6 +1,37 @@
 /* TG-Assistant Web 前端 JS */
 
 // --------------------------------------------------------------------------- //
+// 通用工具
+// --------------------------------------------------------------------------- //
+// 后端返回的群标题、用户名、显示名等文本可能由第三方控制，
+// 拼进 innerHTML 前必须转义，否则会形成存储型 XSS。
+function escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(
+        /[&<>"']/g,
+        (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+    );
+}
+
+function redirectToAuth() {
+    const url = new URL('/auth', location.origin);
+    url.searchParams.set('next', location.pathname + location.search);
+    location.href = url.toString();
+}
+
+// 统一的 401 处理：未鉴权或会话过期时直接送去 /auth，
+// 省得每个页面的每个请求各写一遍判断。
+const _nativeFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+    const response = await _nativeFetch(...args);
+    if (response.status === 401) {
+        redirectToAuth();
+        throw new Error('未授权：正在跳转到访问验证页');
+    }
+    return response;
+};
+
+// --------------------------------------------------------------------------- //
 // Toast 提示
 // --------------------------------------------------------------------------- //
 let toastTimer = null;
@@ -23,7 +54,12 @@ function connectLogWs(onLog) {
         if (data.type === 'ping') return;
         if (data.type === 'log' && onLog) onLog(data);
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+        // 1008 = 服务端判定未授权，重连没有意义，直接去验证页
+        if (event && event.code === 1008) {
+            redirectToAuth();
+            return;
+        }
         // 断线后 3 秒自动重连
         setTimeout(() => connectLogWs(onLog), 3000);
     };

@@ -31,10 +31,19 @@ Telegram 限制单账号最多加入 **500 个群+频道**。当你需要监听/
 # 安装依赖
 pip install -e ".[speed]"
 
-# 启动 Web 控制台
+# 启动 Web 控制台（默认只监听 127.0.0.1，仅本机可访问）
 tg-assistant web --port 8080
 # 打开 http://localhost:8080
+
+# 要从别的机器访问：必须同时设置访问密钥，
+# 否则拒绝启动 —— 没有密钥的控制台等于把账号和配置敞开给所有人。
+tg-assistant web --host 0.0.0.0 --port 8080 --secret 'your-strong-secret'
+# 密钥也可以走环境变量：
+TGA_WEB_SECRET='your-strong-secret' tg-assistant web --host 0.0.0.0
 ```
+
+首次访问会要求输入访问密钥，验证通过后写入 HttpOnly Cookie（有效期 7 天）。
+脚本或命令行调用可以直接用 `Authorization: Bearer <secret>`。
 
 Web 界面包含所有 CLI 功能：
 - 📱 **扫码登录**：WebSocket 实时显示二维码
@@ -86,7 +95,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[speed]"
 
-# 登录
+# 配置环境变量（cp 完记得填 api_id / api_hash，国内服务器还要填 TGA_PROXY）
+cp .env.example .env
+
+# 登录（会自动读取当前目录下的 .env）
 tg-assistant login -a main
 
 # 生成配置
@@ -96,6 +108,9 @@ tg-assistant config init -a main --example
 # 启动
 tg-assistant run
 ```
+
+> `.env` 是从**当前工作目录**读取的，所以请在项目根目录下执行命令；
+> 也可以设置 `TGA_ENV_FILE=/path/to/.env` 指定别的路径。
 
 ## 配置参考
 

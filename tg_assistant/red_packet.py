@@ -490,11 +490,24 @@ class RedPacketHunter:
                 # 先挂上监听，避免"抢完才开始听"导致漏掉瞬间返回的结果消息
                 async with self._bus.watch(chat_id) as queue:
                     callback_text: Optional[str] = None
+                    # 部分红包 bot 不返回 callback answer。这不算失败：
+                    # 记下标记，稍后仍用后续消息判定（见下方 _judge）。
+                    callback_timeout = False
                     # 信号量只保护"动手"这一小段：判定阶段要等最多 wait_timeout 秒，
                     # 若把它也圈进来，几个红包同时来就会互相排队，白白错过时机。
                     async with self._semaphore:
                         if strategy == "button" and button is not None:
-                            callback_text = await self._click_button(message, button)
+                            try:
+                                callback_text = await self._click_button(message, button)
+                            except BotResponseTimeout:
+                                callback_timeout = True
+                                self.alog.warning(
+                                    "点击按钮后机器人未响应",
+                                    chat=chat_title or chat_id,
+                                    message_id=message_id,
+                                    attempt=attempt,
+                                    hint="部分红包 bot 不返回 callback answer，将依据后续消息判定",
+                                )
                         elif strategy == "keyboard-text" and button is not None:
                             await self._send_text(chat_id, str(button.get("text")), message)
                         else:
@@ -509,13 +522,18 @@ class RedPacketHunter:
                                 )
                             await self._send_text(chat_id, text, message)
 
+                    # 判定必须在 watch 上下文内完成：一旦退出这个 with，
+                    # queue 就会从 bus 注销，_judge 再也收不到后续消息，
+                    # 会直接返回 UNKNOWN。
                     verdict, evidence = await self._judge(callback_text, queue)
 
-                cost_ms = (time.perf_counter() - started) * 1000
+                detail = _verdict_detail(verdict, callback_text, evidence)
+                if callback_timeout:
+                    detail = detail or "机器人未在 10 秒内响应回调"
                 return GrabOutcome(
                     result=verdict,
-                    detail=_verdict_detail(verdict, callback_text, evidence),
-                    cost_ms=cost_ms,
+                    detail=detail,
+                    cost_ms=(time.perf_counter() - started) * 1000,
                     callback_text=callback_text,
                     evidence=evidence,
                     attempts=attempt,
@@ -536,24 +554,6 @@ class RedPacketHunter:
                     result=GrabResult.FAILED,
                     detail="红包已失效（按钮数据过期或消息被删除）",
                     cost_ms=(time.perf_counter() - started) * 1000,
-                    attempts=attempt,
-                    **base,
-                )
-            except BotResponseTimeout:
-                last_error = "机器人未在 10 秒内响应回调"
-                self.alog.warning(
-                    "点击按钮后机器人未响应",
-                    chat=chat_title or chat_id,
-                    message_id=message_id,
-                    attempt=attempt,
-                    hint="部分红包 bot 不返回 callback answer，将依据后续消息判定",
-                )
-                verdict, evidence = await self._judge(None, None)
-                return GrabOutcome(
-                    result=verdict,
-                    detail=_verdict_detail(verdict, None, evidence) or last_error,
-                    cost_ms=(time.perf_counter() - started) * 1000,
-                    evidence=evidence,
                     attempts=attempt,
                     **base,
                 )

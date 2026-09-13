@@ -69,11 +69,11 @@
                 document.getElementById('qr-status').textContent = msg.message;
             } else if (msg.type === 'done') {
                 document.getElementById('qr-status').textContent = '';
-                document.getElementById('qr-result').innerHTML = `<span class="badge badge-green">✓ 登录成功：${msg.display_name || ''} @${msg.username || ''} (id=${msg.user_id})</span>`;
+                document.getElementById('qr-result').innerHTML = `<span class="badge badge-green">✓ 登录成功：${escapeHtml(msg.display_name)} @${escapeHtml(msg.username)} (id=${escapeHtml(msg.user_id)})</span>`;
                 loadAccounts();
             } else if (msg.type === 'error') {
                 document.getElementById('qr-status').textContent = '';
-                document.getElementById('qr-result').innerHTML = `<span class="badge badge-red">✗ ${msg.message}</span>`;
+                document.getElementById('qr-result').innerHTML = `<span class="badge badge-red">✗ ${escapeHtml(msg.message)}</span>`;
             }
         };
     }
@@ -88,10 +88,10 @@
         }
         div.innerHTML = data.accounts.map(a => `
             <div class="account-item">
-                <strong>${a.name}</strong>
-                <span class="muted">${a.user || ''}</span>
+                <strong>${escapeHtml(a.name)}</strong>
+                <span class="muted">${escapeHtml(a.user)}</span>
                 <span class="badge ${a.session_exists ? 'badge-green' : 'badge-red'}">${a.session_exists ? '已登录' : '未登录'}</span>
-                <a href="/config/${a.name}" class="btn btn-sm">配置</a>
+                <a href="/config/${encodeURIComponent(a.name)}" class="btn btn-sm">配置</a>
             </div>
         `).join('');
     }

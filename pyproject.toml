@@ -38,6 +38,8 @@ dependencies = [
     "jinja2>=3.1,<4",
     "python-multipart>=0.0.9",
     "aiofiles>=23.2,<24",
+    # 读取工作目录下的 .env（裸机 / 手工执行 CLI 时需要；容器里由 compose env_file 负责）
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -65,6 +67,13 @@ packages = ["tg_assistant", "tg_assistant.web", "tg_assistant.web.routers"]
 
 [tool.setuptools.package-data]
 tg_assistant = ["py.typed"]
+# 模板与静态资源不是 Python 包（没有 __init__.py），必须显式声明，
+# 否则 wheel / sdist 安装后 Web 控制台会 500（找不到模板）。
+"tg_assistant.web" = [
+    "templates/*.html",
+    "static/css/*.css",
+    "static/js/*.js",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

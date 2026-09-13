@@ -806,10 +806,16 @@ def _example_config() -> AccountConfig:
 # web
 # --------------------------------------------------------------------------- #
 @cli.command("web")
-@click.option("--host", default="0.0.0.0", help="监听地址")
+@click.option("--host", default="127.0.0.1", help="监听地址（默认仅本机可访问）")
 @click.option("--port", "-p", default=8080, type=int, help="监听端口")
 @click.option("--log-level", "-l", default=None, help="日志级别")
-@click.option("--secret", "-s", default=None, help="Web 鉴权密钥（留空不校验）")
+@click.option(
+    "--secret",
+    "-s",
+    default=None,
+    envvar="TGA_WEB_SECRET",
+    help="Web 访问密钥（也可用环境变量 TGA_WEB_SECRET）；留空则不校验",
+)
 @pass_ctx
 def web_cmd(
     ctx: Context,
@@ -823,6 +829,14 @@ def web_cmd(
 
     from tg_assistant.web import create_app
 
+    # 对外监听却没有密钥 = 任何人都能删账号、改配置，直接拒绝启动。
+    if not secret and host not in {"127.0.0.1", "localhost", "::1"}:
+        raise click.ClickException(
+            f"监听地址 {host} 会把控制台暴露到网络上，但未设置访问密钥。"
+            "请加 --secret <密钥>（或设置环境变量 TGA_WEB_SECRET）；"
+            "若只想本机访问，请用 --host 127.0.0.1。"
+        )
+
     app = create_app(
         data_dir=ctx.paths.data_dir,
         api_id=ctx.settings.api_id,
@@ -835,6 +849,10 @@ def web_cmd(
 
     click.secho(f"🌐 Web 控制台启动：http://{host}:{port}", fg="cyan")
     click.secho(f"   数据目录：{ctx.paths.data_dir}", fg="cyan")
+    if secret:
+        click.secho("   访问鉴权：已启用（首次访问需输入密钥）", fg="green")
+    else:
+        click.secho("   访问鉴权：未启用（仅本机可访问）", fg="yellow")
     uvicorn.run(app, host=host, port=port, log_level=(log_level or ctx.settings.log_level).lower())
 
 

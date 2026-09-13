@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import patch
 
 import pytest
 from pyrogram.errors import BotResponseTimeout, QueryIdInvalid
 
-from tg_assistant.config import AccountConfig, RedPacketConfig
+from tg_assistant.config import AccountConfig
 from tg_assistant.red_packet import (
     ChatEventBus,
     GrabResult,
@@ -204,7 +203,8 @@ class TestExecution:
         assert "失效" in outcome.detail
 
     @pytest.mark.asyncio
-    async def test_bot_response_timeout_uses_judge(self, alog):
+    async def test_bot_response_timeout_without_followup_is_unknown(self, alog):
+        """bot 不回 callback answer，且窗口内也没有后续消息 → 只能记 unknown。"""
         client = FakeClient(callback_error=BotResponseTimeout("timeout"))
         hunter = RedPacketHunter(client, rp_config(success={"wait_timeout": 0.05}), alog)
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
@@ -212,6 +212,30 @@ class TestExecution:
             msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
         )
         assert outcome.result is GrabResult.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_bot_response_timeout_falls_back_to_followup_message(self, alog):
+        """回归：超时后必须仍能靠后续消息判定。
+
+        旧实现超时分支里调用 ``_judge(None, None)``，queue 传 None 会立刻返回
+        UNKNOWN，导致「依据后续消息判定」形同虚设 —— 这个用例在旧实现下会失败。
+        """
+        client = FakeClient(callback_error=BotResponseTimeout("timeout"))
+        hunter = RedPacketHunter(client, rp_config(success={"wait_timeout": 1.0}), alog)
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+
+        async def feed_result() -> None:
+            # 等点击失败、_judge 进入等待后，再把 bot 的结果消息喂进会话事件总线
+            await asyncio.sleep(0.05)
+            hunter._bus.feed(CHAT, rp_message("恭喜抢到 1 元"))
+
+        feeder = asyncio.create_task(feed_result())
+        outcome = await hunter._execute(
+            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+        )
+        await feeder
+        assert outcome.result is GrabResult.SUCCESS
+        assert outcome.evidence is not None
 
     @pytest.mark.asyncio
     async def test_keyboard_reply_strategy(self, alog):
@@ -222,7 +246,7 @@ class TestExecution:
         msg = rp_message("红包", markup=FakeMarkup([[FakeButton("抢")]], inline=False))
         button = hunter._find_button(msg)
         assert button is not None
-        outcome = await hunter._execute(msg, button, None, "keyboard-text", asyncio.get_event_loop().time())
+        await hunter._execute(msg, button, None, "keyboard-text", asyncio.get_event_loop().time())
         assert client.sent
         assert client.sent[0]["text"] == "抢"
 
