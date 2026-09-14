@@ -239,12 +239,27 @@ async def auth_submit(
     )
 
 
-@router.get("/auth/logout")
-async def auth_logout() -> Response:
-    """清除 Cookie 并回到登录页。"""
+def _logout_response() -> Response:
+    """清掉 Cookie 并回到登录页。"""
     response = RedirectResponse(url="/auth", status_code=303)
     response.delete_cookie(COOKIE_NAME, path="/")
     return response
+
+
+@router.get("/auth/logout")
+async def auth_logout() -> Response:
+    """清除 Cookie 并回到登录页。"""
+    return _logout_response()
+
+
+@router.post("/auth/logout")
+async def auth_logout_post() -> Response:
+    """同 :func:`auth_logout`，供 ``<form method="post">`` 调用。
+
+    侧边栏用表单而不是链接：GET 登出可以被任意一个 ``<img src="/auth/logout">``
+    触发，等于任何人都能把你踢下线。POST 至少挡掉了这种「零成本」的触发方式。
+    """
+    return _logout_response()
 
 
 __all__ = [

@@ -104,6 +104,14 @@ def create_app(
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+    # 二维码图片目录（扫码登录页显示 /qr/<name>.png）。
+    # ⚠️ 刻意**不**放进 is_public_path 白名单：一张二维码就等于一份登录凭据，
+    # 谁能拿到它谁就能扫出一个已登录的会话。页面本身在鉴权后面，
+    # 所以浏览器带 Cookie 取图完全没问题。
+    qr_dir = paths.qr_dir
+    qr_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/qr", StaticFiles(directory=str(qr_dir)), name="qr")
+
     @app.on_event("startup")
     async def _startup() -> None:
         await app.state.runtime.startup()
