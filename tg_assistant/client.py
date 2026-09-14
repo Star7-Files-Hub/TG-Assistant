@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 import random
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -337,13 +338,262 @@ def make_account_logger(name: str, module: str | None = None) -> AccountLogger:
     return account_logger(name, module)
 
 
+# --------------------------------------------------------------------------- #
+# PostgreSQL 会话备份 + 跨账号去重（可选）
+#
+# 由环境变量 ``TGA_POSTGRES_DSN`` 开关：**未设置则整体关闭** —— 每个函数立刻返回，
+# 不产生任何网络开销。设置后才连库。
+#
+# ⚠️ 需要额外依赖：``pip install -e ".[postgres]"``（asyncpg）。
+#
+# ⚠️ 已知性能特征：每次调用都是「新建线程 → 新建 event loop → 新建连接 → 关闭」，
+# 而且是**同步阻塞**的（``pool.submit(...).result()``）。对 ``check_dedupe`` /
+# ``add_dedupe`` 这种**每条转发消息都要走的热路径**并不理想：转发延迟会从毫秒级
+# 涨到十几毫秒，消息量大时还会耗尽 PG 连接数，并且阻塞 pyrogram 的事件循环。
+# 这里先按服务器上已验证的行为原样移植，**后续应改成常驻连接池 + 异步调用**。
+#
+# ⚠️ 失败一律静默降级：``check_dedupe`` 返回 ``False``（视为「没转发过」），
+# 也就是说 PG 一挂，跨账号去重就失效（可能重复转发），但不影响主流程。
+# --------------------------------------------------------------------------- #
+def _pg_dsn() -> Optional[str]:
+    """PostgreSQL 连接串；未配置返回 ``None``（= 关闭 PG 相关功能）。"""
+    return os.environ.get("TGA_POSTGRES_DSN") or None
+
+
+def _get_pg_session_string(name: str) -> Optional[str]:
+    """从 PostgreSQL 读回账号的 session_string；无 PG 或失败返回 ``None``。"""
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return None
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _check() -> Optional[str]:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    row = loop.run_until_complete(
+                        conn.fetchrow(
+                            "SELECT session_string FROM tg_sessions WHERE account_name = $1",
+                            name,
+                        )
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+                return row["session_string"] if row else None
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(_check).result()
+    except Exception:
+        return None
+
+
+def _save_pg_session_string(name: str, session_string: str) -> None:
+    """把 session_string 写进 PostgreSQL（upsert）；无 PG 或失败则静默跳过。"""
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _save() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    loop.run_until_complete(
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS tg_sessions (
+                                account_name TEXT PRIMARY KEY,
+                                session_string TEXT NOT NULL,
+                                updated_at TIMESTAMP DEFAULT NOW()
+                            )
+                            """
+                        )
+                    )
+                    loop.run_until_complete(
+                        conn.execute(
+                            """
+                            INSERT INTO tg_sessions (account_name, session_string, updated_at)
+                            VALUES ($1, $2, NOW())
+                            ON CONFLICT (account_name) DO UPDATE SET
+                                session_string = EXCLUDED.session_string,
+                                updated_at = NOW()
+                            """,
+                            name,
+                            session_string,
+                        )
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(_save).result()
+    except Exception:
+        pass
+
+
+def _ensure_pg_tables() -> None:
+    """建好 ``tg_sessions`` / ``tg_dedupe`` 两张表（幂等）。无 PG 或失败则静默跳过。"""
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _ensure() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    loop.run_until_complete(
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS tg_sessions (
+                                account_name TEXT PRIMARY KEY,
+                                session_string TEXT NOT NULL,
+                                updated_at TIMESTAMP DEFAULT NOW()
+                            )
+                            """
+                        )
+                    )
+                    loop.run_until_complete(
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS tg_dedupe (
+                                chat_id BIGINT NOT NULL,
+                                message_id BIGINT NOT NULL,
+                                forwarded_by TEXT NOT NULL,
+                                forwarded_at TIMESTAMP DEFAULT NOW(),
+                                PRIMARY KEY (chat_id, message_id)
+                            )
+                            """
+                        )
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(_ensure).result()
+    except Exception:
+        pass
+
+
+def check_dedupe(chat_id: int, message_id: int, ttl: int = 300) -> bool:
+    """该消息是否已被**其它账号**转发过（跨账号去重）。
+
+    返回 ``True`` 表示已转发过、应当跳过。无 PG 或查询失败一律返回 ``False``。
+
+    ``ttl`` 是去重窗口（秒）：每次查询顺带清掉过期的记录。
+    它只用于 SQL 里的 ``INTERVAL '<ttl> seconds'`` —— 入参先经 ``int()`` 归一，
+    不存在注入面。
+    """
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return False
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _check() -> bool:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    loop.run_until_complete(
+                        conn.execute(
+                            # ttl 先经 int() 归一成整数，不存在注入面
+                            "DELETE FROM tg_dedupe WHERE forwarded_at < NOW()"
+                            f" - INTERVAL '{int(ttl)} seconds'"
+                        )
+                    )
+                    row = loop.run_until_complete(
+                        conn.fetchrow(
+                            "SELECT 1 FROM tg_dedupe WHERE chat_id = $1 AND message_id = $2",
+                            chat_id,
+                            message_id,
+                        )
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+                return row is not None
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(_check).result()
+    except Exception:
+        return False
+
+
+def add_dedupe(chat_id: int, message_id: int, account_name: str) -> None:
+    """记录「这条消息已由 ``account_name`` 转发」，供其它账号去重。失败静默。"""
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _add() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    loop.run_until_complete(
+                        conn.execute(
+                            """
+                            INSERT INTO tg_dedupe (chat_id, message_id, forwarded_by, forwarded_at)
+                            VALUES ($1, $2, $3, NOW())
+                            ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                                forwarded_by = EXCLUDED.forwarded_by,
+                                forwarded_at = NOW()
+                            """,
+                            chat_id,
+                            message_id,
+                            account_name,
+                        )
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(_add).result()
+    except Exception:
+        pass
+
+
+#: 建表：模块导入时做一次。没配 ``TGA_POSTGRES_DSN`` 时零开销（直接返回）。
+_ensure_pg_tables()
+
+
 __all__ = [
     "ClientBundle",
     "FATAL_AUTH_ERRORS",
     "MissingApiCredentials",
     "SessionInvalid",
     "TRANSIENT_ERRORS",
+    "add_dedupe",
     "build_client",
+    "check_dedupe",
     "device_fingerprint",
     "make_account_logger",
     "resolve_credentials",

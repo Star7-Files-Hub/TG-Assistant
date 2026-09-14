@@ -47,6 +47,9 @@ dependencies = [
 # 单独放进 extra 是因为它需要预编译 wheel，Python 3.13 目前还没有官方 wheel，
 # 缺失时 pyrogram 会自动回退到纯 Python 的 pyaes（能用，但明显更慢）。
 speed = ["TgCrypto-pyrofork==1.2.6"]
+# PostgreSQL 会话备份 + 跨账号去重（可选）。
+# 不装也不影响主流程：相关函数检测不到 asyncpg / 没有 TGA_POSTGRES_DSN 时会直接跳过。
+postgres = ["asyncpg>=0.29"]
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",

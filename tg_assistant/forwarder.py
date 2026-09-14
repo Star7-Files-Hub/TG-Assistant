@@ -29,7 +29,7 @@ from pyrogram import Client, filters
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import LinkPreviewOptions
 
-from .client import SessionInvalid, with_flood_retry
+from .client import SessionInvalid, add_dedupe, check_dedupe, with_flood_retry
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
@@ -334,13 +334,20 @@ class ForwardEngine:
 
             result = prepared.matcher.match(message)
             if not result:
+                # 安全取预览：消息里可能含非法代理对，直接 str() 会抛 UnicodeEncodeError，
+                # 而这里只是打日志，不该因为一条脏消息把整条转发链路带崩。
+                try:
+                    preview = truncate(str(message_text(message)), 60, "…")
+                except Exception:
+                    preview = "[无法解析的消息]"
+
                 self.alog.debug(
                     "未命中规则",
                     rule=prepared.label,
                     reason=result.reason,
                     chat=chat_title,
                     message_id=message_id,
-                    preview=truncate(message_text(message), 60, "…"),
+                    preview=preview,
                 )
                 continue
 
@@ -350,7 +357,20 @@ class ForwardEngine:
                 self.alog.info("命中但被最小间隔限制", rule=prepared.label, reason=reason)
                 continue
 
-            # 去重键必须带上规则 id：同一条消息可以合法地命中多条规则、
+            # 跨账号去重：同一条消息可能被多个账号同时监听到，只允许第一个转发。
+            # 未配置 TGA_POSTGRES_DSN 时 check_dedupe 恒返回 False，等于该功能关闭。
+            dedupe_ttl = int(self.config.forward.dedupe_window)
+            if check_dedupe(chat_id, message_id, dedupe_ttl):
+                self.stats["deduped"] += 1
+                self.alog.debug(
+                    "跨账号去重：消息已转发",
+                    rule=prepared.label,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+                continue
+
+            # 账号内去重键必须带上规则 id：同一条消息可以合法地命中多条规则、
             # 转发到不同频道；只用 (chat_id, message_id) 会让第二条规则被误判为重复。
             dedupe_key = (prepared.id, chat_id, message_id)
             if not self.dedupe.check_and_add(dedupe_key):
@@ -360,10 +380,19 @@ class ForwardEngine:
                 )
                 continue
 
+            # 登记到跨账号去重表，让其它账号跳过这条（无 PG 时是空操作）。
+            # 用 getattr 取账号名：测试里的 client 替身没有 name 属性。
+            add_dedupe(chat_id, message_id, getattr(self.client, "name", ""))
+
             prepared.last_fired = now
             prepared.stats["matched"] += 1
             self.stats["matched"] += 1
             match_ms = (time.perf_counter() - started) * 1000
+            try:
+                preview = truncate(str(message_text(message)), 80, "…")
+            except Exception:
+                preview = "[无法解析的消息]"
+
             self.alog.info(
                 "命中转发规则",
                 rule=prepared.label,
@@ -373,7 +402,7 @@ class ForwardEngine:
                 groups=",".join(result.groups) if result.groups else "-",
                 match_ms=round(match_ms, 3),
                 edited=edited,
-                preview=truncate(message_text(message), 80, "…"),
+                preview=preview,
             )
 
             group_id = getattr(message, "media_group_id", None)
