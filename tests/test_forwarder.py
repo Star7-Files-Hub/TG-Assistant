@@ -104,10 +104,20 @@ class TestPreparedRule:
         assert prepared.chat_allowed(777, None, "private")[0]
         assert not prepared.chat_allowed(888, None, "private")[0]
 
-    def test_raw_bot_chat_type_also_rejected(self):
-        """调用方直接传 pyrogram 原始值 ``bot`` 时也要拒，不能只认归一后的 private。"""
+    @pytest.mark.parametrize("kind", ["private", "bot", "direct"])
+    def test_raw_one_to_one_kinds_also_rejected(self, kind):
+        """调用方直接传 pyrogram 原始值时也要拒。
+
+        逐个枚举字符串容易漏（``direct`` 就漏过一次），所以 ``chat_allowed``
+        内部走 ``normalize_chat_kind``。
+        """
         prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
-        assert not prepared.chat_allowed(777, None, "bot")[0]
+        assert not prepared.chat_allowed(777, None, kind)[0]
+
+    @pytest.mark.parametrize("kind", ["group", "supergroup", "forum", "channel"])
+    def test_raw_broadcast_kinds_still_allowed(self, kind):
+        prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
+        assert prepared.chat_allowed(-1001, None, kind)[0]
 
     def test_from_users_whitelist(self):
         prepared = PreparedRule.build(build_config(from_users=[777]).forward.rules[0])

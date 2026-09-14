@@ -21,6 +21,7 @@ from tg_assistant.matching import (
     first_match,
     message_link,
     message_text,
+    normalize_chat_kind,
     render_template,
     sender_of,
     truncate,
@@ -82,6 +83,27 @@ class TestChatKind:
     def test_unknown_value_returns_none(self):
         message = make_message("hi", chat=FakeChat(-1001, chat_type="brand_new_type"))
         assert chat_kind(message) is None
+
+    def test_normalize_accepts_enum_instance(self):
+        """直接传 pyrogram 的 ``ChatType`` 枚举（而不是 ``.value``）也要认。"""
+        from pyrogram.enums import ChatType
+
+        assert normalize_chat_kind(ChatType.PRIVATE) == "private"
+        assert normalize_chat_kind(ChatType.BOT) == "private"
+        assert normalize_chat_kind(ChatType.DIRECT) == "private"
+        assert normalize_chat_kind(ChatType.FORUM) == "group"
+        assert normalize_chat_kind(ChatType.CHANNEL) == "channel"
+
+    def test_normalize_case_insensitive_but_strict(self):
+        """大小写不敏感，但不做 strip —— 认不出来就返回 None，不去猜。"""
+        assert normalize_chat_kind("SUPERGROUP") == "group"
+        assert normalize_chat_kind("Forum") == "group"
+        assert normalize_chat_kind(" private ") is None
+
+    def test_normalize_rejects_non_string(self):
+        assert normalize_chat_kind(None) is None
+        assert normalize_chat_kind(123) is None
+        assert normalize_chat_kind(object()) is None
 
     def test_message_without_chat_returns_none(self):
         # 注意不能走 make_message：它内部是 ``chat or FakeChat(...)``，

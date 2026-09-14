@@ -115,18 +115,23 @@ _CHAT_KIND = {
 }
 
 
-def chat_kind(message: Any) -> Optional[str]:
-    """返回 ``private`` / ``group`` / ``channel``，无法判断时返回 ``None``。
+def normalize_chat_kind(value: Any) -> Optional[str]:
+    """把会话类型统一成 ``private`` / ``group`` / ``channel``，无法判断时返回 ``None``。
 
-    ``filters.group`` / ``filters.channel`` 用的是 pyrogram 的 ``ChatType``，
-    在测试替身里可能是普通字符串，所以这里统一按 ``.value`` 取值。
+    入参可以是 ``pyrogram.enums.ChatType`` 枚举本身、它的 ``.value``（普通字符串，
+    测试替身就是这种），或者已经归一过的字符串 —— 三种写法都认，
+    这样调用方不必先自己归一，也就不会因为漏判某个原始值而放行不该放行的会话。
     """
-    chat = getattr(message, "chat", None)
-    raw = getattr(chat, "type", None)
-    value = getattr(raw, "value", raw)
-    if not isinstance(value, str):
+    raw = getattr(value, "value", value)
+    if not isinstance(raw, str):
         return None
-    return _CHAT_KIND.get(value.lower())
+    return _CHAT_KIND.get(raw.lower())
+
+
+def chat_kind(message: Any) -> Optional[str]:
+    """返回 ``private`` / ``group`` / ``channel``，无法判断时返回 ``None``。"""
+    chat = getattr(message, "chat", None)
+    return normalize_chat_kind(getattr(chat, "type", None))
 
 
 def message_link(message: Any) -> Optional[str]:
