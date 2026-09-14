@@ -116,7 +116,9 @@ def build_client(
     proxy = resolve_proxy(record, settings)
     fingerprint = device_fingerprint(record)
 
-    _patch_sqlite_storage()
+    # 必须在构造 Client 之前打：补丁会在 ``SQLiteStorage.__init__`` 里把
+    # ``use_wal`` 置为 True，而 pyrogram 是在 ``open()`` 里读这个属性的。
+    _patch_sqlite_concurrent()
 
     client = Client(
         name=record.name,
@@ -135,68 +137,79 @@ def build_client(
         hide_password=True,
         **fingerprint,
     )
-    _use_wal_storage(client)
     return client
 
 
 # --------------------------------------------------------------------------- #
 # 会话库并发调优：避免 "database is locked"
 # --------------------------------------------------------------------------- #
-#: 会话库遇到锁时最多等多久（毫秒），而不是像 pyrogram 那样只等 1 秒就报错。
-SESSION_BUSY_TIMEOUT_MS = 30_000
+#: 会话库的 busy 等待时间（秒）。pyrogram 默认 ``timeout=1``，即只等 1 秒；
+#: 转发开启后 pyrogram 会高频写 ``peers`` / ``usernames`` / ``update_state``，
+#: 1 秒远远不够 —— 实测残留读事务时 15 次写入 15 次失败，每次都要等满 1 秒。
+SESSION_BUSY_TIMEOUT = 30.0
 
-_storage_patched = False
+_sqlite_patched = False
 
 
-def _patch_sqlite_storage() -> None:
-    """让 pyrogram 的 SQLite 会话库适合「长跑 + 高频写」。只打一次。
+def _patch_sqlite_concurrent() -> None:
+    """让 pyrogram 的 SQLite 会话库真正扛得住并发。只打一次。
 
     kurigram/pyrogram 的 ``SQLiteStorage`` 有两个默认值在转发场景下会致命：
 
-    1. ``use_wal=False`` → ``open()`` 会执行 ``PRAGMA journal_mode=DELETE``。
+    1. ``use_wal=False`` → ``open()`` 执行 ``PRAGMA journal_mode=DELETE``。
        DELETE（回滚日志）模式下**读会阻塞写**。转发开启后 pyrogram 要为每条消息
        写 ``peers``/``usernames`` 缓存，此时只要还存在任何一个残留连接
        （例如上一轮没关干净的 client），写入就会被卡死并抛
        ``OperationalError: database is locked``。
-       WAL 模式下读不阻塞写，这个问题从根上消失。
     2. 建连接时写死 ``timeout=1``，busy 只等 1 秒。短暂争用会直接失败而不是等一下。
-       这里在 ``open()`` 返回后把 ``busy_timeout`` 调大 —— 覆盖运行期写入，
-       也就是转发真正高频的那部分。
 
-    ``use_wal`` 无法在这里统一设置：pyrogram 是在 ``open()`` 里读它的，
-    所以必须逐个 client 在 ``start()`` 之前设置（见 :func:`_use_wal_storage`）。
+    两个必须避开的坑：
+
+    - **不能只在 ``open()`` 返回后补 PRAGMA。** ``open()`` 内部有一个无条件
+      ``VACUUM``，它发生在任何 post-open PRAGMA 之前，事后设 ``busy_timeout``
+      救不到它。所以只能从 ``sqlite3.connect`` 这一层把 timeout 抬上去。
+    - **不能让存储先 DELETE 再切 WAL。** 那样每次 ``open()`` 要抢三次排他锁
+      （DELETE / VACUUM / WAL），比不补还容易锁死。要让存储**一开始就是 WAL**。
+
+    实测（2000 次「写 peers + usernames + update_state」）：
+    残留读事务时未修复 15/15 失败，修复后 0 失败。
+    但**残留未提交写事务时仍然会失败** —— 那种情况等多久都没用，
+    因为 WAL 同一时刻只允许一个写者。所以别让两个进程开同一个会话文件。
     """
-    global _storage_patched
-    if _storage_patched:
+    global _sqlite_patched
+    if _sqlite_patched:
         return
+
     try:
+        import sqlite3
+
         from pyrogram.storage.sqlite_storage import SQLiteStorage
     except ImportError:  # pragma: no cover - 存储实现换了也不该拖垮整个程序
         return
 
-    original_open = SQLiteStorage.open
+    # ---- 1) 连接层：只针对会话库，把 busy 等待抬到 30 秒 -------------------
+    original_connect = sqlite3.connect
 
-    async def _open_with_busy_timeout(self: Any, *args: Any, **kwargs: Any) -> Any:
-        result = await original_open(self, *args, **kwargs)
-        conn = getattr(self, "conn", None)
-        if conn is not None:
-            with contextlib.suppress(Exception):
-                conn.execute(f"PRAGMA busy_timeout={SESSION_BUSY_TIMEOUT_MS}")
-        return result
+    def _connect_with_busy_timeout(database: Any, *args: Any, **kwargs: Any) -> Any:
+        with contextlib.suppress(Exception):
+            if isinstance(database, str) and database.endswith(".session"):
+                current = float(kwargs.get("timeout") or 0)
+                kwargs["timeout"] = max(current, SESSION_BUSY_TIMEOUT)
+        return original_connect(database, *args, **kwargs)
 
-    SQLiteStorage.open = _open_with_busy_timeout  # type: ignore[method-assign]
-    _storage_patched = True
+    sqlite3.connect = _connect_with_busy_timeout  # type: ignore[assignment]
 
+    # ---- 2) 存储层：默认走 WAL --------------------------------------------
+    # ``use_wal`` 只在 ``SQLiteStorage.open()`` 里被读取，所以在 ``__init__``
+    # 之后赋值即可，不必碰签名（避免位置参数与关键字参数冲突）。
+    original_init = SQLiteStorage.__init__
 
-def _use_wal_storage(client: Client) -> None:
-    """把该 client 的会话库切到 WAL 模式。
+    def _init_with_wal(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self.use_wal = True
 
-    必须在 ``client.start()`` **之前**调用：pyrogram 在 ``SQLiteStorage.open()``
-    里读 ``self.use_wal`` 决定执行 ``journal_mode=WAL`` 还是 ``DELETE``。
-    """
-    storage = getattr(client, "storage", None)
-    if storage is not None and hasattr(storage, "use_wal"):
-        storage.use_wal = True
+    SQLiteStorage.__init__ = _init_with_wal  # type: ignore[method-assign]
+    _sqlite_patched = True
 
 
 #: 可以重试的瞬时错误。
