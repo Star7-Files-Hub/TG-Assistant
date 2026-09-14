@@ -178,3 +178,54 @@ def test_every_template_class_is_defined_in_css() -> None:
             missing[tpl.name] = gap
 
     assert not missing, f"这些模板引用了 style.css 里不存在的类：{missing}"
+
+
+# --------------------------------------------------------------------------- #
+# 登录页 ↔ 登录接口的字段契约
+# --------------------------------------------------------------------------- #
+def _login_fetch_bodies(html: str) -> list[str]:
+    """取出登录页里每个 ``/api/accounts/login`` 调用提交的字段串。"""
+    bodies = []
+    for m in re.finditer(r"fetch\('/api/accounts/login'", html):
+        chunk = html[m.start() : m.start() + 400]
+        params = re.search(r"URLSearchParams\(\{([^}]*)\}\)", chunk)
+        assert params, f"找不到 URLSearchParams 构造，选择器可能失效了：\n{chunk[:200]}"
+        bodies.append(params.group(1))
+    return bodies
+
+
+def test_login_page_sends_account_to_login_api() -> None:
+    """登录页调 ``/api/accounts/login`` 必须带 ``account``。
+
+    这个端点的 ``account`` 是**必填** Form 字段 —— 仓库版坚持让用户自己起名
+    （部署版是服务端随机生成 ``tg_xxxx``，那个名字没有任何意义）。所以前端
+    一旦漏传就是 422，而这只会在浏览器里真点一下才暴露：API 测试、页面渲染
+    测试、导航测试全都抓不到。这个坑真的踩过一次，所以钉在这里。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "login.html").read_text(encoding="utf-8")
+
+    bodies = _login_fetch_bodies(html)
+    assert len(bodies) >= 2, "登录页应当同时有扫码与验证码两个登录入口"
+
+    for body in bodies:
+        keys = [part.split(":")[0].strip() for part in body.split(",")]
+        assert "account" in keys, (
+            f"登录页调用 /api/accounts/login 没带 account，会 422。实际提交字段：{body!r}"
+        )
+
+
+def test_login_page_has_account_inputs_matching_the_js() -> None:
+    """JS 用 ``getElementById('qr-account'/'code-account')`` 取值，元素必须存在。
+
+    缺了元素不会在渲染阶段报错，而是用户点「获取二维码」时抛
+    ``Cannot read properties of null`` —— 页面上只表现为按钮没反应。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "login.html").read_text(encoding="utf-8")
+
+    for element_id in ["qr-account", "code-account"]:
+        assert f'id="{element_id}"' in html, f"登录页缺少 #{element_id} 输入框"
+        assert f"getElementById('{element_id}')" in html, (
+            f"#{element_id} 存在但没有 JS 读取它 —— 是死元素？"
+        )

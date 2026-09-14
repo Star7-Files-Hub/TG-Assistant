@@ -316,6 +316,9 @@ class CodeLoginSession:
         self.store = store
         self.settings = settings
         self.paths = store.paths
+        # ``force`` 只是为了和 :class:`QrLoginSession` 的构造签名对齐，实际**不生效**：
+        # :meth:`_start` 每次都会先 ``_clear_session_files()`` 再新建 client，
+        # 所以验证码登录天生就是"强制重新登录"，没有需要跳过的既有会话。
         self._force = force
         self._step = 0
         self._client: Optional[Client] = None

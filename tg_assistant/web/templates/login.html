@@ -62,6 +62,16 @@
 
                 <div class="tg-form">
                     <div class="tg-input-group">
+                        <label>账号名</label>
+                        <div class="tg-input-wrapper">
+                            <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/>
+                                <circle cx="12" cy="7" r="4"/>
+                            </svg>
+                            <input id="qr-account" type="text" placeholder="例如 main（登录后用它管理该账号）" />
+                        </div>
+                    </div>
+                    <div class="tg-input-group">
                         <label>代理（可选）</label>
                         <div class="tg-input-wrapper">
                             <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -116,6 +126,16 @@
                     <!-- 第一步 -->
                     <div id="code-step-phone">
                         <div class="tg-input-group">
+                            <label>账号名</label>
+                            <div class="tg-input-wrapper">
+                                <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/>
+                                    <circle cx="12" cy="7" r="4"/>
+                                </svg>
+                                <input id="code-account" type="text" placeholder="例如 main（登录后用它管理该账号）" />
+                            </div>
+                        </div>
+                        <div class="tg-input-group">
                             <label>代理（可选）</label>
                             <div class="tg-input-wrapper">
                                 <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -125,11 +145,11 @@
                                 <input id="code-proxy" type="text" placeholder="socks5://127.0.0.1:1080" />
                             </div>
                         </div>
-                        <label class="tg-checkbox">
-                            <input id="code-force" type="checkbox" />
-                            <span class="tg-checkmark"></span>
-                            <span>强制重新登录</span>
-                        </label>
+                        <!-- 这里原本有个「强制重新登录」复选框，已删掉：
+                             它既没有被 JS 读取，后端 CodeLoginSession 的 force
+                             也只是存进 self._force 从不使用。而且语义上是多余的 ——
+                             _start() 每次都会先清掉旧 session 再建 client，
+                             验证码登录本来就一定是"强制重新登录"。留着只会误导。 -->
                         <div class="tg-input-group">
                             <label>手机号</label>
                             <div class="tg-input-wrapper">
@@ -225,11 +245,15 @@
     }
 
     async function startQrLogin() {
+        const account = document.getElementById('qr-account').value.trim();
+        if (!account) { toast('请输入账号名', false); return; }
         const proxy = document.getElementById('qr-proxy').value.trim();
         const resp = await fetch('/api/accounts/login', {
             method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            // account 是必填的：后端拿它建账号目录与会话文件，名字由用户定
+            // （部署版是服务端随机生成 tg_xxxx，那个名字没有任何意义）。
             // force=true：用户点进「扫码登录」就是想重新扫，已有会话也重来一遍。
-            body: new URLSearchParams({proxy, force: 'true'}),
+            body: new URLSearchParams({account, proxy, force: 'true'}),
         });
         const data = await resp.json();
         if (!data.ok) { toast(data.detail || '登录失败', false); return; }
@@ -337,12 +361,14 @@
     }
 
     async function sendCode() {
+        const account = document.getElementById('code-account').value.trim();
+        if (!account) { toast('请输入账号名', false); return; }
         const proxy = document.getElementById('code-proxy').value.trim();
         const phone = document.getElementById('code-phone').value.trim();
         if (!phone) { toast('请输入手机号', false); return; }
         const resp = await fetch('/api/accounts/login', {
             method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: new URLSearchParams({proxy}),
+            body: new URLSearchParams({account, proxy}),
         });
         const data = await resp.json();
         if (!data.ok) { toast(data.detail || '登录失败', false); return; }

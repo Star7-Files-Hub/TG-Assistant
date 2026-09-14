@@ -295,3 +295,35 @@ def test_run_stop_one_when_nothing_running(client, app, account) -> None:
     resp = client.post(f"/api/run/stop/{NAME}")
     assert resp.status_code == 200
     assert resp.json()["ok"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 登录入口的字段契约
+# --------------------------------------------------------------------------- #
+def test_login_api_requires_account_field(client, app) -> None:
+    """``account`` 是必填的 —— 前端漏传必须是 422，而不是静默生成一个随机名。
+
+    部署版是服务端随机生成 ``tg_<hex>``，前端因此可以不传 account；仓库版改成
+    由用户指定账号名后，这个字段就成了必填。把「必填」这件事钉住，
+    免得哪天有人为了"兼容"又把它改成可选、悄悄退回随机命名。
+    """
+    resp = client.post("/api/accounts/login", data={"proxy": ""})
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_login_api_returns_ws_url_for_valid_account(client, app) -> None:
+    resp = client.post("/api/accounts/login", data={"account": NAME, "proxy": "", "force": "true"})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["account"] == NAME
+    assert body["ws_url"].startswith(f"/ws/login/{NAME}?")
+
+
+def test_login_api_rejects_illegal_account_name(client, app) -> None:
+    """非法账号名要给 400（而不是 500）—— 走的是全局 InvalidAccountName 处理器。"""
+    resp = client.post("/api/accounts/login", data={"account": "../escape"})
+
+    assert resp.status_code == 400, resp.text
