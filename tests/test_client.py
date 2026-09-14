@@ -182,6 +182,31 @@ async def test_writes_survive_lingering_reader(tmp_path: Path) -> None:
         await storage.close()
 
 
+@pytest.mark.asyncio
+async def test_export_after_close_is_impossible(tmp_path: Path) -> None:
+    """钉住上游约束：``storage.close()`` 之后无法再导出 session_string。
+
+    这条不是测我们的代码，而是测**我们依赖的 pyrogram 行为** ——
+    ``runner.login_account()`` 之所以必须在 ``client.stop()`` 之前导出，
+    唯一原因就是这里。
+
+    ``disconnect()`` → ``storage.close()`` → ``self.conn.close()``，
+    但 ``close()`` 不会把 ``self.conn`` 置空，于是后续 ``export_session_string()``
+    会走到 ``self.conn.execute(...)`` 抛 ``ProgrammingError``。
+
+    哪天 pyrogram 改掉这个行为（比如 close 后置空再惰性重连），
+    这条会失败 —— 那时就可以把导出挪到 stop 之后了。
+    """
+    storage = SQLiteStorage("acct", workdir=tmp_path)
+    await storage.open()
+    await storage.close()
+
+    assert storage.conn is not None, "close() 只关连接、不置空 —— 这正是坑的来源"
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        await storage.export_session_string()
+
+
 def test_build_client_arms_the_patch_before_constructing(
     monkeypatch: pytest.MonkeyPatch, paths: Paths
 ) -> None:

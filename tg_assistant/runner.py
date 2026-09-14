@@ -131,6 +131,8 @@ async def login_account(
             + ("请检查代理是否可用（tg-assistant proxy-check）。" if proxy else "国内网络通常必须配置 SOCKS5 代理（--proxy）。")
         ) from exc
 
+    #: 在客户端停止前导出，用于随后的 PostgreSQL 备份。
+    session_string: Optional[str] = None
     try:
         session = QrLoginSession(
             client,
@@ -141,6 +143,15 @@ async def login_account(
         )
         user = await session.run()
         me = await client.get_me()
+        # ⚠️ 必须在 ``stop()`` 之前导出：``stop()`` → ``disconnect()`` 会执行
+        # ``storage.close()``，而 ``SQLiteStorage.close()`` 只是关掉 sqlite 连接、
+        # 不置空 ``self.conn``。之后再调 ``export_session_string()`` 会抛
+        # ``sqlite3.ProgrammingError: Cannot operate on a closed database``
+        # （部署版把这一步放在 finally 之后，所以那里的 PG 备份其实从未成功过）。
+        try:
+            session_string = await client.export_session_string()
+        except Exception as exc:  # noqa: BLE001 - 导出失败不能影响登录
+            alog.warning("导出 session string 失败，将跳过 PostgreSQL 备份", error=str(exc))
     finally:
         with contextlib.suppress(Exception):
             if client.is_initialized:
@@ -160,6 +171,16 @@ async def login_account(
     store.upsert_account(updated)
     store.harden_session(name)
     store.load_account_config(name, create=True)
+    # 把 session_string 备份到 PostgreSQL（未配置 TGA_POSTGRES_DSN 时是空操作）。
+    # 这样即使本机 .session 文件丢了，也能从库里恢复登录态。
+    if session_string:
+        try:
+            from .client import _save_pg_session_string
+
+            _save_pg_session_string(name, session_string)
+            alog.info("会话已备份到 PostgreSQL")
+        except Exception as exc:  # noqa: BLE001 - 备份失败不能影响登录
+            alog.warning("备份会话到 PostgreSQL 失败", error=str(exc))
     del user
 
     alog.info(
