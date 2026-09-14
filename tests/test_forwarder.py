@@ -104,6 +104,11 @@ class TestPreparedRule:
         assert prepared.chat_allowed(777, None, "private")[0]
         assert not prepared.chat_allowed(888, None, "private")[0]
 
+    def test_raw_bot_chat_type_also_rejected(self):
+        """调用方直接传 pyrogram 原始值 ``bot`` 时也要拒，不能只认归一后的 private。"""
+        prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
+        assert not prepared.chat_allowed(777, None, "bot")[0]
+
     def test_from_users_whitelist(self):
         prepared = PreparedRule.build(build_config(from_users=[777]).forward.rules[0])
         assert prepared.sender_allowed(777, None, False)[0]

@@ -133,6 +133,9 @@ class PreparedRule:
         ``sources`` 为空表示"监听全部"，但**只限群组与频道**：
         私聊一律不参与转发。否则任何陌生人给账号发一条含关键词的私信，
         都会被原样转发到目标频道里去。
+
+        这里同时接受 ``"bot"``（pyrogram 的 ``ChatType.BOT``，即与机器人的一对一
+        会话）：调用方若直接把 ``message.chat.type.value`` 传进来也不会漏。
         """
         if self.exclude_sources and self.exclude_sources.matches(chat_id, chat_username):
             return False, "来源在 exclude_sources 中"
@@ -140,7 +143,7 @@ class PreparedRule:
             if not self.sources.matches(chat_id, chat_username):
                 return False, "来源不在 sources 中"
             return True, ""
-        if kind == "private":
+        if kind in ("private", "bot"):
             return False, "未限定 sources 时只监听群组与频道，私聊不转发"
         return True, ""
 
