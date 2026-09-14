@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,12 @@ from fastapi.testclient import TestClient
 
 from tg_assistant.config import load_env_file
 from tg_assistant.web import create_app
-from tg_assistant.web.auth import COOKIE_NAME, cookie_value
+from tg_assistant.web.auth import (
+    COOKIE_MAX_AGE,
+    COOKIE_NAME,
+    cookie_is_valid,
+    cookie_value,
+)
 
 SECRET = "s3cret-key"
 
@@ -113,7 +119,9 @@ def test_submit_sets_cookie_and_redirects(app, client):
     )
     assert resp.status_code == 303
     assert resp.headers["location"] == "/logs"
-    assert resp.cookies.get(COOKIE_NAME) == cookie_value(SECRET)
+    # Cookie 里带签发时间戳，所以不能和本地新算的值做相等比较（跨秒会不等）；
+    # 断言它确实是一枚由 SECRET 签发的有效 Cookie。
+    assert cookie_is_valid(resp.cookies.get(COOKIE_NAME), SECRET)
 
 
 def test_submit_wrong_secret_shows_error(app, client):
@@ -147,6 +155,46 @@ def test_logout_clears_cookie(app, client):
 
 def test_cookie_value_is_not_the_secret():
     assert cookie_value("plain") != "plain"
+
+
+def test_cookie_expires():
+    """回归：Cookie 必须带有效期 —— 过期的 Cookie 不能继续通过校验。
+
+    之前 Cookie 只是密钥的静态摘要，一旦泄露就永久有效，换密码也没用
+    （换密码等价于换密钥，但旧 Cookie 在新密钥下同样失效，所以真正的问题是
+    「无法主动作废」）。
+    """
+    issued = int(time.time()) - (COOKIE_MAX_AGE + 60)
+    stale = cookie_value(SECRET, issued_at=issued)
+
+    assert not cookie_is_valid(stale, SECRET), "超过有效期的 Cookie 必须失效"
+    # 同一枚 Cookie 在有效期内仍然有效（排除"因为格式不对而恰好失败"）
+    assert cookie_is_valid(cookie_value(SECRET, issued_at=int(time.time())), SECRET)
+
+
+def test_cookie_timestamp_cannot_be_forged():
+    """时间戳参与签名，改它不能让过期 Cookie 复活。"""
+    issued = int(time.time()) - (COOKIE_MAX_AGE + 60)
+    stale = cookie_value(SECRET, issued_at=issued)
+    _, _, digest = stale.partition(".")
+
+    forged = f"{int(time.time())}.{digest}"
+
+    assert not cookie_is_valid(forged, SECRET)
+
+
+def test_cookie_rejects_garbage():
+    for junk in ("", "no-dot", ".only-digest", "notanint.deadbeef", "123."):
+        assert not cookie_is_valid(junk, SECRET), f"{junk!r} 不应通过校验"
+
+
+def test_expired_cookie_is_rejected_by_api(app, client):
+    """端到端：过期 Cookie 打 API 应得 401。"""
+    app.state.web_settings.secret_key = SECRET
+    client.cookies.set(
+        COOKIE_NAME, cookie_value(SECRET, issued_at=int(time.time()) - COOKIE_MAX_AGE - 60)
+    )
+    assert client.get("/api/status").status_code == 401
 
 
 # --------------------------------------------------------------------------- #

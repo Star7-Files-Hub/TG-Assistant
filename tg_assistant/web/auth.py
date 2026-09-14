@@ -7,8 +7,13 @@
 
 密钥为空时**不校验**（此时务必只监听回环地址，见 ``WebSettings.host``）。
 
-通过校验后写入 HttpOnly Cookie。Cookie 里存的不是密钥本身，而是密钥的
-HMAC-SHA256 摘要，因此 Cookie 即使泄露也无法反推出密钥。
+通过校验后写入 HttpOnly Cookie。Cookie 里存的不是密钥本身，而是
+``<签发时间戳>.<HMAC-SHA256 摘要>`` —— 时间戳参与签名，所以：
+
+* Cookie 泄露也无法反推出密钥；
+* 篡改时间戳会让摘要失配，无法把 Cookie 续命；
+* Cookie 自带有效期（``COOKIE_MAX_AGE``），不会永久有效。
+
 同时支持 ``Authorization: Bearer <KEY>`` 供脚本/命令行调用。
 """
 
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -27,6 +33,8 @@ COOKIE_NAME = "tga_web_auth"
 #: Cookie 有效期（秒），默认 7 天。
 COOKIE_MAX_AGE = 7 * 24 * 3600
 _COOKIE_SALT = b"tg-assistant/web-console/v1"
+#: 允许的时钟偏移（秒）：Cookie 时间戳略晚于本机时钟时不算过期。
+_CLOCK_SKEW = 60
 
 #: 免鉴权路径：登录页自身、登出、图标。
 #: 登出必须放行 —— 否则 Cookie 已失效时用户点「退出」会被中间件拦回登录页，
@@ -41,9 +49,37 @@ router = APIRouter(tags=["auth"])
 # --------------------------------------------------------------------------- #
 # 校验逻辑
 # --------------------------------------------------------------------------- #
-def cookie_value(secret: str) -> str:
-    """由密钥派生出 Cookie 值（不可逆）。"""
-    return hmac.new(secret.encode("utf-8"), _COOKIE_SALT, hashlib.sha256).hexdigest()
+def _digest(secret: str, issued_at: int) -> str:
+    """对 ``<密钥, 签发时间>`` 做 HMAC-SHA256。"""
+    message = _COOKIE_SALT + b"|" + str(int(issued_at)).encode("ascii")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def cookie_value(secret: str, issued_at: Optional[int] = None) -> str:
+    """由密钥派生出带签发时间的 Cookie 值（不可逆）。
+
+    形如 ``<时间戳>.<摘要>``。时间戳参与签名，因此它既不能在不被发现的情况下被改写，
+    又能让 Cookie 具备有效期 —— 泄露的 Cookie 不会永久可用。
+    """
+    ts = int(time.time() if issued_at is None else issued_at)
+    return f"{ts}.{_digest(secret, ts)}"
+
+
+def cookie_is_valid(value: Optional[str], secret: str, max_age: int = COOKIE_MAX_AGE) -> bool:
+    """该 Cookie 值是否由 ``secret`` 签发，且未超过 ``max_age``。"""
+    if not value or not secret:
+        return False
+    raw_ts, _, digest = value.partition(".")
+    if not raw_ts or not digest:
+        return False
+    try:
+        issued_at = int(raw_ts)
+    except ValueError:
+        return False
+    if not hmac.compare_digest(digest, _digest(secret, issued_at)):
+        return False
+    age = time.time() - issued_at
+    return -_CLOCK_SKEW <= age <= max_age
 
 
 def secret_of(web_settings: Any) -> str:
@@ -87,8 +123,10 @@ def is_authorized(conn: Any, web_settings: Any) -> bool:
 
     接受两种凭据：
 
-    - 浏览器 Cookie 里的 HMAC 摘要（正常页面访问）；
+    - 浏览器 Cookie 里由密钥签发的、带有效期的摘要（正常页面访问）；
     - 明文密钥本身，即 ``Authorization: Bearer <secret>``（脚本/命令行调用）。
+
+    明文密钥不做有效期检查 —— 它本来就是长期凭据，持有者随时可以重新登录。
     """
     secret = secret_of(web_settings)
     if not secret:
@@ -96,7 +134,7 @@ def is_authorized(conn: Any, web_settings: Any) -> bool:
     token = _token_from(conn)
     if not token:
         return False
-    if hmac.compare_digest(token, cookie_value(secret)):
+    if cookie_is_valid(token, secret):
         return True
     return hmac.compare_digest(token, secret)
 
@@ -213,6 +251,7 @@ __all__ = [
     "COOKIE_MAX_AGE",
     "COOKIE_NAME",
     "auth_required",
+    "cookie_is_valid",
     "cookie_value",
     "is_authorized",
     "is_public_path",
