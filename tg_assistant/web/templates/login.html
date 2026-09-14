@@ -1,97 +1,415 @@
 {% extends "base.html" %}
-{% block title %}扫码登录 · TG-Assistant{% endblock %}
+{% block title %}登录 · TG-Assistant{% endblock %}
 
 {% block content %}
-<h1>扫码登录</h1>
+<div class="tg-login-page">
+    <!-- 动态背景 -->
+    <div class="bg-animation">
+        <div class="bg-blob bg-blob-1"></div>
+        <div class="bg-blob bg-blob-2"></div>
+        <div class="bg-blob bg-blob-3"></div>
+    </div>
 
-<section class="card">
-    <h2>新账号登录</h2>
-    <div class="form-row">
-        <label>账号名</label>
-        <input id="login-account" type="text" placeholder="如 main、alt1" />
-    </div>
-    <div class="form-row">
-        <label>代理（可选，覆盖全局）</label>
-        <input id="login-proxy" type="text" placeholder="socks5://127.0.0.1:1080" />
-    </div>
-    <div class="form-row">
-        <label>
-            <input id="login-force" type="checkbox" /> 强制重新登录（即使已有会话）
-        </label>
-    </div>
-    <button class="btn btn-primary" onclick="startLogin()">📱 获取二维码</button>
-</section>
+    <div class="tg-login-wrapper">
+        <!-- 顶部品牌 -->
+        <div class="tg-login-header">
+            <div class="tg-logo">
+                <div class="tg-logo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                        <path d="M2 17l10 5 10-5"/>
+                        <path d="M2 12l10 5 10-5"/>
+                    </svg>
+                </div>
+                <div class="tg-logo-text">
+                    <h1>TG-Assistant</h1>
+                    <p>多账号 Telegram 助手</p>
+                </div>
+            </div>
+        </div>
 
-<section class="card" id="qr-section" style="display:none;">
-    <h2>扫描二维码</h2>
-    <div id="qr-status" class="muted">正在连接...</div>
-    <div class="qr-container">
-        <pre id="qr-ascii" class="qr-ascii"></pre>
-    </div>
-    <div id="qr-result"></div>
-</section>
+        <!-- 主登录卡片 -->
+        <div class="tg-login-card">
+            <!-- 登录方式 Tabs -->
+            <div class="tg-tabs">
+                <button class="tg-tab active" onclick="switchTab('qr')" id="tab-qr">
+                    <svg class="tg-tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="7" height="7" rx="1"/>
+                        <rect x="14" y="3" width="7" height="7" rx="1"/>
+                        <rect x="3" y="14" width="7" height="7" rx="1"/>
+                        <rect x="14" y="14" width="3" height="3"/>
+                        <rect x="18" y="14" width="3" height="3"/>
+                        <rect x="14" y="18" width="3" height="3"/>
+                        <rect x="18" y="18" width="3" height="3"/>
+                    </svg>
+                    <span>扫码登录</span>
+                </button>
+                <button class="tg-tab" onclick="switchTab('code')" id="tab-code">
+                    <svg class="tg-tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z"/>
+                    </svg>
+                    <span>验证码登录</span>
+                </button>
+                <div class="tg-tab-indicator"></div>
+            </div>
 
-<section class="card">
-    <h2>已登录账号</h2>
-    <div id="account-list">加载中...</div>
-</section>
+            <!-- 扫码登录面板 -->
+            <div class="tg-panel" id="login-qr">
+                <div class="tg-panel-header">
+                    <h2>扫码登录</h2>
+                    <p>快速安全，推荐使用</p>
+                </div>
+
+                <div class="tg-form">
+                    <div class="tg-input-group">
+                        <label>代理（可选）</label>
+                        <div class="tg-input-wrapper">
+                            <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/>
+                                <path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+                            </svg>
+                            <input id="qr-proxy" type="text" placeholder="socks5://127.0.0.1:1080" />
+                        </div>
+                    </div>
+                    <button class="tg-btn tg-btn-primary tg-btn-block" onclick="startQrLogin()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M5 12h14M12 5l7 7-7 7"/>
+                        </svg>
+                        获取二维码
+                    </button>
+                </div>
+
+                <div class="tg-qr-area" id="qr-section" style="display:none;">
+                    <div class="tg-qr-status">
+                        <div class="tg-qr-spinner"></div>
+                        <span id="qr-status">正在连接...</span>
+                    </div>
+                    <div class="tg-qr-display">
+                        <div class="tg-qr-frame">
+                            <div class="tg-qr-corner tl"></div>
+                            <div class="tg-qr-corner tr"></div>
+                            <div class="tg-qr-corner bl"></div>
+                            <div class="tg-qr-corner br"></div>
+                            <img id="qr-image" src="" alt="QR Code" style="display:none;" />
+                            <pre id="qr-ascii" class="tg-qr-ascii" style="display:none;"></pre>
+                        </div>
+                    </div>
+                    <div class="tg-qr-tip">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                            <path d="M7 11V7a5 5 0 0110 0v4"/>
+                        </svg>
+                        <span>Telegram → 设置 → 设备 → 关联桌面设备 → 扫描二维码</span>
+                    </div>
+                    <div id="qr-result"></div>
+                </div>
+            </div>
+
+            <!-- 验证码登录面板 -->
+            <div class="tg-panel" id="login-code" style="display:none;">
+                <div class="tg-panel-header">
+                    <h2>验证码登录</h2>
+                    <p>手机号 + 短信验证码</p>
+                </div>
+
+                <div class="tg-form">
+                    <!-- 第一步 -->
+                    <div id="code-step-phone">
+                        <div class="tg-input-group">
+                            <label>代理（可选）</label>
+                            <div class="tg-input-wrapper">
+                                <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+                                </svg>
+                                <input id="code-proxy" type="text" placeholder="socks5://127.0.0.1:1080" />
+                            </div>
+                        </div>
+                        <label class="tg-checkbox">
+                            <input id="code-force" type="checkbox" />
+                            <span class="tg-checkmark"></span>
+                            <span>强制重新登录</span>
+                        </label>
+                        <div class="tg-input-group">
+                            <label>手机号</label>
+                            <div class="tg-input-wrapper">
+                                <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z"/>
+                                </svg>
+                                <input id="code-phone" type="text" placeholder="+86 138 xxxx xxxx" />
+                            </div>
+                        </div>
+                        <button class="tg-btn tg-btn-primary tg-btn-block" onclick="sendCode()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z"/>
+                            </svg>
+                            发送验证码
+                        </button>
+                    </div>
+
+                    <!-- 第二步 -->
+                    <div id="code-step-verify" style="display:none;">
+                        <div class="tg-input-group">
+                            <label>验证码</label>
+                            <div class="tg-input-wrapper">
+                                <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                                </svg>
+                                <input id="code-input" type="text" placeholder="输入 5 位验证码" maxlength="10" />
+                            </div>
+                        </div>
+                        <div class="tg-input-group" id="code-2fa-row" style="display:none;">
+                            <label>2FA 密码</label>
+                            <div class="tg-input-wrapper">
+                                <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                                    <path d="M7 11V7a5 5 0 0110 0v4"/>
+                                </svg>
+                                <input id="code-password" type="password" placeholder="两步验证密码" />
+                            </div>
+                        </div>
+                        <button class="tg-btn tg-btn-primary tg-btn-block" onclick="verifyCode()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
+                                <polyline points="22 4 12 14.01 9 11.01"/>
+                            </svg>
+                            验证登录
+                        </button>
+                        <button class="tg-btn tg-btn-ghost tg-btn-block" onclick="backToPhone()">
+                            ← 返回修改手机号
+                        </button>
+                    </div>
+
+                    <div id="code-status" class="tg-status-text"></div>
+                    <div id="code-result"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 已登录账号 -->
+        <div class="tg-accounts-card">
+            <div class="tg-accounts-header">
+                <h3>已登录账号</h3>
+                <span class="tg-accounts-count" id="accounts-count">0</span>
+            </div>
+            <div id="account-list">
+                <div class="tg-accounts-empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                        <circle cx="9" cy="7" r="4"/>
+                        <path d="M23 21v-2a4 4 0 00-3-3.87"/>
+                        <path d="M16 3.13a4 4 0 010 7.75"/>
+                    </svg>
+                    <p>还没有登录的账号</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
     let ws = null;
+    let currentTab = 'qr';
 
-    async function startLogin() {
-        const account = document.getElementById('login-account').value.trim();
-        if (!account) { toast('请输入账号名', false); return; }
-        const proxy = document.getElementById('login-proxy').value.trim();
-        const force = document.getElementById('login-force').checked;
+    function switchTab(tab) {
+        currentTab = tab;
+        document.getElementById('tab-qr').classList.toggle('active', tab === 'qr');
+        document.getElementById('tab-code').classList.toggle('active', tab === 'code');
+        document.getElementById('login-qr').style.display = tab === 'qr' ? 'block' : 'none';
+        document.getElementById('login-code').style.display = tab === 'code' ? 'block' : 'none';
+        const indicator = document.querySelector('.tg-tab-indicator');
+        if (tab === 'qr') { indicator.style.left = '0'; indicator.style.width = '50%'; }
+        else { indicator.style.left = '50%'; indicator.style.width = '50%'; }
+    }
 
+    async function startQrLogin() {
+        const proxy = document.getElementById('qr-proxy').value.trim();
         const resp = await fetch('/api/accounts/login', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: new URLSearchParams({account, proxy, force: force ? 'true' : 'false'}),
+            method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            // force=true：用户点进「扫码登录」就是想重新扫，已有会话也重来一遍。
+            body: new URLSearchParams({proxy, force: 'true'}),
         });
         const data = await resp.json();
         if (!data.ok) { toast(data.detail || '登录失败', false); return; }
-
         document.getElementById('qr-section').style.display = 'block';
         document.getElementById('qr-status').textContent = '正在连接...';
-
+        document.getElementById('qr-image').style.display = 'none';
+        document.getElementById('qr-ascii').style.display = 'none';
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${proto}//${location.host}${data.ws_url}`);
+        // 鉴权走 Cookie：WebSocket 握手会自动带上。
+        // 不要把令牌拼进 URL —— 那会漏进访问日志、浏览器历史和 Referer。
+        const wsUrl = `${proto}//${location.host}${data.ws_url}`;
+        if (ws) ws.close();
+        ws = new WebSocket(wsUrl);
         ws.onmessage = (e) => {
             const msg = JSON.parse(e.data);
             if (msg.type === 'qr') {
-                document.getElementById('qr-ascii').textContent = msg.ascii;
-                document.getElementById('qr-status').textContent = `二维码有效期 ${msg.expires_in} 秒，请用 Telegram 扫描`;
+                document.getElementById('qr-status').textContent = `有效期 ${msg.expires_in} 秒`;
+                if (msg.png_url) {
+                    document.getElementById('qr-image').src = msg.png_url;
+                    document.getElementById('qr-image').style.display = 'block';
+                    document.getElementById('qr-ascii').style.display = 'none';
+                } else if (msg.ascii) {
+                    document.getElementById('qr-ascii').textContent = msg.ascii;
+                    document.getElementById('qr-ascii').style.display = 'block';
+                    document.getElementById('qr-image').style.display = 'none';
+                }
             } else if (msg.type === 'status') {
                 document.getElementById('qr-status').textContent = msg.message;
+            } else if (msg.type === 'need_2fa') {
+                // 显示二步验证输入弹窗
+                show2FAPopup(msg.hint || '');
             } else if (msg.type === 'done') {
                 document.getElementById('qr-status').textContent = '';
-                document.getElementById('qr-result').innerHTML = `<span class="badge badge-green">✓ 登录成功：${escapeHtml(msg.display_name)} @${escapeHtml(msg.username)} (id=${escapeHtml(msg.user_id)})</span>`;
+                document.getElementById('qr-result').innerHTML = `<div class="tg-alert tg-alert-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>登录成功：${msg.display_name || ''} @${msg.username || ''}</div>`;
                 loadAccounts();
             } else if (msg.type === 'error') {
                 document.getElementById('qr-status').textContent = '';
-                document.getElementById('qr-result').innerHTML = `<span class="badge badge-red">✗ ${escapeHtml(msg.message)}</span>`;
+                document.getElementById('qr-result').innerHTML = `<div class="tg-alert tg-alert-error"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>${msg.message}</div>`;
             }
         };
+        ws.onerror = () => { document.getElementById('qr-status').textContent = '连接失败'; };
+        ws.onclose = (e) => { if (e.code === 1008) document.getElementById('qr-status').textContent = '认证已过期，请刷新页面'; };
+    }
+
+    // 2FA 弹窗
+    function show2FAPopup(hint) {
+        // 创建弹窗
+        const modal = document.createElement('div');
+        modal.id = 'tg-2fa-modal';
+        modal.className = 'tg-modal active';
+        modal.innerHTML = `
+            <div class="tg-modal-overlay" onclick="close2FAPopup()"></div>
+            <div class="tg-modal-dialog" style="max-width:400px;">
+                <div class="tg-modal-header">
+                    <h2>🔐 两步验证</h2>
+                    <button class="tg-modal-close" onclick="close2FAPopup()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
+                <div class="tg-modal-body">
+                    <p style="margin-bottom:12px;color:var(--text-muted);">${hint ? '提示：' + hint : '该账号已开启两步验证，请输入密码'}</p>
+                    <div class="tg-input-group">
+                        <label>2FA 密码</label>
+                        <div class="tg-input-wrapper">
+                            <svg class="tg-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                                <path d="M7 11V7a5 5 0 0110 0v4"/>
+                            </svg>
+                            <input id="tg-2fa-input" type="password" placeholder="输入两步验证密码" autofocus />
+                        </div>
+                    </div>
+                </div>
+                <div class="tg-modal-footer">
+                    <button class="tg-btn tg-btn-ghost" onclick="close2FAPopup()">取消</button>
+                    <button class="tg-btn tg-btn-primary" onclick="submit2FAPassword()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                        确认
+                    </button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        // 聚焦输入框
+        setTimeout(() => document.getElementById('tg-2fa-input')?.focus(), 100);
+        // 回车提交
+        document.getElementById('tg-2fa-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') submit2FAPassword();
+        });
+    }
+
+    function close2FAPopup() {
+        const modal = document.getElementById('tg-2fa-modal');
+        if (modal) modal.remove();
+    }
+
+    function submit2FAPassword() {
+        const password = document.getElementById('tg-2fa-input').value.trim();
+        if (!password) { toast('请输入密码', false); return; }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({type: '2fa_password', password: password}));
+            close2FAPopup();
+        } else {
+            toast('连接已断开', false);
+        }
+    }
+
+    async function sendCode() {
+        const proxy = document.getElementById('code-proxy').value.trim();
+        const phone = document.getElementById('code-phone').value.trim();
+        if (!phone) { toast('请输入手机号', false); return; }
+        const resp = await fetch('/api/accounts/login', {
+            method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: new URLSearchParams({proxy}),
+        });
+        const data = await resp.json();
+        if (!data.ok) { toast(data.detail || '登录失败', false); return; }
+        // 使用返回的 account 名
+        const account = data.account;
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        // 同样把令牌留在 Cookie 里，交给 WebSocket 握手自动携带。
+        const wsUrl = `${proto}//${location.host}/ws/login-code/${account}?proxy=${encodeURIComponent(proxy)}`;
+        if (ws) ws.close();
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => { ws.send(JSON.stringify({type: 'send_code', phone: phone})); };
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'status') { document.getElementById('code-status').textContent = msg.message; }
+            else if (msg.type === 'code_sent') {
+                document.getElementById('code-status').textContent = msg.message || '验证码已发送';
+                document.getElementById('code-step-phone').style.display = 'none';
+                document.getElementById('code-step-verify').style.display = 'block';
+            } else if (msg.type === 'need_2fa') {
+                document.getElementById('code-status').textContent = msg.message || '请输入 2FA 密码';
+                document.getElementById('code-2fa-row').style.display = 'flex';
+            } else if (msg.type === 'done') {
+                document.getElementById('code-status').textContent = '';
+                document.getElementById('code-result').innerHTML = `<div class="tg-alert tg-alert-success"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>登录成功：${msg.display_name || ''} @${msg.username || ''}</div>`;
+                loadAccounts();
+            } else if (msg.type === 'error') {
+                document.getElementById('code-status').textContent = '';
+                document.getElementById('code-result').innerHTML = `<div class="tg-alert tg-alert-error"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>${msg.message}</div>`;
+            }
+        };
+        ws.onerror = () => { document.getElementById('code-status').textContent = '连接失败'; };
+        ws.onclose = (e) => { if (e.code === 1008) document.getElementById('code-status').textContent = '认证已过期，请刷新页面'; };
+    }
+
+    function verifyCode() {
+        const code = document.getElementById('code-input').value.trim();
+        const password = document.getElementById('code-password').value.trim();
+        if (!code) { toast('请输入验证码', false); return; }
+        if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify({type: 'verify', code: code, password: password})); }
+        else { toast('连接已断开，请重试', false); }
+    }
+
+    function backToPhone() {
+        document.getElementById('code-step-phone').style.display = 'block';
+        document.getElementById('code-step-verify').style.display = 'none';
+        document.getElementById('code-status').textContent = '';
+        document.getElementById('code-result').innerHTML = '';
+        document.getElementById('code-input').value = '';
+        document.getElementById('code-password').value = '';
+        if (ws) ws.close();
     }
 
     async function loadAccounts() {
         const res = await fetch('/api/accounts');
         const data = await res.json();
         const div = document.getElementById('account-list');
+        const countEl = document.getElementById('accounts-count');
+        countEl.textContent = data.accounts.length;
         if (!data.accounts.length) {
-            div.innerHTML = '<span class="muted">还没有账号</span>';
+            div.innerHTML = `<div class="tg-accounts-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg><p>还没有登录的账号</p></div>`;
             return;
         }
         div.innerHTML = data.accounts.map(a => `
-            <div class="account-item">
-                <strong>${escapeHtml(a.name)}</strong>
-                <span class="muted">${escapeHtml(a.user)}</span>
-                <span class="badge ${a.session_exists ? 'badge-green' : 'badge-red'}">${a.session_exists ? '已登录' : '未登录'}</span>
-                <a href="/config/${encodeURIComponent(a.name)}" class="btn btn-sm">配置</a>
+            <div class="tg-account-card">
+                <div class="tg-account-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
+                <div class="tg-account-info"><div class="tg-account-name">${a.name}</div><div class="tg-account-user">${a.user || '未绑定'}</div></div>
+                <div class="tg-account-meta"><span class="tg-badge ${a.session_exists ? 'tg-badge-success' : 'tg-badge-error'}">${a.session_exists ? '已登录' : '未登录'}</span><a href="/config/${a.name}" class="tg-btn tg-btn-sm">配置</a></div>
             </div>
         `).join('');
     }
