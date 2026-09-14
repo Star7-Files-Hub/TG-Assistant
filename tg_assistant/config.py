@@ -381,7 +381,11 @@ class NotifyConfig(StrictModel):
     enabled: bool = False
     bot_token: Optional[str] = None
     #: 接收通知的对象：你的用户 id（需先和 bot 私聊过一次）或群 id。
+    #: 兼容旧配置；新配置建议用 ``chat_ids``。
     chat_id: Optional[ChatRef] = None
+    #: 接收通知的多个对象：你的用户 id（需先和 bot 私聊过一次）或群 id。
+    #: 与 ``chat_id`` 是**并集**关系（``chat_id`` 排在最前）。
+    chat_ids: list[ChatRef] = Field(default_factory=list)
     message_thread_id: Optional[int] = None
     mode: NotifyMode = "copy"
     #: 通知里附带原始来源链接。
@@ -417,6 +421,13 @@ class NotifyConfig(StrictModel):
     def _normalize_chat(cls, value: Any) -> Any:
         return parse_chat_ref(value)
 
+    @field_validator("chat_ids", mode="before")
+    @classmethod
+    def _normalize_chats(cls, value: Any) -> Any:
+        # 部署版漏了这个 validator，导致 chat_ids 里的字符串 id 不会被归一成 int，
+        # 与 sources / exclude_sources 的处理方式不一致。
+        return _normalize_refs(value)
+
     @model_validator(mode="after")
     def _check(self) -> "NotifyConfig":
         if self.enabled:
@@ -427,8 +438,8 @@ class NotifyConfig(StrictModel):
                     f"notify.bot_token 里的环境变量没有被替换：{self.bot_token}。"
                     "请在 .env 或环境里设置该变量，或直接写死 token。"
                 )
-            if self.chat_id is None:
-                raise ValueError("notify.enabled=true 时必须提供 chat_id")
+            if self.chat_id is None and not self.chat_ids:
+                raise ValueError("notify.enabled=true 时必须提供 chat_id 或 chat_ids")
             if ":" not in self.bot_token:
                 raise ValueError(
                     "notify.bot_token 格式不对，应形如 123456789:AAE...（从 @BotFather 获取）"

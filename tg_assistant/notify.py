@@ -88,8 +88,19 @@ class BotNotifier:
 
     # ------------------------------------------------------------------ #
     @property
+    def _all_chat_ids(self) -> list[Any]:
+        """全部通知目标：``chat_ids`` 与旧版 ``chat_id`` 的并集（``chat_id`` 排最前）。
+
+        用 ``is not None`` 而不是真值判断 —— 否则 ``chat_id=0`` 会被静默丢掉。
+        """
+        ids: list[Any] = list(self.config.chat_ids) if self.config.chat_ids else []
+        if self.config.chat_id is not None and self.config.chat_id not in ids:
+            ids.insert(0, self.config.chat_id)
+        return ids
+
+    @property
     def enabled(self) -> bool:
-        return self.config.enabled and bool(self.config.bot_token) and self.config.chat_id is not None
+        return self.config.enabled and bool(self.config.bot_token) and len(self._all_chat_ids) > 0
 
     @property
     def _base_url(self) -> str:
@@ -119,7 +130,7 @@ class BotNotifier:
         self.alog.info(
             "Bot 通知已启动",
             bot=detail,
-            target=self.config.chat_id,
+            targets=self._all_chat_ids,
             mode=self.config.mode,
             rate_limit=f"{self.config.rate_limit_per_minute}/min",
             proxy=self.proxy.to_url() if self.proxy else "直连",
@@ -285,40 +296,44 @@ class BotNotifier:
             return False
         all_ok = True
         for from_chat, message_id in pairs:
-            payload: dict[str, Any] = {
-                "chat_id": self.config.chat_id,
-                "from_chat_id": from_chat,
-                "message_id": message_id,
-                "disable_notification": task.silent or self.config.silent,
-            }
-            if self.config.message_thread_id is not None:
-                payload["message_thread_id"] = self.config.message_thread_id
-            ok, _ = await self._call("copyMessage", payload)
-            all_ok = all_ok and ok
-            if not ok:
-                break
+            for chat_id in self._all_chat_ids:
+                payload: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "from_chat_id": from_chat,
+                    "message_id": message_id,
+                    "disable_notification": task.silent or self.config.silent,
+                }
+                if self.config.message_thread_id is not None:
+                    payload["message_thread_id"] = self.config.message_thread_id
+                ok, _ = await self._call("copyMessage", payload)
+                all_ok = all_ok and ok
+                if not ok:
+                    break
         return all_ok
 
     async def _send_text(self, task: NotifyTask) -> bool:
         text = truncate(task.text, SAFE_TEXT_LENGTH)
-        payload: dict[str, Any] = {
-            "chat_id": self.config.chat_id,
-            "text": text,
-            "disable_notification": task.silent or self.config.silent,
-            "link_preview_options": {"is_disabled": True},
-        }
-        if task.parse_mode:
-            payload["parse_mode"] = task.parse_mode
-        if self.config.message_thread_id is not None:
-            payload["message_thread_id"] = self.config.message_thread_id
+        all_ok = True
+        for chat_id in self._all_chat_ids:
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_notification": task.silent or self.config.silent,
+                "link_preview_options": {"is_disabled": True},
+            }
+            if task.parse_mode:
+                payload["parse_mode"] = task.parse_mode
+            if self.config.message_thread_id is not None:
+                payload["message_thread_id"] = self.config.message_thread_id
 
-        ok, description = await self._call("sendMessage", payload)
-        if not ok and description and "can't parse entities" in description.lower():
-            # 模板里混入了裸 < > &，去掉 parse_mode 再发一次，宁可少格式也别丢消息
-            payload.pop("parse_mode", None)
-            self.alog.warning("HTML 解析失败，改用纯文本重发", description=description)
             ok, description = await self._call("sendMessage", payload)
-        return ok
+            if not ok and description and "can't parse entities" in description.lower():
+                # 模板里混入了裸 < > &，去掉 parse_mode 再发一次，宁可少格式也别丢消息
+                payload.pop("parse_mode", None)
+                self.alog.warning("HTML 解析失败，改用纯文本重发", description=description)
+                ok, description = await self._call("sendMessage", payload)
+            all_ok = all_ok and ok
+        return all_ok
 
     async def _call(
         self,
