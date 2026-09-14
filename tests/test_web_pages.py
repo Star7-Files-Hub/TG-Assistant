@@ -229,3 +229,36 @@ def test_login_page_has_account_inputs_matching_the_js() -> None:
         assert f"getElementById('{element_id}')" in html, (
             f"#{element_id} 存在但没有 JS 读取它 —— 是死元素？"
         )
+
+
+def test_every_get_element_by_id_target_exists() -> None:
+    """每个 ``getElementById('x')`` 都要有对应的 ``id="x"``。
+
+    这是页面模板里最容易出、也最难发现的一类 bug：元素缺失时模板照样渲染
+    （测试全绿），只有 JS 跑起来才抛 ``Cannot read properties of null``。
+
+    ``rules.html`` 就踩过：``loadRules()`` 第一句读 ``#forward-enabled``，
+    而那段 HTML 根本没写 —— 于是 ``loadRules()`` 直接抛异常，
+    **后面的 ``renderRules() 一次都没执行过，规则列表永远是空的**。
+    CSS 里 ``.rules-master-toggle`` 和 JS 里的 ``toggleForward()`` 都早就写好了，
+    只有元素丢了 —— 光看单侧根本发现不了。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    tpl_dir = web_dir / "templates"
+    base_ids = set(re.findall(r'id="([^"]+)"', (tpl_dir / "base.html").read_text(encoding="utf-8")))
+
+    missing: dict[str, list[str]] = {}
+    for tpl in sorted(tpl_dir.glob("*.html")):
+        html = tpl.read_text(encoding="utf-8")
+        declared = set(re.findall(r'id="([^"]+)"', html))
+        # JS 动态创建的节点（createElement 后 .id = 'x' / setAttribute('id','x')）
+        dynamic = set(re.findall(r"\.id\s*=\s*['\"]([^'\"]+)['\"]", html))
+        dynamic |= set(
+            re.findall(r"setAttribute\(\s*['\"]id['\"]\s*,\s*['\"]([^'\"]+)['\"]", html)
+        )
+        used = set(re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]", html))
+        gap = sorted(used - declared - dynamic - base_ids)
+        if gap:
+            missing[tpl.name] = gap
+
+    assert not missing, f"这些模板引用了不存在的元素 id（JS 会抛 null）: {missing}"

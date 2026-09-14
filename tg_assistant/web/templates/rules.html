@@ -20,6 +20,15 @@
                 <span class="status-dot" id="status-dot"></span>
                 <span id="status-text" class="text-muted">未运行</span>
             </div>
+            <!-- 转发总开关。CSS（.rules-master-toggle）与 JS（loadRules / toggleForward）
+                 都早就写好了，只有这段 HTML 丢了 —— 结果是 loadRules() 在
+                 getElementById('forward-enabled') 上抛 TypeError，后面的
+                 renderRules() 根本不执行，整个规则列表永远渲染不出来。 -->
+            <label class="rules-master-toggle" id="master-toggle" style="display:none;">
+                <input type="checkbox" id="forward-enabled" onchange="toggleForward()" />
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">转发总开关</span>
+            </label>
             <button class="tg-btn tg-btn-sm" id="btn-start-account" onclick="startAccount()" style="display:none;">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                 启动
@@ -293,6 +302,7 @@
         currentAccount = sel.value;
         document.getElementById('btn-add-rule').style.display = currentAccount ? 'inline-flex' : 'none';
         document.getElementById('account-status').style.display = currentAccount ? 'flex' : 'none';
+        document.getElementById('master-toggle').style.display = currentAccount ? 'flex' : 'none';
         document.getElementById('btn-start-account').style.display = currentAccount ? 'inline-flex' : 'none';
         document.getElementById('btn-stop-account').style.display = currentAccount ? 'inline-flex' : 'none';
         if (!currentAccount) {
@@ -616,12 +626,22 @@
     }
 
     async function toggleForward() {
-        const enabled = document.getElementById('forward-enabled').checked;
-        await fetch(`/api/config/${currentAccount}/forward-enabled`, {
+        const box = document.getElementById('forward-enabled');
+        const enabled = box.checked;
+        const res = await fetch(`/api/config/${currentAccount}/forward-enabled`, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({enabled: enabled})
         });
+        if (res.ok) {
+            toast(enabled ? '已开启转发' : '已关闭转发', true);
+            return;
+        }
+        // 保存失败就把开关拨回去：否则界面显示"已开启"而后端其实没变，
+        // 用户会以为转发在跑，实际一条都发不出去。
+        box.checked = !enabled;
+        const data = await res.json().catch(() => ({}));
+        toast(data.detail || '保存失败', false);
     }
 
     // ==================== 正则测试器 ====================
