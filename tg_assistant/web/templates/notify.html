@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}通知设置 · TG-Assistant{% endblock %}
+
+{% block content %}
+<div class="nt-page">
+    <div class="nt-header">
+        <div class="nt-header-left">
+            <h1>通知设置</h1>
+            <p class="text-muted">配置 Bot 通知渠道，转发内容同时推送给你</p>
+        </div>
+        <div class="nt-header-right">
+            <div class="nt-account-select">
+                <label>账号</label>
+                <select id="account-selector" onchange="switchAccount()">
+                    <option value="">选择账号...</option>
+                </select>
+            </div>
+            <label class="nt-master-toggle">
+                <input type="checkbox" id="nt-enabled" onchange="toggleNotify()" />
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">通知总开关</span>
+            </label>
+        </div>
+    </div>
+
+    <div class="nt-content" id="nt-content" style="display:none;">
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>Bot 配置</h3><p>从 @BotFather 获取 Token</p></div>
+            <div class="nt-card-body">
+                <div class="nt-input-group"><label>Bot Token</label><input id="nt-bot-token" type="password" placeholder="123456:ABC-DEF1234ghIkl..." /></div>
+                <div class="nt-input-group">
+                    <label>通知接收人（TG ID）</label>
+                    <p class="nt-hint">输入用户 ID 或群 ID，按回车添加多个。需先和 Bot 私聊过一次。</p>
+                    <div class="tag-input" id="nt-chat-ids-input">
+                        <div class="tag-list" id="nt-chat-ids-list"></div>
+                        <input type="text" id="nt-chat-ids-field" placeholder="输入 TG ID，按回车添加" />
+                    </div>
+                </div>
+                <div class="nt-input-group">
+                    <label>话题 ID（可选）</label>
+                    <input id="nt-thread-id" type="text" placeholder="论坛话题 ID" />
+                </div>
+            </div>
+        </div>
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>通知模式</h3></div>
+            <div class="nt-card-body">
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>模式</label><select id="nt-mode"><option value="copy">复制消息</option><option value="text">纯文本</option></select></div>
+                    <div class="nt-input-group"><label>每分钟上限</label><input id="nt-rate-limit" type="number" value="18" min="1" max="60" /></div>
+                </div>
+                <div class="nt-input-group" id="nt-template-group" style="display:none;"><label>文本模板</label><textarea id="nt-template" rows="3" placeholder="{text}&#10;---&#10;来源：{source}"></textarea></div>
+            </div>
+        </div>
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>通知事件</h3></div>
+            <div class="nt-card-body">
+                <div class="nt-events">
+                    <label class="nt-event-card"><input type="checkbox" id="nt-event-forward" checked /><div class="nt-event-info"><strong>转发通知</strong><span>消息被成功转发时推送</span></div></label>
+                    <label class="nt-event-card"><input type="checkbox" id="nt-event-red_packet" checked /><div class="nt-event-info"><strong>抢红包通知</strong><span>抢到红包时推送</span></div></label>
+                    <label class="nt-event-card"><input type="checkbox" id="nt-event-error" /><div class="nt-event-info"><strong>错误通知</strong><span>发生错误时推送</span></div></label>
+                </div>
+            </div>
+        </div>
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>高级设置</h3></div>
+            <div class="nt-card-body">
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>队列上限</label><input id="nt-queue-size" type="number" value="500" min="1" /></div>
+                    <div class="nt-input-group"><label>超时（秒）</label><input id="nt-timeout" type="number" value="15" min="1" /></div>
+                </div>
+                <div class="nt-grid">
+                    <label class="tg-checkbox"><input id="nt-include-link" type="checkbox" checked /><span class="tg-checkmark"></span><span>来源链接</span></label>
+                    <label class="tg-checkbox"><input id="nt-silent" type="checkbox" /><span class="tg-checkmark"></span><span>静音</span></label>
+                    <label class="tg-checkbox"><input id="nt-use-proxy" type="checkbox" checked /><span class="tg-checkmark"></span><span>Bot 走代理</span></label>
+                </div>
+            </div>
+        </div>
+        <div class="nt-save-bar">
+            <button class="tg-btn tg-btn-primary" onclick="saveNotify()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>保存</button>
+        </div>
+    </div>
+    <div class="nt-empty" id="nt-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg><h3>请先选择账号</h3><p>从上方下拉框选择一个账号</p></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentAccount = '', ntData = {};
+    let chatIds = [];
+
+    function init() {
+        document.getElementById('nt-mode').addEventListener('change', function() { document.getElementById('nt-template-group').style.display = this.value === 'text' ? 'flex' : 'none'; });
+        const field = document.getElementById('nt-chat-ids-field');
+        field.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && this.value.trim()) {
+                e.preventDefault();
+                if (!chatIds.includes(this.value.trim())) { chatIds.push(this.value.trim()); renderChatIds(); }
+                this.value = '';
+            }
+            if (e.key === 'Backspace' && !this.value && chatIds.length > 0) { chatIds.pop(); renderChatIds(); }
+        });
+        loadAccounts();
+    }
+
+    function renderChatIds() {
+        document.getElementById('nt-chat-ids-list').innerHTML = chatIds.map((id, i) =>
+            `<span class="tag">${escapeHtml(id)}<button onclick="chatIds.splice(${i},1);renderChatIds()">&times;</button></span>`
+        ).join('');
+    }
+    function escapeHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const sel = document.getElementById('account-selector');
+        sel.innerHTML = '<option value="">选择账号...</option>';
+        data.accounts.forEach(a => { sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + a.user + ')' : ''}</option>`; });
+        if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
+    }
+    async function switchAccount() {
+        const sel = document.getElementById('account-selector');
+        currentAccount = sel.value;
+        if (!currentAccount) { document.getElementById('nt-content').style.display = 'none'; document.getElementById('nt-empty').style.display = 'flex'; return; }
+        document.getElementById('nt-content').style.display = 'block'; document.getElementById('nt-empty').style.display = 'none';
+        await loadNotify();
+    }
+    async function loadNotify() {
+        const res = await fetch(`/api/config/${currentAccount}/notify`);
+        if (!res.ok) return;
+        ntData = await res.json();
+        document.getElementById('nt-enabled').checked = ntData.enabled;
+        document.getElementById('nt-bot-token').value = (ntData.bot_token || '').replace(/\w{3}$/, '') ? ntData.bot_token || '' : '';
+        chatIds = [...(ntData.chat_ids || [])];
+        if (chatIds.length === 0 && ntData.chat_id) chatIds = [ntData.chat_id];
+        renderChatIds();
+        document.getElementById('nt-thread-id').value = ntData.message_thread_id || '';
+        document.getElementById('nt-mode').value = ntData.mode || 'copy';
+        document.getElementById('nt-rate-limit').value = ntData.rate_limit_per_minute || 18;
+        document.getElementById('nt-queue-size').value = ntData.queue_size || 500;
+        document.getElementById('nt-timeout').value = ntData.timeout || 15;
+        document.getElementById('nt-template').value = ntData.template || '';
+        document.getElementById('nt-include-link').checked = ntData.include_source_link !== false;
+        document.getElementById('nt-silent').checked = ntData.silent || false;
+        document.getElementById('nt-use-proxy').checked = ntData.use_proxy !== false;
+        document.getElementById('nt-template-group').style.display = (ntData.mode || 'copy') === 'text' ? 'flex' : 'none';
+        const events = ntData.events || ['forward', 'red_packet'];
+        document.getElementById('nt-event-forward').checked = events.includes('forward');
+        document.getElementById('nt-event-red_packet').checked = events.includes('red_packet');
+        document.getElementById('nt-event-error').checked = events.includes('error');
+    }
+    async function toggleNotify() {
+        const enabled = document.getElementById('nt-enabled').checked;
+        await fetch(`/api/config/${currentAccount}/notify`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...ntData, enabled}) });
+    }
+    async function saveNotify() {
+        const events = [];
+        if (document.getElementById('nt-event-forward').checked) events.push('forward');
+        if (document.getElementById('nt-event-red_packet').checked) events.push('red_packet');
+        if (document.getElementById('nt-event-error').checked) events.push('error');
+        const payload = {
+            enabled: document.getElementById('nt-enabled').checked,
+            bot_token: document.getElementById('nt-bot-token').value || null,
+            chat_id: chatIds[0] || null,
+            chat_ids: chatIds,
+            message_thread_id: document.getElementById('nt-thread-id').value ? parseInt(document.getElementById('nt-thread-id').value) : null,
+            mode: document.getElementById('nt-mode').value,
+            rate_limit_per_minute: parseInt(document.getElementById('nt-rate-limit').value) || 18,
+            queue_size: parseInt(document.getElementById('nt-queue-size').value) || 500,
+            timeout: parseFloat(document.getElementById('nt-timeout').value) || 15,
+            template: document.getElementById('nt-template').value || null,
+            include_source_link: document.getElementById('nt-include-link').checked,
+            silent: document.getElementById('nt-silent').checked,
+            use_proxy: document.getElementById('nt-use-proxy').checked,
+            events: events
+        };
+        const res = await fetch(`/api/config/${currentAccount}/notify`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        if (res.ok) { toast('保存成功', true); loadNotify(); } else { toast('保存失败', false); }
+    }
+    init();
+</script>
+{% endblock %}

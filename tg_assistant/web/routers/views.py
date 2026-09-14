@@ -1,6 +1,8 @@
 """页面路由（返回 HTML）。"""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -56,6 +58,21 @@ async def proxy_page(request: Request) -> HTMLResponse:
     return await _render(request, "proxy.html")
 
 
+@router.get("/rules", response_class=HTMLResponse)
+async def rules_page(request: Request) -> HTMLResponse:
+    return await _render(request, "rules.html")
+
+
+@router.get("/red_packet", response_class=HTMLResponse)
+async def red_packet_page(request: Request) -> HTMLResponse:
+    return await _render(request, "red_packet.html")
+
+
+@router.get("/notify", response_class=HTMLResponse)
+async def notify_page(request: Request) -> HTMLResponse:
+    return await _render(request, "notify.html")
+
+
 @router.get("/chats/{name}", response_class=HTMLResponse)
 async def chats_page(request: Request, name: str) -> HTMLResponse:
     state = get_state(request)
@@ -64,7 +81,5 @@ async def chats_page(request: Request, name: str) -> HTMLResponse:
         return RedirectResponse(url="/accounts", status_code=303)
     return await _render(request, "chats.html", account=account)
 
-
-from typing import Any  # noqa: E402 - 放在文件末尾避免循环导入
 
 __all__ = ["router"]

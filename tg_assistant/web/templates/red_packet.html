@@ -1,0 +1,314 @@
+{% extends "base.html" %}
+{% block title %}抢红包 · TG-Assistant{% endblock %}
+
+{% block content %}
+<div class="rp-page">
+    <div class="rp-header">
+        <div class="rp-header-left">
+            <h1>抢红包设置</h1>
+            <p class="text-muted">可视化配置自动抢红包规则</p>
+        </div>
+        <div class="rp-header-right">
+            <div class="rp-account-select">
+                <label>账号</label>
+                <select id="account-selector" onchange="switchAccount()">
+                    <option value="">选择账号...</option>
+                </select>
+            </div>
+            <label class="rp-master-toggle">
+                <input type="checkbox" id="rp-enabled" onchange="toggleRedPacket()" />
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">抢红包总开关</span>
+            </label>
+        </div>
+    </div>
+
+    <div class="rp-content" id="rp-content" style="display:none;">
+        <!-- 监听频道 -->
+        <div class="rp-card">
+            <div class="rp-card-header"><h3>监听频道</h3><p>留空表示监听全部频道</p></div>
+            <div class="rp-card-body">
+                <div class="tag-input" id="rp-chats-input">
+                    <div class="tag-list" id="rp-chats-list"></div>
+                    <input type="text" id="rp-chats-field" placeholder="输入频道 ID 或 @username，按回车添加" />
+                </div>
+                <div class="rp-input-group" style="margin-top:12px;">
+                    <label>排除频道</label>
+                    <div class="tag-input" id="rp-exclude-chats-input">
+                        <div class="tag-list" id="rp-exclude-chats-list"></div>
+                        <input type="text" id="rp-exclude-chats-field" placeholder="排除的频道..." />
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 识别规则 -->
+        <div class="rp-card">
+            <div class="rp-card-header"><h3>识别规则</h3><p>如何识别红包消息</p></div>
+            <div class="rp-card-body">
+                <div class="rp-grid">
+                    <div class="rp-input-group">
+                        <label>抢包策略</label>
+                        <select id="rp-strategy">
+                            <option value="auto">自动（按钮 + 关键词）</option>
+                            <option value="button">仅按钮</option>
+                            <option value="keyword">口令模式</option>
+                        </select>
+                    </div>
+                    <div class="rp-input-group">
+                        <label>只处理机器人红包</label>
+                        <select id="rp-only-bots">
+                            <option value="false">否</option>
+                            <option value="true">是（推荐）</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="rp-input-group">
+                    <label>按钮关键词</label>
+                    <p class="rp-hint">内联按钮文字包含任一关键词即视为红包按钮</p>
+                    <div class="tag-input" id="rp-button-keywords-input">
+                        <div class="tag-list" id="rp-button-keywords-list"></div>
+                        <input type="text" id="rp-button-keywords-field" placeholder="输入关键词，按回车添加" />
+                    </div>
+                </div>
+                <div class="rp-input-group">
+                    <label>消息正文正则</label>
+                    <p class="rp-hint">消息正文命中任一正则才尝试抢（为空表示只要有按钮就抢）</p>
+                    <div class="tag-input" id="rp-text-patterns-input">
+                        <div class="tag-list" id="rp-text-patterns-list"></div>
+                        <input type="text" id="rp-text-patterns-field" placeholder="输入正则，按回车添加" />
+                    </div>
+                </div>
+                <div class="rp-input-group" id="rp-keyword-group" style="display:none;">
+                    <label>口令提取正则</label>
+                    <p class="rp-hint">从正文提取口令/编号，第一个捕获组作为 {'{code}'}</p>
+                    <input id="rp-code-pattern" type="text" placeholder="如：口令[：:]\s*(\w+)" />
+                    <label style="margin-top:8px;">发送模板</label>
+                    <input id="rp-keyword-template" type="text" placeholder='如：/grab {code} 或 抢' />
+                </div>
+            </div>
+        </div>
+
+        <!-- 成功/失败判定 -->
+        <div class="rp-card">
+            <div class="rp-card-header"><h3>成功/失败判定</h3><p>如何判断抢包结果</p></div>
+            <div class="rp-card-body">
+                <div class="rp-input-group">
+                    <label>成功关键词</label>
+                    <div class="tag-input" id="rp-success-patterns-input">
+                        <div class="tag-list" id="rp-success-patterns-list"></div>
+                        <input type="text" id="rp-success-patterns-field" placeholder="输入正则，按回车添加" />
+                    </div>
+                </div>
+                <div class="rp-input-group">
+                    <label>失败关键词</label>
+                    <div class="tag-input" id="rp-failure-patterns-input">
+                        <div class="tag-list" id="rp-failure-patterns-list"></div>
+                        <input type="text" id="rp-failure-patterns-field" placeholder="输入正则，按回车添加" />
+                    </div>
+                </div>
+                <div class="rp-grid">
+                    <div class="rp-input-group">
+                        <label>等待超时（秒）</label>
+                        <input id="rp-wait-timeout" type="number" value="8" min="0" max="120" step="0.5" />
+                    </div>
+                    <div class="rp-input-group">
+                        <label>需要 @自己 才算成功</label>
+                        <select id="rp-require-mention"><option value="false">否</option><option value="true">是</option></select>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 抢包回复 -->
+        <div class="rp-card">
+            <div class="rp-card-header"><h3>抢包回复</h3><p>抢到后的随机回复</p></div>
+            <div class="rp-card-body">
+                <label class="tg-checkbox">
+                    <input id="rp-reply-enabled" type="checkbox" />
+                    <span class="tg-checkmark"></span><span>启用抢包回复</span>
+                </label>
+                <div id="rp-reply-settings" style="display:none;">
+                    <div class="rp-input-group">
+                        <label>回复语列表</label><p class="rp-hint">随机抽一条发送</p>
+                        <div class="tag-input" id="rp-reply-texts-input">
+                            <div class="tag-list" id="rp-reply-texts-list"></div>
+                            <input type="text" id="rp-reply-texts-field" placeholder="输入回复语，按回车添加" />
+                        </div>
+                    </div>
+                    <div class="rp-grid">
+                        <div class="rp-input-group"><label>仅成功后回复</label><select id="rp-reply-on-success"><option value="true">是（推荐）</option><option value="false">否</option></select></div>
+                        <div class="rp-input-group"><label>回复冷却（秒）</label><input id="rp-reply-cooldown" type="number" value="0" min="0" step="1" /></div>
+                    </div>
+                    <div class="rp-grid">
+                        <div class="rp-input-group"><label>回复延迟（秒）</label><div class="rp-range-inputs"><input id="rp-reply-delay-min" type="number" value="0.8" min="0" step="0.1" /><span>~</span><input id="rp-reply-delay-max" type="number" value="2.5" min="0" step="0.1" /></div></div>
+                        <div class="rp-input-group"><label>引用红包消息</label><select id="rp-reply-to-message"><option value="true">是</option><option value="false">否</option></select></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 高级设置 -->
+        <div class="rp-card">
+            <div class="rp-card-header"><h3>高级设置</h3></div>
+            <div class="rp-card-body">
+                <div class="rp-grid">
+                    <div class="rp-input-group"><label>点击前延迟（秒）</label><input id="rp-delay" type="number" value="0" min="0" max="60" step="0.1" /></div>
+                    <div class="rp-input-group"><label>随机抖动（秒）</label><input id="rp-jitter" type="number" value="0" min="0" max="10" step="0.1" /></div>
+                    <div class="rp-input-group"><label>最多重试次数</label><input id="rp-max-attempts" type="number" value="2" min="1" max="5" step="1" /></div>
+                    <div class="rp-input-group"><label>并发上限</label><input id="rp-max-concurrency" type="number" value="3" min="1" max="20" step="1" /></div>
+                </div>
+                <div class="rp-grid">
+                    <label class="tg-checkbox"><input id="rp-notify" type="checkbox" checked /><span class="tg-checkmark"></span><span>推送通知</span></label>
+                    <label class="tg-checkbox"><input id="rp-include-edited" type="checkbox" checked /><span class="tg-checkmark"></span><span>处理编辑事件</span></label>
+                    <label class="tg-checkbox"><input id="rp-ignore-self" type="checkbox" checked /><span class="tg-checkmark"></span><span>忽略自己消息</span></label>
+                </div>
+            </div>
+        </div>
+
+        <div class="rp-save-bar">
+            <button class="tg-btn tg-btn-primary" onclick="saveRedPacket()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                保存设置
+            </button>
+        </div>
+    </div>
+
+    <div class="rp-empty" id="rp-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>
+        <h3>请先选择账号</h3>
+        <p>从上方下拉框选择一个账号来配置抢红包</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentAccount = '';
+    let rpData = {};
+    const tagFields = ['chats', 'exclude_chats', 'button_keywords', 'text_patterns', 'success_patterns', 'failure_patterns', 'reply_texts'];
+    const tagInputs = {};
+
+    function init() {
+        tagFields.forEach(f => { tagInputs[f] = []; initTagInput(f); });
+        document.getElementById('rp-strategy').addEventListener('change', function() {
+            document.getElementById('rp-keyword-group').style.display = this.value === 'keyword' ? 'flex' : 'none';
+        });
+        document.getElementById('rp-reply-enabled').addEventListener('change', function() {
+            document.getElementById('rp-reply-settings').style.display = this.checked ? 'block' : 'none';
+        });
+        loadAccounts();
+    }
+
+    function initTagInput(field) {
+        const input = document.getElementById(`rp-${field}-field`);
+        if (!input) return;
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && this.value.trim()) {
+                e.preventDefault();
+                if (!tagInputs[field].includes(this.value.trim())) {
+                    tagInputs[field].push(this.value.trim());
+                    renderTags(field);
+                }
+                this.value = '';
+            }
+            if (e.key === 'Backspace' && !this.value && tagInputs[field].length > 0) {
+                tagInputs[field].pop();
+                renderTags(field);
+            }
+        });
+    }
+
+    function renderTags(field) {
+        const list = document.getElementById(`rp-${field}-list`);
+        if (!list) return;
+        list.innerHTML = tagInputs[field].map((tag, i) =>
+            `<span class="tag">${escapeHtml(tag)}<button onclick="removeTag('${field}', ${i})">&times;</button></span>`
+        ).join('');
+    }
+
+    function removeTag(field, index) { tagInputs[field].splice(index, 1); renderTags(field); }
+    function escapeHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const sel = document.getElementById('account-selector');
+        sel.innerHTML = '<option value="">选择账号...</option>';
+        data.accounts.forEach(a => { sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + a.user + ')' : ''}</option>`; });
+        if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
+    }
+
+    async function switchAccount() {
+        const sel = document.getElementById('account-selector');
+        currentAccount = sel.value;
+        if (!currentAccount) { document.getElementById('rp-content').style.display = 'none'; document.getElementById('rp-empty').style.display = 'flex'; return; }
+        document.getElementById('rp-content').style.display = 'block'; document.getElementById('rp-empty').style.display = 'none';
+        await loadRedPacket();
+    }
+
+    async function loadRedPacket() {
+        const res = await fetch(`/api/config/${currentAccount}/red_packet`);
+        if (!res.ok) return;
+        rpData = await res.json();
+        document.getElementById('rp-enabled').checked = rpData.enabled;
+        tagInputs.chats = [...(rpData.chats || [])];
+        tagInputs.exclude_chats = [...(rpData.exclude_chats || [])];
+        tagInputs.button_keywords = [...(rpData.detect?.button_keywords || [])];
+        tagInputs.text_patterns = [...(rpData.detect?.text_patterns || [])];
+        tagInputs.success_patterns = [...(rpData.success?.success_patterns || [])];
+        tagInputs.failure_patterns = [...(rpData.success?.failure_patterns || [])];
+        tagInputs.reply_texts = [...(rpData.reply?.texts || [])];
+        tagFields.forEach(renderTags);
+        document.getElementById('rp-strategy').value = rpData.strategy || 'auto';
+        document.getElementById('rp-only-bots').value = String(rpData.detect?.only_from_bots || false);
+        document.getElementById('rp-wait-timeout').value = rpData.success?.wait_timeout || 8;
+        document.getElementById('rp-require-mention').value = String(rpData.success?.require_self_mention || false);
+        document.getElementById('rp-delay').value = rpData.delay || 0;
+        document.getElementById('rp-jitter').value = rpData.jitter || 0;
+        document.getElementById('rp-max-attempts').value = rpData.max_attempts || 2;
+        document.getElementById('rp-max-concurrency').value = rpData.max_concurrency || 3;
+        document.getElementById('rp-notify').checked = rpData.notify !== false;
+        document.getElementById('rp-include-edited').checked = rpData.include_edited !== false;
+        document.getElementById('rp-ignore-self').checked = rpData.detect?.ignore_self !== false;
+        document.getElementById('rp-code-pattern').value = rpData.detect?.code_pattern || '';
+        document.getElementById('rp-keyword-template').value = rpData.detect?.keyword_template || '';
+        document.getElementById('rp-keyword-group').style.display = (rpData.strategy || 'auto') === 'keyword' ? 'flex' : 'none';
+        document.getElementById('rp-reply-enabled').checked = rpData.reply?.enabled || false;
+        document.getElementById('rp-reply-settings').style.display = rpData.reply?.enabled ? 'block' : 'none';
+        document.getElementById('rp-reply-on-success').value = String(rpData.reply?.only_on_success !== false);
+        document.getElementById('rp-reply-cooldown').value = rpData.reply?.cooldown || 0;
+        document.getElementById('rp-reply-to-message').value = String(rpData.reply?.reply_to_message !== false);
+        const dr = rpData.reply?.delay_range || [0.8, 2.5];
+        document.getElementById('rp-reply-delay-min').value = dr[0];
+        document.getElementById('rp-reply-delay-max').value = dr[1];
+    }
+
+    async function toggleRedPacket() {
+        const enabled = document.getElementById('rp-enabled').checked;
+        await fetch(`/api/config/${currentAccount}/red_packet/enabled`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled}) });
+    }
+
+    async function saveRedPacket() {
+        const payload = {
+            enabled: document.getElementById('rp-enabled').checked,
+            chats: tagInputs.chats,
+            exclude_chats: tagInputs.exclude_chats,
+            strategy: document.getElementById('rp-strategy').value,
+            detect: { button_keywords: tagInputs.button_keywords, text_patterns: tagInputs.text_patterns, code_pattern: document.getElementById('rp-code-pattern').value || null, keyword_template: document.getElementById('rp-keyword-template').value || null, only_from_bots: document.getElementById('rp-only-bots').value === 'true', ignore_self: document.getElementById('rp-ignore-self').checked },
+            success: { success_patterns: tagInputs.success_patterns, failure_patterns: tagInputs.failure_patterns, wait_timeout: parseFloat(document.getElementById('rp-wait-timeout').value) || 0, require_self_mention: document.getElementById('rp-require-mention').value === 'true' },
+            reply: { enabled: document.getElementById('rp-reply-enabled').checked, texts: tagInputs.reply_texts, only_on_success: document.getElementById('rp-reply-on-success').value === 'true', delay_range: [parseFloat(document.getElementById('rp-reply-delay-min').value) || 0, parseFloat(document.getElementById('rp-reply-delay-max').value) || 0], reply_to_message: document.getElementById('rp-reply-to-message').value === 'true', cooldown: parseFloat(document.getElementById('rp-reply-cooldown').value) || 0 },
+            delay: parseFloat(document.getElementById('rp-delay').value) || 0,
+            jitter: parseFloat(document.getElementById('rp-jitter').value) || 0,
+            max_attempts: parseInt(document.getElementById('rp-max-attempts').value) || 2,
+            max_concurrency: parseInt(document.getElementById('rp-max-concurrency').value) || 3,
+            notify: document.getElementById('rp-notify').checked,
+            include_edited: document.getElementById('rp-include-edited').checked
+        };
+        const res = await fetch(`/api/config/${currentAccount}/red_packet`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        if (res.ok) { toast('保存成功', true); loadRedPacket(); } else { toast('保存失败', false); }
+    }
+
+    init();
+</script>
+{% endblock %}

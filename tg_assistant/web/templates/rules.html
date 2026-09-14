@@ -1,0 +1,671 @@
+{% extends "base.html" %}
+{% block title %}转发规则 · TG-Assistant{% endblock %}
+
+{% block content %}
+<div class="rules-page">
+    <!-- 页面头部 -->
+    <div class="rules-header">
+        <div class="rules-header-left">
+            <h1>转发规则</h1>
+            <p class="text-muted">管理正则表达式转发规则，可视化配置消息转发</p>
+        </div>
+        <div class="rules-header-right">
+            <div class="rules-account-select">
+                <label>账号</label>
+                <select id="account-selector" onchange="switchAccount()">
+                    <option value="">选择账号...</option>
+                </select>
+            </div>
+            <div id="account-status" class="rules-account-status" style="display:none;">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text" class="text-muted">未运行</span>
+            </div>
+            <button class="tg-btn tg-btn-sm" id="btn-start-account" onclick="startAccount()" style="display:none;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                启动
+            </button>
+            <button class="tg-btn tg-btn-sm tg-btn-danger" id="btn-stop-account" onclick="stopAccount()" style="display:none;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                停止
+            </button>
+            <button class="tg-btn tg-btn-primary" onclick="openAddRule()" id="btn-add-rule" style="display:none;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                新建规则
+            </button>
+        </div>
+    </div>
+
+    <!-- 规则列表 -->
+    <div class="rules-list" id="rules-list">
+        <div class="rules-empty" id="rules-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+            </svg>
+            <h3>请先选择账号</h3>
+            <p>从上方下拉框选择一个账号来管理其转发规则</p>
+        </div>
+    </div>
+</div>
+
+<!-- 规则编辑器 Modal -->
+<div class="tg-modal" id="rule-modal">
+    <div class="tg-modal-overlay" onclick="closeRuleModal()"></div>
+    <div class="tg-modal-dialog">
+        <div class="tg-modal-header">
+            <h2 id="modal-title">新建规则</h2>
+            <button class="tg-modal-close" onclick="closeRuleModal()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+            </button>
+        </div>
+        <div class="tg-modal-body">
+            <div class="tg-rule-form">
+                <!-- 基本信息 -->
+                <div class="form-section">
+                    <h3>基本信息</h3>
+                    <div class="form-grid">
+                        <div class="tg-input-group">
+                            <label>规则 ID <span class="required">*</span></label>
+                            <input id="rule-id" type="text" placeholder="如 rule-1、forward-btc" />
+                        </div>
+                        <div class="tg-input-group">
+                            <label>规则名称</label>
+                            <input id="rule-name" type="text" placeholder="如：转发 BTC 信号" />
+                        </div>
+                    </div>
+                    <label class="tg-checkbox">
+                        <input id="rule-enabled" type="checkbox" checked />
+                        <span class="tg-checkmark"></span>
+                        <span>启用规则</span>
+                    </label>
+                </div>
+
+                <!-- 来源 -->
+                <div class="form-section">
+                    <h3>来源频道</h3>
+                    <p class="form-hint">留空表示监听全部频道（不推荐，量大时开销高）</p>
+                    <div class="tag-input" id="sources-input">
+                        <div class="tag-list" id="sources-list"></div>
+                        <input type="text" id="sources-field" placeholder="输入频道 ID 或 @username，按回车添加" />
+                    </div>
+                    <div class="form-grid">
+                        <div class="tg-input-group">
+                            <label>排除来源</label>
+                            <div class="tag-input" id="exclude-sources-input">
+                                <div class="tag-list" id="exclude-sources-list"></div>
+                                <input type="text" id="exclude-sources-field" placeholder="排除的频道..." />
+                            </div>
+                        </div>
+                        <div class="tg-input-group">
+                            <label>发送者白名单</label>
+                            <div class="tag-input" id="from-users-input">
+                                <div class="tag-list" id="from-users-list"></div>
+                                <input type="text" id="from-users-field" placeholder="只转发这些人..." />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 目标 -->
+                <div class="form-section">
+                    <h3>转发目标 <span class="required">*</span></h3>
+                    <div class="tag-input" id="targets-input">
+                        <div class="tag-list" id="targets-list"></div>
+                        <input type="text" id="targets-field" placeholder="输入目标频道 ID 或 @username，按回车添加" />
+                    </div>
+                </div>
+
+                <!-- 匹配规则 -->
+                <div class="form-section">
+                    <h3>匹配规则</h3>
+                    <div class="form-grid">
+                        <div class="tg-input-group">
+                            <label>匹配模式</label>
+                            <select id="match-mode">
+                                <option value="regex">正则表达式</option>
+                                <option value="contains">包含文本</option>
+                                <option value="exact">精确匹配</option>
+                                <option value="all">全部消息</option>
+                            </select>
+                        </div>
+                        <div class="tg-input-group">
+                            <label>匹配字段</label>
+                            <select id="match-fields">
+                                <option value="text-caption">正文 + 图片说明</option>
+                                <option value="text">仅正文</option>
+                                <option value="caption">仅图片说明</option>
+                                <option value="text-caption-buttons">正文 + 说明 + 按钮</option>
+                            </select>
+                        </div>
+                    </div>
+                    <label class="tg-checkbox">
+                        <input id="ignore-case" type="checkbox" checked />
+                        <span class="tg-checkmark"></span>
+                        <span>忽略大小写</span>
+                    </label>
+
+                    <!-- 正则输入 -->
+                    <div class="tg-input-group" id="patterns-group">
+                        <label>正则表达式 <span class="required">*</span></label>
+                        <div class="tag-input" id="patterns-input">
+                            <div class="tag-list" id="patterns-list"></div>
+                            <input type="text" id="patterns-field" placeholder="输入正则，按回车添加，如：(?:BTC|比特币)" />
+                        </div>
+                    </div>
+
+                    <!-- 排除规则 -->
+                    <div class="tg-input-group">
+                        <label>排除规则</label>
+                        <div class="tag-input" id="exclude-patterns-input">
+                            <div class="tag-list" id="exclude-patterns-list"></div>
+                            <input type="text" id="exclude-patterns-field" placeholder="匹配到这些规则时跳过..." />
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 正则测试器 -->
+                <div class="form-section">
+                    <h3>正则测试器</h3>
+                    <div class="regex-tester">
+                        <textarea id="test-text" rows="3" placeholder="输入测试消息内容..."></textarea>
+                        <button class="tg-btn tg-btn-ghost" onclick="testRegex()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3"/>
+                            </svg>
+                            测试匹配
+                        </button>
+                        <div class="test-result" id="test-result"></div>
+                    </div>
+                </div>
+
+                <!-- 转发设置 -->
+                <div class="form-section">
+                    <h3>转发设置</h3>
+                    <div class="form-grid">
+                        <div class="tg-input-group">
+                            <label>转发模式</label>
+                            <select id="forward-mode">
+                                <option value="copy">服务端复制（无转发标记）</option>
+                                <option value="forward">原生转发（带转发标记）</option>
+                                <option value="text">纯文本模板</option>
+                            </select>
+                        </div>
+                        <div class="tg-input-group">
+                            <label>转发延迟（秒）</label>
+                            <input id="rule-delay" type="number" value="0" min="0" max="600" step="0.5" />
+                        </div>
+                    </div>
+                    <div class="tg-input-group" id="template-group" style="display:none;">
+                        <label>文本模板</label>
+                        <input id="rule-template" type="text" placeholder="{text}&#10;---&#10;来源：{source}" />
+                        <p class="form-hint">可用变量：{text} {caption} {source} {chat_name} {sender} {g1} {g2} ...</p>
+                    </div>
+                    <div class="form-grid">
+                        <label class="tg-checkbox">
+                            <input id="rule-notify" type="checkbox" />
+                            <span class="tg-checkmark"></span>
+                            <span>同时发送 Bot 通知</span>
+                        </label>
+                        <label class="tg-checkbox">
+                            <input id="rule-silent" type="checkbox" />
+                            <span class="tg-checkmark"></span>
+                            <span>静音发送</span>
+                        </label>
+                        <label class="tg-checkbox">
+                            <input id="rule-media-group" type="checkbox" checked />
+                            <span class="tg-checkmark"></span>
+                            <span>相册聚合转发</span>
+                        </label>
+                        <label class="tg-checkbox">
+                            <input id="rule-include-link" type="checkbox" checked />
+                            <span class="tg-checkmark"></span>
+                            <span>附带来源链接</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="tg-modal-footer">
+            <button class="tg-btn tg-btn-ghost" onclick="closeRuleModal()">取消</button>
+            <button class="tg-btn tg-btn-primary" onclick="saveRule()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+                    <polyline points="17 21 17 13 7 13 7 21"/>
+                    <polyline points="7 3 7 8 15 8"/>
+                </svg>
+                保存规则
+            </button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // 全局数据
+    let ruleData = { rules: [], enabled: false };
+    let accounts = [];
+    let currentAccount = '';
+    let editingRuleId = null;
+
+    // Tag input 数据
+    const tagInputs = {
+        sources: [], exclude_sources: [], targets: [],
+        from_users: [], patterns: [], exclude_patterns: []
+    };
+
+    // 初始化
+    async function init() {
+        await loadAccounts();
+        initTagInputs();
+        // 模式切换
+        document.getElementById('match-mode').addEventListener('change', function() {
+            document.getElementById('patterns-group').style.display = this.value === 'all' ? 'none' : 'flex';
+        });
+        document.getElementById('forward-mode').addEventListener('change', function() {
+            document.getElementById('template-group').style.display = this.value === 'text' ? 'flex' : 'none';
+        });
+        // 自动测试
+        document.getElementById('test-text').addEventListener('input', debounce(testRegex, 500));
+        document.getElementById('patterns-field').addEventListener('change', debounce(testRegex, 300));
+    }
+
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        accounts = data.accounts;
+        const sel = document.getElementById('account-selector');
+        sel.innerHTML = '<option value="">选择账号...</option>';
+        accounts.forEach(a => {
+            sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + a.user + ')' : ''}</option>`;
+        });
+        if (accounts.length > 0) {
+            sel.value = accounts[0].name;
+            switchAccount();
+        }
+    }
+
+    async function switchAccount() {
+        const sel = document.getElementById('account-selector');
+        currentAccount = sel.value;
+        document.getElementById('btn-add-rule').style.display = currentAccount ? 'inline-flex' : 'none';
+        document.getElementById('account-status').style.display = currentAccount ? 'flex' : 'none';
+        document.getElementById('btn-start-account').style.display = currentAccount ? 'inline-flex' : 'none';
+        document.getElementById('btn-stop-account').style.display = currentAccount ? 'inline-flex' : 'none';
+        if (!currentAccount) {
+            document.getElementById('rules-list').innerHTML = `
+                <div class="rules-empty" id="rules-empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+                    <h3>请先选择账号</h3>
+                    <p>从上方下拉框选择一个账号来管理其转发规则</p>
+                </div>`;
+            return;
+        }
+        await loadRules();
+        await refreshAccountStatus();
+    }
+
+    async function refreshAccountStatus() {
+        if (!currentAccount) return;
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        const account = data.accounts.find(a => a.name === currentAccount);
+        if (account) {
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            if (account.running) {
+                dot.className = 'status-dot status-running';
+                text.textContent = '运行中';
+            } else if (account.session_exists) {
+                dot.className = 'status-dot status-stopped';
+                text.textContent = '已登录';
+            } else {
+                dot.className = 'status-dot status-offline';
+                text.textContent = '未登录';
+            }
+        }
+    }
+
+    async function startAccount() {
+        if (!currentAccount) { toast('请先选择账号', false); return; }
+        const res = await fetch(`/api/run/start/${currentAccount}`, {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+            toast('启动成功', true);
+        } else {
+            toast(data.message || '启动失败', false);
+        }
+        setTimeout(refreshAccountStatus, 2000);
+    }
+
+    async function stopAccount() {
+        if (!currentAccount) { toast('请先选择账号', false); return; }
+        const res = await fetch(`/api/run/stop/${currentAccount}`, {method: 'POST'});
+        const data = await res.json();
+        if (data.ok) {
+            toast('已停止', true);
+        } else {
+            toast(data.message || '停止失败', false);
+        }
+        setTimeout(refreshAccountStatus, 2000);
+    }
+
+    async function loadRules() {
+        const res = await fetch(`/api/config/${currentAccount}/rules`);
+        if (!res.ok) return;
+        ruleData = await res.json();
+        document.getElementById('forward-enabled').checked = ruleData.enabled;
+        renderRules();
+    }
+
+    function renderRules() {
+        const list = document.getElementById('rules-list');
+        const rules = ruleData.rules;
+        if (rules.length === 0) {
+            list.innerHTML = `
+                <div class="rules-empty" id="rules-empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                    <h3>还没有转发规则</h3>
+                    <p>点击右上角「新建规则」开始创建</p>
+                </div>`;
+            return;
+        }
+        list.innerHTML = rules.map(rule => `
+            <div class="rule-card ${rule.enabled ? '' : 'rule-disabled'}" data-id="${rule.id}">
+                <div class="rule-card-header">
+                    <div class="rule-card-title">
+                        <label class="tg-checkbox rule-toggle">
+                            <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="toggleRule('${rule.id}', this.checked)" onclick="event.stopPropagation()" />
+                            <span class="tg-checkmark"></span>
+                        </label>
+                        <div>
+                            <div class="rule-name">${rule.name || rule.id}</div>
+                            <div class="rule-id">${rule.id}</div>
+                        </div>
+                    </div>
+                    <div class="rule-card-actions">
+                        <button class="tg-btn tg-btn-sm tg-btn-ghost" onclick="editRule('${rule.id}')" title="编辑">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                        </button>
+                        <button class="tg-btn tg-btn-sm tg-btn-danger" onclick="deleteRule('${rule.id}')" title="删除">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="rule-card-body">
+                    <div class="rule-flow">
+                        <div class="rule-flow-item">
+                            <div class="rule-flow-label">来源</div>
+                            <div class="rule-flow-value">${rule.sources && rule.sources.length > 0 ? rule.sources.map(s => `<span class="rule-tag">${s}</span>`).join('') : '<span class="rule-tag rule-tag-all">全部频道</span>'}</div>
+                        </div>
+                        <div class="rule-flow-arrow">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                        </div>
+                        <div class="rule-flow-item">
+                            <div class="rule-flow-label">目标</div>
+                            <div class="rule-flow-value">${rule.targets.map(t => `<span class="rule-tag rule-tag-target">${t}</span>`).join('')}</div>
+                        </div>
+                    </div>
+                    ${rule.match && rule.match.patterns && rule.match.patterns.length > 0 ? `
+                    <div class="rule-match">
+                        <div class="rule-match-label">
+                            <span class="badge-mode badge-${rule.match.mode}">${({regex:'正则',contains:'包含',exact:'精确',all:'全部'})[rule.match.mode] || rule.match.mode}</span>
+                        </div>
+                        <div class="rule-patterns">
+                            ${rule.match.patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('')}
+                        </div>
+                    </div>` : ''}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function escapeHtml(s) {
+        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // ==================== Tag Input ====================
+    function initTagInputs() {
+        const fields = ['sources', 'exclude_sources', 'targets', 'from_users', 'patterns', 'exclude_patterns'];
+        fields.forEach(field => {
+            const input = document.getElementById(`${field}-field`);
+            if (!input) return;
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && this.value.trim()) {
+                    e.preventDefault();
+                    addTag(field, this.value.trim());
+                    this.value = '';
+                }
+                if (e.key === 'Backspace' && !this.value && tagInputs[field].length > 0) {
+                    removeTag(field, tagInputs[field].length - 1);
+                }
+            });
+        });
+    }
+
+    function addTag(field, value) {
+        if (!tagInputs[field].includes(value)) {
+            tagInputs[field].push(value);
+            renderTags(field);
+        }
+    }
+
+    function removeTag(field, index) {
+        tagInputs[field].splice(index, 1);
+        renderTags(field);
+    }
+
+    function renderTags(field) {
+        const list = document.getElementById(`${field}-list`);
+        if (!list) return;
+        list.innerHTML = tagInputs[field].map((tag, i) =>
+            `<span class="tag">${escapeHtml(tag)}<button onclick="removeTag('${field}', ${i})">&times;</button></span>`
+        ).join('');
+    }
+
+    function clearAllTags() {
+        Object.keys(tagInputs).forEach(k => { tagInputs[k] = []; renderTags(k); });
+    }
+
+    // ==================== Modal ====================
+    function openAddRule() {
+        editingRuleId = null;
+        document.getElementById('modal-title').textContent = '新建规则';
+        // 清空表单
+        document.getElementById('rule-id').value = '';
+        document.getElementById('rule-name').value = '';
+        document.getElementById('rule-enabled').checked = true;
+        document.getElementById('match-mode').value = 'regex';
+        document.getElementById('match-fields').value = 'text-caption';
+        document.getElementById('ignore-case').checked = true;
+        document.getElementById('forward-mode').value = 'copy';
+        document.getElementById('rule-delay').value = '0';
+        document.getElementById('rule-template').value = '';
+        document.getElementById('rule-notify').checked = false;
+        document.getElementById('rule-silent').checked = false;
+        document.getElementById('rule-media-group').checked = true;
+        document.getElementById('rule-include-link').checked = true;
+        document.getElementById('test-text').value = '';
+        document.getElementById('test-result').innerHTML = '';
+        clearAllTags();
+        document.getElementById('patterns-group').style.display = 'flex';
+        document.getElementById('template-group').style.display = 'none';
+        document.getElementById('rule-modal').classList.add('active');
+    }
+
+    function closeRuleModal() {
+        document.getElementById('rule-modal').classList.remove('active');
+    }
+
+    function editRule(ruleId) {
+        const rule = ruleData.rules.find(r => r.id === ruleId);
+        if (!rule) return;
+        editingRuleId = ruleId;
+        document.getElementById('modal-title').textContent = '编辑规则';
+        document.getElementById('rule-id').value = rule.id;
+        document.getElementById('rule-name').value = rule.name || '';
+        document.getElementById('rule-enabled').checked = rule.enabled;
+        document.getElementById('match-mode').value = rule.match?.mode || 'regex';
+        document.getElementById('ignore-case').checked = rule.match?.ignore_case !== false;
+        document.getElementById('forward-mode').value = rule.mode || 'copy';
+        document.getElementById('rule-delay').value = rule.delay || 0;
+        document.getElementById('rule-template').value = rule.template || '';
+        document.getElementById('rule-notify').checked = rule.notify || false;
+        document.getElementById('rule-silent').checked = rule.silent || false;
+        document.getElementById('rule-media-group').checked = rule.media_group !== false;
+        document.getElementById('rule-include-link').checked = rule.include_source_link !== false;
+        document.getElementById('test-text').value = '';
+        document.getElementById('test-result').innerHTML = '';
+        // fields
+        const mode = rule.match?.mode || 'regex';
+        document.getElementById('patterns-group').style.display = mode === 'all' ? 'none' : 'flex';
+        document.getElementById('template-group').style.display = (rule.mode || 'copy') === 'text' ? 'flex' : 'none';
+        // match fields
+        const fields = rule.match?.fields || ['text', 'caption'];
+        const fieldsStr = fields.includes('buttons') ? 'text-caption-buttons' : fields.length === 1 ? fields[0] : 'text-caption';
+        document.getElementById('match-fields').value = fieldsStr;
+        // Tags
+        tagInputs.sources = [...(rule.sources || [])];
+        tagInputs.exclude_sources = [...(rule.exclude_sources || [])];
+        tagInputs.targets = [...(rule.targets || [])];
+        tagInputs.from_users = [...(rule.from_users || [])];
+        tagInputs.patterns = [...(rule.match?.patterns || [])];
+        tagInputs.exclude_patterns = [...(rule.match?.exclude_patterns || [])];
+        Object.keys(tagInputs).forEach(renderTags);
+        document.getElementById('rule-modal').classList.add('active');
+    }
+
+    async function saveRule() {
+        if (!currentAccount) { toast('请先选择账号', false); return; }
+        const id = document.getElementById('rule-id').value.trim();
+        if (!id) { toast('请输入规则 ID', false); return; }
+        if (tagInputs.targets.length === 0) { toast('请至少添加一个转发目标', false); return; }
+        const mode = document.getElementById('match-mode').value;
+        if (mode !== 'all' && tagInputs.patterns.length === 0) { toast('请至少添加一个匹配规则', false); return; }
+
+        const fieldsMap = {
+            'text-caption': ['text', 'caption'],
+            'text': ['text'],
+            'caption': ['caption'],
+            'text-caption-buttons': ['text', 'caption', 'buttons']
+        };
+
+        const payload = {
+            id: id,
+            name: document.getElementById('rule-name').value.trim() || null,
+            enabled: document.getElementById('rule-enabled').checked,
+            sources: tagInputs.sources,
+            exclude_sources: tagInputs.exclude_sources,
+            targets: tagInputs.targets,
+            from_users: tagInputs.from_users,
+            match: {
+                mode: mode,
+                patterns: tagInputs.patterns,
+                exclude_patterns: tagInputs.exclude_patterns,
+                ignore_case: document.getElementById('ignore-case').checked,
+                fields: fieldsMap[document.getElementById('match-fields').value] || ['text', 'caption']
+            },
+            mode: document.getElementById('forward-mode').value,
+            template: document.getElementById('rule-template').value || null,
+            delay: parseFloat(document.getElementById('rule-delay').value) || 0,
+            notify: document.getElementById('rule-notify').checked,
+            silent: document.getElementById('rule-silent').checked,
+            media_group: document.getElementById('rule-media-group').checked,
+            include_source_link: document.getElementById('rule-include-link').checked
+        };
+
+        let url = `/api/config/${currentAccount}/rules`;
+        let method = 'POST';
+        if (editingRuleId) {
+            url = `/api/config/${currentAccount}/rules/${editingRuleId}`;
+            method = 'PUT';
+        }
+        const res = await fetch(url, {
+            method: method,
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.ok) {
+            toast('保存成功', true);
+            closeRuleModal();
+            await loadRules();
+        } else {
+            toast(data.detail || '保存失败', false);
+        }
+    }
+
+    async function toggleRule(ruleId, enabled) {
+        const rule = ruleData.rules.find(r => r.id === ruleId);
+        if (!rule) return;
+        const res = await fetch(`/api/config/${currentAccount}/rules/${ruleId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({...rule, enabled: enabled})
+        });
+        if (res.ok) loadRules();
+    }
+
+    async function deleteRule(ruleId) {
+        if (!confirm('确定要删除这条规则吗？')) return;
+        const res = await fetch(`/api/config/${currentAccount}/rules/${ruleId}`, {method: 'DELETE'});
+        if (res.ok) { toast('已删除', true); loadRules(); }
+    }
+
+    async function toggleForward() {
+        const enabled = document.getElementById('forward-enabled').checked;
+        await fetch(`/api/config/${currentAccount}/forward-enabled`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: enabled})
+        });
+    }
+
+    // ==================== 正则测试器 ====================
+    async function testRegex() {
+        const pattern = tagInputs.patterns.join('|');
+        const text = document.getElementById('test-text').value;
+        const mode = document.getElementById('match-mode').value;
+        const ignoreCase = document.getElementById('ignore-case').checked;
+        const resultEl = document.getElementById('test-result');
+
+        if (!pattern || !text) {
+            resultEl.innerHTML = '';
+            return;
+        }
+
+        const res = await fetch(`/api/config/${currentAccount}/rules/test`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({pattern, text, mode, ignore_case: ignoreCase})
+        });
+        const data = await res.json();
+        if (data.error) {
+            resultEl.innerHTML = `<div class="test-result-error">${data.error}</div>`;
+        } else if (data.match) {
+            let html = `<div class="test-result-success">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                匹配成功`;
+            if (data.full_match) html += `<span class="test-match-text">"${escapeHtml(data.full_match)}"</span>`;
+            if (data.groups && data.groups.length > 0) html += `<span class="test-groups">捕获组: ${data.groups.map(g => escapeHtml(g)).join(', ')}</span>`;
+            html += `</div>`;
+            resultEl.innerHTML = html;
+        } else {
+            resultEl.innerHTML = `<div class="test-result-fail">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                不匹配
+            </div>`;
+        }
+    }
+
+    function debounce(fn, ms) {
+        let timer;
+        return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+    }
+
+    init();
+</script>
+{% endblock %}
