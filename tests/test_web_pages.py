@@ -262,3 +262,36 @@ def test_every_get_element_by_id_target_exists() -> None:
             missing[tpl.name] = gap
 
     assert not missing, f"这些模板引用了不存在的元素 id（JS 会抛 null）: {missing}"
+
+
+def test_every_inline_handler_is_defined() -> None:
+    """``onclick="foo()"`` 里的 ``foo`` 必须真的定义了。
+
+    错拼一个函数名不会让模板渲染失败，页面上表现为**按钮点了完全没反应**
+    （只有控制台里一条 ``foo is not defined``）。跨版本搬模板时很容易漏掉
+    某个函数 —— 部署版的 ``accounts.html`` 就引用过 ``reloginAccount()``，
+    而仓库版把它删了。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    tpl_dir = web_dir / "templates"
+    base = (tpl_dir / "base.html").read_text(encoding="utf-8")
+    app_js = (web_dir / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+    pattern = r"""on(?:click|change|input|submit|keydown|keypress)\s*=\s*['"]([A-Za-z_$][\w$]*)\(\)"""
+    missing: dict[str, list[str]] = {}
+    for tpl in sorted(tpl_dir.glob("*.html")):
+        html = tpl.read_text(encoding="utf-8")
+        handlers = set(re.findall(pattern, html))
+        if not handlers:
+            continue
+        pool = "\n".join([html, base, app_js])
+        defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)\s*\(", pool))
+        defined |= set(
+            re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function|\()", pool)
+        )
+        defined |= set(re.findall(r"window\.([A-Za-z_$][\w$]*)\s*=", pool))
+        gap = sorted(h for h in handlers if h not in defined)
+        if gap:
+            missing[tpl.name] = gap
+
+    assert not missing, f"这些模板绑定了未定义的处理函数（按钮会没反应）: {missing}"
