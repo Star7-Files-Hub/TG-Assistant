@@ -137,6 +137,120 @@ def __parse_proxy(url: str) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# 验证码登录
+# --------------------------------------------------------------------------- #
+@router.websocket("/login-code/{name}")
+async def ws_login_code(
+    websocket: WebSocket,
+    name: str,
+    proxy: str = Query(""),
+    force: bool = Query(False),
+    store=Depends(get_store),
+    settings=Depends(get_settings),
+    runtime=Depends(get_runtime),
+    web_settings=Depends(get_web_settings),
+) -> None:
+    """验证码登录 WebSocket（手机号 + 短信验证码 + 可选 2FA）。
+
+    与 ``/ws/login/{name}`` 的区别：扫码登录由服务端一次跑完，这里需要多轮往返，
+    由前端驱动 ——
+
+    ``send_code`` → ``code_sent`` → ``verify`` → ``need_2fa``（可选）
+    → ``verify`` → ``done``。任意阶段都可以发 ``cancel`` 中止。
+
+    无论成功、失败还是取消，``finally`` 都会 ``session.close()``：
+    验证码登录的 client 是**跨多轮**活着的，不主动放掉就会一直占着
+    ``<name>.session`` 的写锁，下次启动直接 ``database is locked``。
+    """
+    await websocket.accept()
+    if await _reject_unauthorized(websocket, web_settings):
+        return
+
+    from tg_assistant.paths import validate_account_name
+
+    try:
+        validate_account_name(name)
+    except Exception as exc:
+        await _ws_send(websocket, {"type": "error", "message": str(exc)})
+        return
+
+    if name in runtime._running_accounts():
+        await _ws_send(websocket, {"type": "error", "message": "账号正在运行中，请先停止"})
+        return
+
+    from tg_assistant.runner import CodeLoginSession, LoginResult
+
+    session = CodeLoginSession(
+        name=name,
+        store=store,
+        settings=settings,
+        proxy_override=__parse_proxy(proxy) if proxy else None,
+        force=force,
+    )
+
+    async def _send_done(result: LoginResult) -> None:
+        await _ws_send(
+            websocket,
+            {
+                "type": "done",
+                "account": result.account,
+                "user_id": result.user_id,
+                "username": result.username,
+                "display_name": result.display_name,
+            },
+        )
+
+    try:
+        first = await session.step(None)
+        if isinstance(first, LoginResult):  # pragma: no cover - 防御性分支
+            await _send_done(first)
+            return
+        await _ws_send(websocket, {"type": "status", "message": first})
+
+        while True:
+            data = await websocket.receive_json()
+            kind = data.get("type")
+
+            if kind == "cancel":
+                await _ws_send(websocket, {"type": "error", "message": "已取消"})
+                return
+
+            if kind == "send_code":
+                phone = str(data.get("phone") or "").strip()
+                if not phone:
+                    await _ws_send(websocket, {"type": "error", "message": "手机号不能为空"})
+                    continue
+                if session.step_index == 2:
+                    message = await session.resend_code(phone)
+                else:
+                    message = await session.step(phone)
+                await _ws_send(websocket, {"type": "code_sent", "message": message})
+
+            elif kind == "verify":
+                code = str(data.get("code") or "").strip()
+                if not code:
+                    await _ws_send(websocket, {"type": "error", "message": "验证码不能为空"})
+                    continue
+                outcome = await session.step((code, str(data.get("password") or "")))
+                if isinstance(outcome, LoginResult):
+                    await _send_done(outcome)
+                    return
+                # 验证码通过了，但账号开了两步验证 —— 还差密码。
+                await _ws_send(websocket, {"type": "need_2fa", "message": outcome})
+
+            else:
+                await _ws_send(
+                    websocket, {"type": "error", "message": f"未知消息类型：{kind}"}
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _ws_send(websocket, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+    finally:
+        await session.close()
+
+
+# --------------------------------------------------------------------------- #
 # 实时日志 + 事件
 # --------------------------------------------------------------------------- #
 @router.websocket("/logs")

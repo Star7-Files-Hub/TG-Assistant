@@ -15,7 +15,18 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from pyrogram import Client
-from pyrogram.errors import AuthKeyUnregistered, RPCError, Unauthorized, UserDeactivated
+from pyrogram.errors import (
+    AuthKeyUnregistered,
+    BadRequest,
+    PasswordHashInvalid,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    PhoneNumberInvalid,
+    RPCError,
+    SessionPasswordNeeded,
+    Unauthorized,
+    UserDeactivated,
+)
 
 from .client import (
     ClientBundle,
@@ -253,6 +264,263 @@ def _guard_duplicate(store: Store, name: str, user_id: int, alog: Any) -> None:
                 user_id=user_id,
                 hint="两个账号名指向同一个账号会导致会话互相踢下线，建议只保留一个",
             )
+
+
+# --------------------------------------------------------------------------- #
+# 验证码登录
+# --------------------------------------------------------------------------- #
+#: session 文件的 sqlite 附属文件后缀（回滚日志 / WAL）。
+_SESSION_SIDECARS = ("-journal", "-wal", "-shm")
+
+#: 正在进行验证码登录的账号名。
+#: 同一个账号并发登录会抢同一个 ``.session`` 文件，必然撞 ``database is locked``，
+#: 所以在进程内先挡一道。
+_CODE_LOGIN_ACTIVE: set[str] = set()
+
+
+def _clear_session_files(account_paths: Any, alog: Any) -> None:
+    """删掉该账号的 session 文件及其 sqlite 附属文件。
+
+    ⚠️ 只删 session，**绝不能**删账号目录本身 —— 目录里还躺着 ``config.json``
+    （转发规则）和 ``state.json``。部署版这里写的是
+    ``shutil.rmtree(account_paths.session_dir)``，而 ``session_dir`` 就等于账号根目录，
+    于是每次验证码登录都会把用户的转发规则一起抹掉，紧接着
+    ``load_account_config(create=True)`` 再悄悄补回一份**默认配置** ——
+    用户只会看到"规则莫名其妙变回默认了"。
+    """
+    session = account_paths.session_file
+    names = [session.name, *(session.name + suffix for suffix in _SESSION_SIDECARS)]
+    for name in names:
+        path = session.with_name(name)
+        if not path.is_file():
+            continue
+        with contextlib.suppress(OSError):
+            path.unlink()
+            alog.info("已清理旧的 session 文件", file=name)
+
+
+class CodeLoginSession:
+    """验证码登录（手机号 + 短信验证码 + 可选 2FA）。
+
+    用 ``step()`` 逐步推进，方便在 WebSocket 上分多轮交互：
+
+    * ``await step(None)`` → 提示串：请给手机号
+    * ``await step("+8613800000000")`` → 提示串：验证码已发送
+    * ``await step(("12345", "2fa密码"))`` → :class:`LoginResult`（完成）
+      或提示串（该账号开了两步验证，还缺密码）
+
+    与扫码登录不同，验证码登录随时可能失败或被用户取消，所以 :meth:`close`
+    是**必需**的：那个已经连上的 client 会一直占着 ``<name>.session``，
+    不放掉的话下次启动就是 ``database is locked``。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        store: Store,
+        settings: Settings,
+        *,
+        proxy_override: Optional[Any] = None,
+        api_id: Optional[int] = None,
+        api_hash: Optional[str] = None,
+        force: bool = False,
+    ) -> None:
+        self.name = name
+        self.store = store
+        self.settings = settings
+        self.paths = store.paths
+        self._force = force
+        self._step = 0
+        self._client: Optional[Client] = None
+        self._phone: Optional[str] = None
+        self._sent: Any = None
+
+        record = store.get_account(name) or AccountRecord(name=name, created_at=utc_now_iso())
+        if proxy_override is not None:
+            record = record.model_copy(update={"proxy": proxy_override})
+        if api_id is not None:
+            record = record.model_copy(update={"api_id": api_id})
+        if api_hash is not None:
+            record = record.model_copy(update={"api_hash": api_hash})
+
+        self._record = record
+        self.alog = make_account_logger(name, "login")
+        self.account_paths = self.paths.account(name).ensure()
+
+    async def close(self) -> None:
+        """释放底层 client 与并发占位（幂等）。取消 / 出错 / 完成时都要调用。"""
+        _CODE_LOGIN_ACTIVE.discard(self.name)
+        client, self._client = self._client, None
+        if client is None:
+            return
+        with contextlib.suppress(Exception):
+            if client.is_initialized:
+                await client.stop(block=True)
+            elif client.is_connected:
+                await client.disconnect()
+
+    @property
+    def step_index(self) -> int:
+        """当前步骤：0=未开始，1=待发码，2=待验证码，3=待 2FA，4=已结束。"""
+        return self._step
+
+    async def resend_code(self, phone: str) -> str:
+        """重新发送验证码（仅在「等待验证码」阶段可用）。
+
+        用户输错/超时后要能重发。这里必须显式回到第 1 步 —— 直接把手机号丢给
+        :meth:`step` 会在第 2 步被当成 ``(验证码, 密码)`` 解包，行为不可预期。
+        """
+        if self._step != 2:
+            raise QrLoginError("当前不在等待验证码的阶段，无法重发")
+        self._step = 1
+        self._sent = None
+        return await self._send_code(phone)
+
+    async def step(self, data: Any) -> Any:
+        """推进登录流程一步。
+
+        ``data`` 的含义取决于当前步骤：``None`` → 手机号 → ``(验证码, 2FA 密码)``。
+        返回 ``str`` 表示还要继续，返回 :class:`LoginResult` 表示登录完成。
+        """
+        if self._step == 4:
+            raise QrLoginError("本次登录会话已结束，请重新发起")
+        if self._step == 0:
+            return await self._start()
+        if self._step == 1:
+            return await self._send_code(data)
+        if self._step == 2:
+            return await self._verify_code(data)
+        return await self._submit_password(self._split_verify(data)[1])
+
+    # ---------------- 各步骤 ----------------
+    async def _start(self) -> str:
+        if self.name in _CODE_LOGIN_ACTIVE:
+            raise QrLoginError("该账号已有一个验证码登录正在进行，请勿重复发起")
+        _CODE_LOGIN_ACTIVE.add(self.name)
+
+        # 先清掉可能残留的旧 session：它多半是上次没走完的登录留下的坏会话，
+        # 留着会让 pyrogram 直接拿它去复用。
+        _clear_session_files(self.account_paths, self.alog)
+
+        self._client = build_client(self._record, self.settings, self.paths, no_updates=True)
+        proxy = resolve_proxy(self._record, self.settings)
+        self.alog.info(
+            "准备验证码登录",
+            proxy=proxy.to_url() if proxy else "直连",
+            session=str(self.account_paths.session_file),
+        )
+        try:
+            await self._client.connect()
+        except OSError as exc:
+            raise QrLoginError(
+                f"无法连接 Telegram：{exc}。"
+                + (
+                    "请检查代理是否可用（tg-assistant proxy-check）。"
+                    if proxy
+                    else "国内网络通常必须配置 SOCKS5 代理（--proxy）。"
+                )
+            ) from exc
+
+        self._step = 1
+        return "请输入手机号（带国家代码，如 +8613800000000）"
+
+    async def _send_code(self, data: Any) -> str:
+        phone = str(data or "").strip()
+        if not phone:
+            raise QrLoginError("手机号不能为空")
+
+        self._phone = phone
+        self.alog.info("正在发送验证码", phone=mask_phone(phone))
+        try:
+            self._sent = await self._client.send_code(phone)
+        except PhoneNumberInvalid as exc:
+            raise QrLoginError("手机号格式不正确，请检查国家代码和号码") from exc
+        except BadRequest as exc:
+            raise QrLoginError(f"发送验证码失败：{exc}") from exc
+
+        self.alog.info("验证码已发送")
+        self._step = 2
+        return "验证码已发送，请输入验证码"
+
+    async def _verify_code(self, data: Any) -> Any:
+        code, password = self._split_verify(data)
+        if not code:
+            raise QrLoginError("验证码不能为空")
+
+        self.alog.info("正在验证验证码")
+        try:
+            await self._client.sign_in(self._phone, self._sent.phone_code_hash, code)
+        except PhoneCodeExpired as exc:
+            # 退回上一步重新发码。
+            self._step = 1
+            self._sent = None
+            raise QrLoginError("验证码已过期，请重新获取") from exc
+        except PhoneCodeInvalid as exc:
+            raise QrLoginError("验证码错误，请重新输入") from exc
+        except SessionPasswordNeeded:
+            # 验证码本身已经通过了，只差 2FA 密码。
+            # ⚠️ 这里**不能**重放 sign_in —— 同一个验证码只能用一次，
+            # 部署版就是每次 verify 都重新 sign_in，所以 2FA 那一步必然报
+            # "验证码错误"。
+            self._step = 3
+            if not password:
+                return "该账号开启了两步验证，请输入 2FA 密码"
+            return await self._submit_password(password)
+
+        return await self._finalize()
+
+    async def _submit_password(self, password: str) -> Any:
+        if not password:
+            raise QrLoginError("2FA 密码不能为空")
+
+        self.alog.info("正在验证 2FA 密码")
+        try:
+            await self._client.check_password(password)
+        except PasswordHashInvalid as exc:
+            # 部署版这里捕的是 ``PhoneCodeInvalid`` —— 捕错了类型，
+            # 于是密码输错会直接冒到上层，前端只能看到
+            # "PasswordHashInvalid: ..." 这种原文。
+            raise QrLoginError("2FA 密码错误，请重试") from exc
+
+        return await self._finalize()
+
+    # ---------------- 收尾 ----------------
+    async def _finalize(self) -> LoginResult:
+        """登录成功：写入身份信息并释放 client。"""
+        me = await self._client.get_me()
+        identity = {
+            "id": me.id,
+            "username": me.username,
+            "name": " ".join(filter(None, [me.first_name, me.last_name])) or None,
+            "phone": mask_phone(getattr(me, "phone_number", None)),
+        }
+        _guard_duplicate(self.store, self.name, identity["id"], self.alog)
+        updated = _merge_identity(self._record, identity)
+        updated = updated.model_copy(update={"last_login_at": utc_now_iso()})
+        self.store.upsert_account(updated)
+        self.store.harden_session(self.name)
+        self.store.load_account_config(self.name, create=True)
+
+        self._step = 4
+        self.alog.info("验证码登录成功", user=updated.label)
+        await self.close()
+
+        return LoginResult(
+            account=self.name,
+            user_id=identity["id"],
+            username=identity["username"],
+            display_name=identity["name"],
+            phone=identity["phone"],
+        )
+
+    @staticmethod
+    def _split_verify(data: Any) -> tuple[str, str]:
+        """把 ``(验证码, 2FA 密码)`` 拆开；也容忍只传验证码。"""
+        if isinstance(data, (tuple, list)):
+            code = str(data[0] or "").strip() if len(data) > 0 else ""
+            password = str(data[1] or "") if len(data) > 1 else ""
+            return code, password
+        return str(data or "").strip(), ""
 
 
 # --------------------------------------------------------------------------- #
