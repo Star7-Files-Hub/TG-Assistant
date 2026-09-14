@@ -118,6 +118,11 @@ def build_client(
 
     # 必须在构造 Client 之前打：补丁会在 ``SQLiteStorage.__init__`` 里把
     # ``use_wal`` 置为 True，而 pyrogram 是在 ``open()`` 里读这个属性的。
+    #
+    # 放在这里而不是模块级：``build_client`` 是全项目**唯一**构造 ``Client``
+    # 的入口（cli / runner / web 都走它），所以不存在漏打的分支；
+    # 同时避免 ``import tg_assistant.client`` 就去全局 patch ``sqlite3.connect``。
+    # 这个「顺序 + 必被调用」的约定由 tests/test_client.py 钉住。
     _patch_sqlite_concurrent()
 
     client = Client(

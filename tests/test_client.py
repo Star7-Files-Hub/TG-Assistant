@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import sqlite3
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pyrogram.storage.sqlite_storage import SQLiteStorage
@@ -27,6 +29,7 @@ from tg_assistant.client import (
     SESSION_BUSY_TIMEOUT,
     _patch_sqlite_concurrent,
 )
+from tg_assistant.paths import Paths
 
 #: ``PRAGMA busy_timeout`` 返回的是毫秒。
 BUSY_MS = int(SESSION_BUSY_TIMEOUT * 1000)
@@ -177,3 +180,45 @@ async def test_writes_survive_lingering_reader(tmp_path: Path) -> None:
         lingering.rollback()
         lingering.close()
         await storage.close()
+
+
+def test_build_client_arms_the_patch_before_constructing(
+    monkeypatch: pytest.MonkeyPatch, paths: Paths
+) -> None:
+    """回归：``build_client()`` 必须在**构造 Client 之前**把补丁打上。
+
+    补丁之所以放在 ``build_client`` 而不是模块级，唯一依据是
+    「``build_client`` 是全项目唯一构造 ``Client`` 的入口」——
+    cli / runner / web 都走它。这一点必须被钉住，否则哪天有人挪掉那行调用，
+    上面那些用例**会全部照绿**（它们都是自己显式调用
+    ``_patch_sqlite_concurrent()`` 的），并发保护就静默失效，
+    「一打开转发就锁库」会原样复发。
+
+    同时校验**顺序**：若先构造 Client 再打补丁，``SQLiteStorage.__init__``
+    的包裹就晚了 —— storage 对象已经建好，``use_wal`` 仍是 ``False``。
+    """
+    from tg_assistant import client as client_mod
+
+    events: list[str] = []
+
+    class _DummyClient:
+        def __init__(self, **kwargs: Any) -> None:
+            events.append("client")
+
+    monkeypatch.setattr(
+        client_mod, "_patch_sqlite_concurrent", lambda: events.append("patch")
+    )
+    monkeypatch.setattr(client_mod, "resolve_credentials", lambda *a, **k: (1, "hash"))
+    monkeypatch.setattr(client_mod, "resolve_proxy", lambda *a, **k: None)
+    monkeypatch.setattr(client_mod, "device_fingerprint", lambda *a, **k: {})
+    monkeypatch.setattr(client_mod, "Client", _DummyClient)
+
+    settings = types.SimpleNamespace(workers=1, sleep_threshold=60, ipv6=False)
+    record = types.SimpleNamespace(name="acct")
+
+    client_mod.build_client(record, settings, paths)
+
+    assert events == ["patch", "client"], (
+        "build_client 必须先调用 _patch_sqlite_concurrent() 再构造 Client；"
+        f"实际顺序：{events}"
+    )
