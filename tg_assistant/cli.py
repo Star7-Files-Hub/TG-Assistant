@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -377,6 +378,15 @@ def accounts_set_proxy(ctx: Context, account: str, proxy_url: Optional[str]) -> 
 @click.option("--heartbeat", default=300.0, show_default=True, help="心跳统计间隔（秒）")
 @click.option("--restart-delay", default=15.0, show_default=True, help="异常后重启的基础延迟（秒）")
 @click.option("--max-restarts", default=5, show_default=True, help="单账号最大重启次数")
+@click.option("--web", is_flag=True, help="同时启动 Web 控制台（零账号时也可用，方便扫码登录）")
+@click.option("--web-host", default="0.0.0.0", show_default=True, help="Web 监听地址")
+@click.option("--web-port", default=8080, type=int, show_default=True, help="Web 监听端口")
+@click.option(
+    "--web-password",
+    default=None,
+    envvar="TGA_WEB_PASSWORD",
+    help="Web 访问密码（也可用环境变量 TGA_WEB_PASSWORD）",
+)
 @pass_ctx
 def run_cmd(
     ctx: Context,
@@ -384,6 +394,10 @@ def run_cmd(
     heartbeat: float,
     restart_delay: float,
     max_restarts: int,
+    web: bool,
+    web_host: str,
+    web_port: int,
+    web_password: Optional[str],
 ) -> None:
     """启动转发与抢红包（前台运行，Ctrl-C 优雅退出）。"""
     from .runner import MultiRunner
@@ -398,13 +412,6 @@ def run_cmd(
             names.append(name)
     else:
         names = [record.name for record in registry.enabled_accounts]
-
-    if not names:
-        _fail(
-            "没有可运行的账号",
-            "先执行 tg-assistant login -a <账号名>，或用 accounts enable 启用已停用的账号",
-        )
-        return
 
     # 启动前先把配置全部校验一遍，避免跑起来才发现规则写错
     problems = 0
@@ -423,19 +430,103 @@ def run_cmd(
         _fail(f"{problems} 个账号的配置无法加载，已中止启动")
         return
 
-    click.secho(f"启动 {len(names)} 个账号：{', '.join(names)}", fg="cyan")
+    if names:
+        click.secho(f"启动 {len(names)} 个账号：{', '.join(names)}", fg="cyan")
+    else:
+        # 「零账号 + --web」是合法用法：面板本来就是用来扫码加账号的。
+        click.secho("没有可运行的账号", fg="yellow")
+        if not web:
+            _fail(
+                "没有可运行的账号",
+                "先执行 tg-assistant login -a <账号名>，或用 accounts enable 启用已停用的账号",
+            )
+            return
+        click.secho("  启动 Web 控制台以便扫码登录…", fg="yellow")
+
     click.secho(f"日志目录：{ctx.paths.log_dir}", fg="cyan")
 
+    app = None
+    if web:
+        from tg_assistant.web import create_app
+        from tg_assistant.web.settings import WebSettings
+
+        # 密钥直接用密码本身，**不要**用 api_hash：api_hash 是 Telegram 的长期凭据，
+        # 散落在 .env / 配置备份 / 日志里，泄露即可伪造 session cookie 绕过密码，
+        # 而且改密码也救不了（密钥不随密码变）。用密码当密钥则
+        # 「改密码 = 所有旧 session 立即失效」，且不必把密钥落盘。
+        password = (web_password or "").strip()
+
+        # 对外监听却没有密钥 = 任何人都能删账号、改配置，直接拒绝启动。
+        if not password and web_host not in {"127.0.0.1", "localhost", "::1"}:
+            _fail(
+                f"Web 监听地址 {web_host} 会把控制台暴露到网络上，但未设置访问密码",
+                "请加 --web-password <密码>（或设置环境变量 TGA_WEB_PASSWORD）；"
+                "若只想本机访问，请用 --web-host 127.0.0.1。",
+            )
+            return
+
+        click.secho(f"🌐 Web 控制台启动：http://{web_host}:{web_port}", fg="cyan")
+        if password:
+            click.secho("   访问鉴权：已启用", fg="cyan")
+        else:
+            click.secho("   访问鉴权：未启用（仅本机可访问）", fg="yellow")
+
+        app = create_app(
+            data_dir=ctx.paths.data_dir,
+            api_id=ctx.settings.api_id,
+            api_hash=ctx.settings.api_hash,
+            proxy_url=ctx.settings.proxy.to_url() if ctx.settings.proxy else None,
+            log_level=ctx.settings.log_level,
+        )
+        app.state.web_settings = WebSettings(
+            host=web_host,
+            port=web_port,
+            secret_key=password,
+        )
+
     runner = MultiRunner(ctx.store, ctx.settings)
-    try:
-        code = asyncio.run(
-            runner.run(
+
+    async def _run_all() -> int:
+        """跑转发 runner；开了 ``--web`` 就把 Web 控制台一起跑起来。"""
+        if app is None:
+            return await runner.run(
                 names,
                 heartbeat=heartbeat,
                 restart_delay=restart_delay,
                 max_restarts=max_restarts,
             )
+
+        import uvicorn
+
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host=web_host,
+                port=web_port,
+                log_level=ctx.settings.log_level.lower(),
+            )
         )
+
+        if not names:
+            click.secho("等待在 Web 界面扫码登录…（Ctrl-C 退出）", fg="cyan")
+            await server.serve()
+            return 0
+
+        web_task = asyncio.create_task(server.serve())
+        try:
+            return await runner.run(
+                names,
+                heartbeat=heartbeat,
+                restart_delay=restart_delay,
+                max_restarts=max_restarts,
+            )
+        finally:
+            web_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await web_task
+
+    try:
+        code = asyncio.run(_run_all())
     except KeyboardInterrupt:
         code = 130
     raise SystemExit(code)
