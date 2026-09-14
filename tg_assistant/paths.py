@@ -23,8 +23,16 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-#: 账号名允许的字符：字母、数字、下划线、连字符、点。禁止路径分隔符以避免目录穿越。
-ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: 账号名允许的字符：Unicode 字母/数字/下划线打头，其后可含 ``.`` ``-`` 与空格。
+#:
+#: 刻意允许非 ASCII（中文 / 日文 / 韩文）：部署版一直支持，而仓库初版只允许
+#: ``[A-Za-z0-9]``。两边不一致的后果不只是"少个功能" ——
+#: :meth:`Paths.iter_account_names` 对校验不过的目录名是**静默跳过**的，
+#: 所以服务器上建的中文账号名在仓库版里会直接"消失"。
+#:
+#: 安全性：路径分隔符 ``/`` ``\`` 与 NUL 都不在字符集内，且首字符必须是
+#: ``\w``，因此 ``.``、``..`` 这类目录穿越名一律不合法（见 tests/test_paths.py）。
+ACCOUNT_NAME_RE = re.compile(r"^[\w][\w.\- ]{0,63}$", re.UNICODE)
 
 DEFAULT_DATA_DIR = "./data"
 
@@ -42,8 +50,8 @@ def validate_account_name(name: str) -> str:
     normalized = (name or "").strip()
     if not ACCOUNT_NAME_RE.match(normalized):
         raise InvalidAccountName(
-            f"账号名 {name!r} 不合法：只允许字母、数字、'.'、'_'、'-'，"
-            "首字符必须是字母或数字，长度 1-64。"
+            f"账号名 {name!r} 不合法：允许字母（含中文等 Unicode 字符）、数字、"
+            "'.'、'_'、'-'、空格，首字符不能是符号或空格，长度 1-64。"
         )
     return normalized
 
