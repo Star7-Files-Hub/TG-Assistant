@@ -140,8 +140,12 @@ class RuntimeManager:
             names = accounts or [r.name for r in self.store.load_registry().enabled_accounts]
             if not names:
                 return {"ok": False, "message": "没有可运行的账号。先 login 并用 accounts enable 启用。"}
+            # 把 runner 显式交给 _supervise：它原来是回头读 self._runner，
+            # 于是「start() 之后立刻 stop()」这种时序下，任务还没开始跑
+            # self._runner 就已经被摘成 None 了，任务一启动就撞 assert。
+            runner = self._runner
             self._runner_task = asyncio.create_task(
-                self._supervise(names), name="web-runner"
+                self._supervise(runner, names), name="web-runner"
             )
             # 通知 /ws/status 订阅者：已开始运行。
             self.push_event({"type": "status", "running": True, "accounts": names})
@@ -155,11 +159,65 @@ class RuntimeManager:
         和通知 worker 漏在后台，重新 start 时新旧 client 会争抢同一个 session 文件。
         """
         async with self._lock:
-            runner = self._runner
-            task = self._runner_task
-            self._runner = None
-            self._runner_task = None
+            runner, task = self._detach_runner()
+        return await self._finish_stop(runner, task)
 
+    async def stop_account(self, name: str) -> dict[str, Any]:
+        """停止单个账号。
+
+        ``MultiRunner`` 是「一批账号跑在同一个任务里」的结构，没法只摘掉其中一个，
+        所以做法是：优雅停掉整批，再把其余的重新拉起。
+
+        ⚠️ 重新拉起必须发生在**释放锁之后**：``asyncio.Lock`` 不可重入，
+        在持锁状态下调用 :meth:`start` 会直接死锁（部署版就是这么写的，
+        于是只要还有其他账号在跑，"停止单个账号"这个请求就会永久挂住，
+        并且把那把锁一直占着，之后所有启停请求一起卡死）。
+        """
+        async with self._lock:
+            if not self.is_running:
+                return {"ok": False, "message": "没有在运行的账号"}
+            running = sorted(self._running_accounts())
+            if name not in running:
+                return {"ok": False, "message": f"账号 {name} 未在运行"}
+            remaining = [n for n in running if n != name]
+            runner, task = self._detach_runner()
+
+        await self._finish_stop(runner, task)
+
+        if not remaining:
+            return {"ok": True, "message": f"已停止账号 {name}"}
+        result = await self.start(remaining)
+        if not result.get("ok"):
+            return result
+        return {"ok": True, "message": f"已停止账号 {name}", "accounts": remaining}
+
+    async def start_account(self, name: str) -> dict[str, Any]:
+        """单独启动一个账号。
+
+        已经在跑的账号会被一并优雅重启 —— 原因同 :meth:`stop_account`：
+        ``MultiRunner`` 一次只接受一批账号。
+        """
+        async with self._lock:
+            running = sorted(self._running_accounts()) if self.is_running else []
+            if name in running:
+                return {"ok": False, "message": f"账号 {name} 已在运行"}
+            runner, task = self._detach_runner() if self.is_running else (None, None)
+
+        if runner is not None or task is not None:
+            await self._finish_stop(runner, task)
+
+        return await self.start([*running, name])
+
+    def _detach_runner(self) -> tuple[Any, Optional[asyncio.Task[None]]]:
+        """把当前 runner 与任务摘下来交给调用方（必须在持锁时调用）。"""
+        runner = self._runner
+        task = self._runner_task
+        self._runner = None
+        self._runner_task = None
+        return runner, task
+
+    async def _finish_stop(self, runner: Any, task: Optional[asyncio.Task[None]]) -> dict[str, Any]:
+        """优雅停掉已摘下的 runner（不持锁 —— 这里要等最多 ``STOP_TIMEOUT`` 秒）。"""
         if runner is not None:
             runner.request_shutdown()
 
@@ -167,23 +225,35 @@ class RuntimeManager:
             try:
                 await asyncio.wait_for(task, timeout=STOP_TIMEOUT)
             except asyncio.TimeoutError:
-                log.warning("账号停止超时，已强制取消", timeout_s=STOP_TIMEOUT)
+                # ⚠️ 这里的 log 是 get_logger() 拿到的**普通** logging.Logger，
+                # 只有结构化关键字参数是不支持的（那是 AccountLogger 的能力）。
+                # 传了会当场抛 TypeError，把真正要报告的异常盖掉。
+                log.warning(
+                    "账号停止超时，已强制取消",
+                    extra={"account": "-", "extra_fields": {"timeout_s": STOP_TIMEOUT}},
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("账号停止过程中出现异常", error=str(exc))
+                log.warning(
+                    "账号停止过程中出现异常",
+                    extra={"account": "-", "extra_fields": {"error": str(exc)}},
+                )
 
         self._shutdown_event.set()
         # 通知 /ws/status 订阅者：已停止。
         self.push_event({"type": "status", "running": False, "accounts": []})
         return {"ok": True}
 
-    async def _supervise(self, names: list[str]) -> None:
-        """在后台运行 MultiRunner，捕获异常，并把结束状态广播出去。"""
-        assert self._runner is not None
+    async def _supervise(self, runner: Any, names: list[str]) -> None:
+        """在后台运行 MultiRunner，捕获异常，并把结束状态广播出去。
+
+        ``runner`` 由调用方显式传入，**不要**回头读 ``self._runner``：
+        ``stop()`` 会把它摘成 ``None``，而本任务可能还没开始跑。
+        """
         error: Optional[str] = None
         try:
-            await self._runner.run(
+            await runner.run(
                 names,
                 heartbeat=float(self.state.web_settings.heartbeat_interval),
                 # 信号由 uvicorn 接管，这里不能再抢注
@@ -193,7 +263,7 @@ class RuntimeManager:
             pass
         except Exception as exc:
             error = str(exc)
-            get_logger().exception("运行管理器异常退出", error=error)
+            get_logger().exception("运行管理器异常退出", extra={"account": "-", "extra_fields": {"error": error}})
         finally:
             # 正常退出和崩溃都要通知，否则前端会一直停在「运行中」。
             self.push_event(
