@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -134,6 +135,52 @@ class Store:
                 log.info("已删除账号数据目录 path=%s", account_paths.root)
         return removed
 
+    def rename_account(self, old_name: str, new_name: str) -> bool:
+        """重命名账号：更新注册表 + 重命名数据目录与 session 文件。
+
+        返回 ``False`` 表示旧名不存在（此时不做任何改动）。
+
+        ⚠️ 顺序是「先改注册表、再改文件」。如果文件重命名失败，注册表已经指向新名，
+        而文件还在旧目录 —— 属于**不一致状态**，需要人工介入。所以这里刻意不静默
+        （原实现是 ``except Exception: pass``，出问题时完全看不出来）。
+        """
+        safe_old = validate_account_name(old_name)
+        safe_new = validate_account_name(new_name)
+
+        registry = self.load_registry()
+        record = registry.get(safe_old)
+        if record is None:
+            return False
+
+        registry.remove(safe_old)
+        registry.upsert(record.model_copy(update={"name": safe_new}))
+        self.save_registry(registry)
+
+        old_dir = self.paths.account(safe_old).root
+        new_dir = self.paths.account(safe_new).root
+        if old_dir.is_dir() and not new_dir.is_dir():
+            try:
+                old_dir.rename(new_dir)
+            except OSError as exc:
+                log.warning("账号目录重命名失败 old=%s new=%s err=%s", old_dir, new_dir, exc)
+
+        # 账号目录里通常只有一个 session 文件，把它的文件名也同步成新账号名。
+        for session_file in new_dir.glob("*.session"):
+            if not session_file.is_file():
+                continue
+            target = new_dir / f"{safe_new}.session"
+            if not target.exists():
+                try:
+                    session_file.rename(target)
+                except OSError as exc:
+                    log.warning(
+                        "session 文件重命名失败 src=%s dst=%s err=%s", session_file, target, exc
+                    )
+            break
+
+        log.info("账号重命名完成 old=%s new=%s", safe_old, safe_new)
+        return True
+
     # ---------------- 单账号配置 ----------------
     def load_account_config(self, name: str, *, create: bool = True) -> AccountConfig:
         account_paths = self.paths.account(name)
@@ -172,7 +219,53 @@ class Store:
             _harden(session, stat.S_IRUSR | stat.S_IWUSR)
 
     def has_session(self, name: str) -> bool:
-        return self.paths.account(name).session_file.is_file()
+        """该账号是否有可用会话：本地 ``.session`` 文件，或 PostgreSQL 里的备份。
+
+        本地检查刻意用「目录下任意 ``*.session``」而不是精确的 ``<name>.session``：
+        账号重命名后文件名未必同步过来，用精确名会把有会话的账号误判成「没会话」。
+        """
+        account_dir = self.paths.account(name).root
+        if account_dir.is_dir():
+            for candidate in account_dir.glob("*.session"):
+                if candidate.is_file():
+                    return True
+
+        pg_dsn = os.environ.get("TGA_POSTGRES_DSN")
+        if not pg_dsn:
+            return False
+        try:
+            import concurrent.futures
+
+            import asyncpg
+
+            def _check() -> bool:
+                loop = asyncio.new_event_loop()
+                try:
+                    conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                    try:
+                        # ``tg_sessions`` 是 client.py 真正写入的表名；
+                        # 另两个是历史遗留命名，一并探测以兼容旧数据。
+                        for table in ("tg_sessions", "pyrogram_sessions", "sessions"):
+                            try:
+                                row = loop.run_until_complete(
+                                    conn.fetchrow(
+                                        f"SELECT 1 FROM {table} WHERE account_name = $1", name
+                                    )
+                                )
+                            except Exception:
+                                continue
+                            if row is not None:
+                                return True
+                    finally:
+                        loop.run_until_complete(conn.close())
+                finally:
+                    loop.close()
+                return False
+
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(_check).result()
+        except Exception:
+            return False
 
 
 def _format_validation_error(exc: ValidationError) -> str:
