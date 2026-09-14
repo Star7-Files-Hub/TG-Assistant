@@ -99,6 +99,30 @@ def chat_identity(message: Any) -> tuple[Optional[int], Optional[str], Optional[
     )
 
 
+#: pyrogram ``ChatType.value`` → 归并后的会话类别。
+_CHAT_KIND = {
+    "private": "private",
+    "bot": "private",
+    "group": "group",
+    "supergroup": "group",
+    "channel": "channel",
+}
+
+
+def chat_kind(message: Any) -> Optional[str]:
+    """返回 ``private`` / ``group`` / ``channel``，无法判断时返回 ``None``。
+
+    ``filters.group`` / ``filters.channel`` 用的是 pyrogram 的 ``ChatType``，
+    在测试替身里可能是普通字符串，所以这里统一按 ``.value`` 取值。
+    """
+    chat = getattr(message, "chat", None)
+    raw = getattr(chat, "type", None)
+    value = getattr(raw, "value", raw)
+    if not isinstance(value, str):
+        return None
+    return _CHAT_KIND.get(value.lower())
+
+
 def message_link(message: Any) -> Optional[str]:
     """构造消息永久链接。私有群/频道用 ``t.me/c/<短id>/<msg_id>``。"""
     chat_id, username, _ = chat_identity(message)

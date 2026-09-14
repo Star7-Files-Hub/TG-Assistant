@@ -91,6 +91,19 @@ class TestPreparedRule:
         assert prepared.chat_allowed(-1, None)[0]
         assert prepared.chat_allowed(-2, "x")[0]
 
+    def test_empty_sources_rejects_private(self):
+        """sources 为空 = 监听全部群组与频道；私聊不转发。"""
+        prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
+        assert not prepared.chat_allowed(777, None, "private")[0]
+        assert prepared.chat_allowed(-1001, None, "group")[0]
+        assert prepared.chat_allowed(-1002, None, "channel")[0]
+
+    def test_explicit_private_source_still_allowed(self):
+        """显式把私聊写进 sources 时不受「只限群组/频道」限制。"""
+        prepared = PreparedRule.build(build_config(sources=[777]).forward.rules[0])
+        assert prepared.chat_allowed(777, None, "private")[0]
+        assert not prepared.chat_allowed(888, None, "private")[0]
+
     def test_from_users_whitelist(self):
         prepared = PreparedRule.build(build_config(from_users=[777]).forward.rules[0])
         assert prepared.sender_allowed(777, None, False)[0]
@@ -131,6 +144,44 @@ class TestForwardEngine:
         await drain(engine)
         assert client.forwarded == []
         assert engine.stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_skips_private_chat(self, client, alog):
+        """未限定 sources 时，私聊里命中的消息不能被转发出去。"""
+        engine = ForwardEngine(client, build_config(sources=[]), alog)
+        engine.register()
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(777, chat_type="private")),
+            edited=False,
+        )
+        await drain(engine)
+        assert client.forwarded == []
+        assert engine.stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_forwards_from_group(self, client, alog):
+        engine = ForwardEngine(client, build_config(sources=[]), alog)
+        engine.register()
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(-100999, title="任意群")), edited=False
+        )
+        await drain(engine)
+        assert len(client.forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_unrestricted_registers_group_channel_filter(self, client, alog):
+        """不能退化成 filter=None，否则私聊也会进 handler。"""
+        engine = ForwardEngine(client, build_config(sources=[]), alog)
+        engine.register()
+        handler = client.handlers[0][0]
+        assert handler.filters is not None
+
+    @pytest.mark.asyncio
+    async def test_restricted_registers_chat_filter(self, client, alog):
+        engine = ForwardEngine(client, build_config(), alog)
+        engine.register()
+        handler = client.handlers[0][0]
+        assert handler.filters is not None
 
     @pytest.mark.asyncio
     async def test_other_chat_ignored(self, client, alog):

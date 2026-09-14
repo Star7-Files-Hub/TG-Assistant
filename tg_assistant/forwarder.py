@@ -39,6 +39,7 @@ from .matching import (
     apply_groups,
     build_variables,
     chat_identity,
+    chat_kind,
     message_text,
     render_template,
     sender_of,
@@ -121,11 +122,26 @@ class PreparedRule:
     def label(self) -> str:
         return self.rule.label
 
-    def chat_allowed(self, chat_id: Optional[int], chat_username: Optional[str]) -> tuple[bool, str]:
+    def chat_allowed(
+        self,
+        chat_id: Optional[int],
+        chat_username: Optional[str],
+        kind: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """``kind`` 是 :func:`~tg_assistant.matching.chat_kind` 的返回值。
+
+        ``sources`` 为空表示"监听全部"，但**只限群组与频道**：
+        私聊一律不参与转发。否则任何陌生人给账号发一条含关键词的私信，
+        都会被原样转发到目标频道里去。
+        """
         if self.exclude_sources and self.exclude_sources.matches(chat_id, chat_username):
             return False, "来源在 exclude_sources 中"
-        if self.sources and not self.sources.matches(chat_id, chat_username):
-            return False, "来源不在 sources 中"
+        if self.sources:
+            if not self.sources.matches(chat_id, chat_username):
+                return False, "来源不在 sources 中"
+            return True, ""
+        if kind == "private":
+            return False, "未限定 sources 时只监听群组与频道，私聊不转发"
         return True, ""
 
     def sender_allowed(
@@ -218,7 +234,13 @@ class ForwardEngine:
             return
 
         chats = self.watched_chats()
-        message_filter = filters.chat(chats) if chats else None
+        if chats:
+            message_filter: Any = filters.chat(chats)
+        else:
+            # 未限定来源 = 监听全部群组与频道。
+            # 这里刻意用 filters.group | filters.channel 而不是 None：
+            # None 会把私聊也收进来，陌生人发条含关键词的私信就会被转发出去。
+            message_filter = filters.group | filters.channel
         handler = MessageHandler(self._on_message, message_filter)
         self._handlers.append(self.client.add_handler(handler, group=self.HANDLER_GROUP))
 
@@ -229,7 +251,7 @@ class ForwardEngine:
         self.alog.info(
             "转发引擎已注册",
             rules=len(self.rules),
-            watched_chats=len(chats) or "全部",
+            watched_chats=len(chats) or "全部群组/频道",
             dedupe_window_s=self.config.forward.dedupe_window,
             rule_ids=",".join(prepared.id for prepared in self.rules),
         )
@@ -282,6 +304,7 @@ class ForwardEngine:
             return
 
         is_service = bool(getattr(message, "service", None))
+        kind = chat_kind(message)
         sender_id, sender_username, is_self, _is_bot = sender_of(message)
         now = time.monotonic()
 
@@ -292,7 +315,7 @@ class ForwardEngine:
             if is_service and not rule.include_service:
                 continue
 
-            allowed, reason = prepared.chat_allowed(chat_id, chat_username)
+            allowed, reason = prepared.chat_allowed(chat_id, chat_username, kind)
             if not allowed:
                 continue
             allowed, reason = prepared.sender_allowed(sender_id, sender_username, is_self)
