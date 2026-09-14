@@ -31,6 +31,34 @@ class ConfigError(RuntimeError):
     """配置文件读写/校验失败。"""
 
 
+#: session 文件的 sqlite 附属文件后缀（回滚日志 / WAL）。
+SESSION_SIDECARS = ("-journal", "-wal", "-shm")
+
+
+def session_files_of(account_paths: Any) -> list[Path]:
+    """该账号的 session 文件及其 sqlite 附属文件（不保证存在）。"""
+    session = account_paths.session_file
+    return [session, *(session.with_name(session.name + suffix) for suffix in SESSION_SIDECARS)]
+
+
+def clear_session_files(account_paths: Any) -> list[str]:
+    """删掉该账号的 session 及附属文件，返回实际删掉的文件名。
+
+    ⚠️ 只删 session，**绝不能**删账号目录 —— 目录里还躺着 ``config.json``
+    （转发规则）和 ``state.json``。而 ``AccountPaths.session_dir`` 就等于账号根目录，
+    对它 ``rmtree`` 会把用户的转发规则一起抹掉，再被 ``load_account_config(create=True)``
+    悄悄补回一份默认配置（部署版的验证码登录和清除会话都有这个 bug）。
+    """
+    removed: list[str] = []
+    for path in session_files_of(account_paths):
+        if not path.is_file():
+            continue
+        with contextlib.suppress(OSError):
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any], *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
@@ -217,6 +245,25 @@ class Store:
         session = self.paths.account(name).session_file
         if session.is_file():
             _harden(session, stat.S_IRUSR | stat.S_IWUSR)
+
+    def clear_session(self, name: str) -> list[str]:
+        """清除该账号的本地会话数据（session 文件 + 二维码图片）。
+
+        返回实际删掉的文件名，便于调用方回报给用户。
+        账号名已由 :func:`validate_account_name` 限制为 ``[A-Za-z0-9._-]``，
+        不含 glob 元字符，所以下面的通配是安全的。
+        """
+        removed = clear_session_files(self.paths.account(name))
+
+        qr_dir = self.paths.qr_dir
+        if qr_dir.is_dir():
+            for path in sorted(qr_dir.glob(f"{name}*")):
+                if not path.is_file():
+                    continue
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    removed.append(path.name)
+        return removed
 
     def has_session(self, name: str) -> bool:
         """该账号是否有可用会话：本地 ``.session`` 文件，或 PostgreSQL 里的备份。

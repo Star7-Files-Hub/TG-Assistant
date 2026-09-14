@@ -56,7 +56,7 @@ from .qr_login import (
     QrRenderer,
 )
 from .red_packet import RedPacketHunter
-from .store import ConfigError, Store
+from .store import ConfigError, Store, clear_session_files
 
 log = get_logger("runner")
 
@@ -269,9 +269,6 @@ def _guard_duplicate(store: Store, name: str, user_id: int, alog: Any) -> None:
 # --------------------------------------------------------------------------- #
 # 验证码登录
 # --------------------------------------------------------------------------- #
-#: session 文件的 sqlite 附属文件后缀（回滚日志 / WAL）。
-_SESSION_SIDECARS = ("-journal", "-wal", "-shm")
-
 #: 正在进行验证码登录的账号名。
 #: 同一个账号并发登录会抢同一个 ``.session`` 文件，必然撞 ``database is locked``，
 #: 所以在进程内先挡一道。
@@ -279,24 +276,14 @@ _CODE_LOGIN_ACTIVE: set[str] = set()
 
 
 def _clear_session_files(account_paths: Any, alog: Any) -> None:
-    """删掉该账号的 session 文件及其 sqlite 附属文件。
+    """删掉该账号的 session 文件及其 sqlite 附属文件（只删 session，不删目录）。
 
-    ⚠️ 只删 session，**绝不能**删账号目录本身 —— 目录里还躺着 ``config.json``
-    （转发规则）和 ``state.json``。部署版这里写的是
-    ``shutil.rmtree(account_paths.session_dir)``，而 ``session_dir`` 就等于账号根目录，
-    于是每次验证码登录都会把用户的转发规则一起抹掉，紧接着
-    ``load_account_config(create=True)`` 再悄悄补回一份**默认配置** ——
-    用户只会看到"规则莫名其妙变回默认了"。
+    实现在 :func:`tg_assistant.store.clear_session_files` —— 那里有一条必须
+    一直生效的告诫：``AccountPaths.session_dir`` 就等于账号根目录，
+    对它 ``rmtree`` 会连 ``config.json``（转发规则）一起抹掉。
     """
-    session = account_paths.session_file
-    names = [session.name, *(session.name + suffix for suffix in _SESSION_SIDECARS)]
-    for name in names:
-        path = session.with_name(name)
-        if not path.is_file():
-            continue
-        with contextlib.suppress(OSError):
-            path.unlink()
-            alog.info("已清理旧的 session 文件", file=name)
+    for name in clear_session_files(account_paths):
+        alog.info("已清理旧的 session 文件", file=name)
 
 
 class CodeLoginSession:

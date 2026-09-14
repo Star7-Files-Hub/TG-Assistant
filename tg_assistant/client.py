@@ -393,6 +393,41 @@ def _get_pg_session_string(name: str) -> Optional[str]:
         return None
 
 
+def _delete_pg_session_string(name: str) -> bool:
+    """从 PostgreSQL 删掉账号的 session_string；无 PG 或失败返回 ``False``。
+
+    表名必须是 ``tg_sessions`` —— 那才是 :func:`_save_pg_session_string` 真正写入的表。
+    （部署版的「清除会话」删的是 ``pyrogram_sessions``，一张从未被写过的表，
+    所以那一步其实什么也没删掉。）
+    """
+    pg_dsn = _pg_dsn()
+    if not pg_dsn:
+        return False
+    try:
+        import concurrent.futures
+
+        import asyncpg
+
+        def _delete() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+                try:
+                    loop.run_until_complete(
+                        conn.execute("DELETE FROM tg_sessions WHERE account_name = $1", name)
+                    )
+                finally:
+                    loop.run_until_complete(conn.close())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(_delete).result()
+        return True
+    except Exception:
+        return False
+
+
 def _save_pg_session_string(name: str, session_string: str) -> None:
     """把 session_string 写进 PostgreSQL（upsert）；无 PG 或失败则静默跳过。"""
     pg_dsn = _pg_dsn()

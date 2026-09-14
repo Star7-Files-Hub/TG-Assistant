@@ -45,6 +45,46 @@ async def api_account_detail(name: str, runtime=Depends(get_runtime)) -> dict[st
     return account
 
 
+@router.post("/accounts/{name}/clear-session")
+async def api_account_clear_session(
+    name: str,
+    store=Depends(get_store),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """清除账号的会话数据（本地 session 文件 + PostgreSQL 备份 + 二维码），用于重新登录。
+
+    回移自部署版，但修掉了它的两个 bug：
+
+    * 它用 ``shutil.rmtree(account_paths.session_dir)`` 清本地文件，
+      而 ``session_dir`` 就是账号根目录 —— 于是 ``config.json``（转发规则）
+      和 ``state.json`` 会一起被删掉。
+    * 它删的是 PG 表 ``pyrogram_sessions``，而 :func:`_save_pg_session_string`
+      写的是 ``tg_sessions`` —— 一张从未被写过的表，等于没删。
+    """
+    from tg_assistant.client import _delete_pg_session_string
+
+    try:
+        validated = validate_account_name(name)
+    except InvalidAccountName as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    record = store.get_account(validated)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"账号 {validated} 不存在")
+    if record.name in runtime._running_accounts():
+        raise HTTPException(status_code=409, detail="账号正在运行中，请先停止再清除会话")
+
+    pg_cleared = _delete_pg_session_string(validated)
+    removed = store.clear_session(validated)
+
+    return {
+        "ok": True,
+        "message": "会话数据已清除，请重新登录",
+        "removed_files": removed,
+        "postgres_cleared": pg_cleared,
+    }
+
+
 @router.delete("/accounts/{name}")
 async def api_account_delete(
     name: str,
@@ -245,6 +285,246 @@ def _example_config() -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# 转发规则 CRUD
+# --------------------------------------------------------------------------- #
+def _require_account(store: Any, name: str) -> Any:
+    """取账号记录，不存在直接 404。账号名非法由应用级异常处理器翻成 400。"""
+    record = store.get_account(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"账号 {name} 不存在")
+    return record
+
+
+@router.get("/config/{name}/rules")
+async def api_rules_list(name: str, store=Depends(get_store)) -> dict[str, Any]:
+    """列出账号的全部转发规则。"""
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    return {
+        "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
+        "enabled": config.forward.enabled,
+    }
+
+
+@router.post("/config/{name}/rules")
+async def api_rules_add(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """新增一条转发规则。"""
+    from tg_assistant.config import ForwardRule
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    try:
+        rule = ForwardRule.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
+
+    if any(existing.id == rule.id for existing in config.forward.rules):
+        raise HTTPException(status_code=409, detail=f"规则 id {rule.id!r} 已存在")
+
+    config.forward.rules.append(rule)
+    store.save_account_config(name, config)
+    return {"ok": True, "rule": rule.model_dump(mode="json")}
+
+
+@router.put("/config/{name}/rules/{rule_id}")
+async def api_rules_update(
+    name: str,
+    rule_id: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """按 id 覆盖一条转发规则。"""
+    from tg_assistant.config import ForwardRule
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    try:
+        updated = ForwardRule.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
+
+    for index, rule in enumerate(config.forward.rules):
+        if rule.id == rule_id:
+            config.forward.rules[index] = updated
+            break
+    else:
+        raise HTTPException(status_code=404, detail=f"规则 {rule_id!r} 不存在")
+
+    store.save_account_config(name, config)
+    return {"ok": True, "rule": updated.model_dump(mode="json")}
+
+
+@router.delete("/config/{name}/rules/{rule_id}")
+async def api_rules_delete(
+    name: str,
+    rule_id: str,
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """删除一条转发规则。"""
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    before = len(config.forward.rules)
+    config.forward.rules = [rule for rule in config.forward.rules if rule.id != rule_id]
+    if len(config.forward.rules) == before:
+        raise HTTPException(status_code=404, detail=f"规则 {rule_id!r} 不存在")
+
+    store.save_account_config(name, config)
+    return {"ok": True}
+
+
+@router.post("/config/{name}/rules/test")
+async def api_rules_test(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """在服务端试跑匹配逻辑，供规则编辑页做实时预览。
+
+    纯计算，不落盘、不依赖账号是否已登录。
+    """
+    import re
+
+    pattern = str(payload.get("pattern", ""))
+    text = str(payload.get("text", ""))
+    mode = str(payload.get("mode", "regex"))
+    ignore_case = bool(payload.get("ignore_case", True))
+
+    if not pattern:
+        return {"match": False, "error": "正则表达式为空"}
+    if not text:
+        return {"match": False, "error": "测试文本为空"}
+
+    if mode == "regex":
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        except re.error as exc:
+            return {"match": False, "error": f"正则表达式无效: {exc}"}
+        found = compiled.search(text)
+        if not found:
+            return {"match": False}
+        groups = found.groups()
+        return {
+            "match": True,
+            "full_match": found.group(0),
+            "groups": [group for group in groups if group] if groups else [],
+            "span": list(found.span()),
+        }
+
+    if mode == "contains":
+        matched = pattern.lower() in text.lower() if ignore_case else pattern in text
+        return {"match": matched}
+
+    if mode == "exact":
+        matched = pattern.lower() == text.lower() if ignore_case else pattern == text
+        return {"match": matched}
+
+    return {"match": True, "message": "all 模式始终匹配"}
+
+
+@router.put("/config/{name}/forward-enabled")
+async def api_forward_set_enabled(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """转发功能总开关。"""
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    config.forward.enabled = bool(payload.get("enabled", True))
+    store.save_account_config(name, config)
+    return {"ok": True, "enabled": config.forward.enabled}
+
+
+# --------------------------------------------------------------------------- #
+# 抢红包设置
+# --------------------------------------------------------------------------- #
+@router.get("/config/{name}/red_packet")
+async def api_red_packet_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
+    _require_account(store, name)
+    return store.load_account_config(name, create=False).red_packet.model_dump(mode="json")
+
+
+@router.put("/config/{name}/red_packet")
+async def api_red_packet_put(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    from tg_assistant.config import RedPacketConfig
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    try:
+        config.red_packet = RedPacketConfig.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
+    store.save_account_config(name, config)
+    return {"ok": True}
+
+
+@router.put("/config/{name}/red_packet/enabled")
+async def api_red_packet_enabled(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    config.red_packet.enabled = bool(payload.get("enabled", False))
+    store.save_account_config(name, config)
+    return {"ok": True, "enabled": config.red_packet.enabled}
+
+
+# --------------------------------------------------------------------------- #
+# 通知设置
+# --------------------------------------------------------------------------- #
+def _mask_bot_token(data: dict[str, Any]) -> dict[str, Any]:
+    """bot_token 只回显前缀，避免面板把它整串读回去。"""
+    token = data.get("bot_token")
+    if token:
+        data["bot_token"] = f"{token[:8]}***"
+    return data
+
+
+@router.get("/config/{name}/notify")
+async def api_notify_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    return _mask_bot_token(config.notify.model_dump(mode="json"))
+
+
+@router.put("/config/{name}/notify")
+async def api_notify_put(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """保存通知配置。
+
+    ⚠️ 面板读回来的 ``bot_token`` 是脱敏的（``12345678***``）。若原样提交回来，
+    这里会把脱敏值当成新 token 存下去，把真 token 覆盖掉。
+    所以：脱敏形态的值一律忽略，保留原有 token。
+    """
+    from tg_assistant.config import NotifyConfig
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+
+    submitted = dict(payload)
+    token = str(submitted.get("bot_token") or "")
+    if token.endswith("***"):
+        submitted["bot_token"] = config.notify.bot_token
+
+    try:
+        config.notify = NotifyConfig.model_validate(submitted)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
+
+    store.save_account_config(name, config)
+    return {"ok": True, "bot_token": _mask_bot_token({"bot_token": config.notify.bot_token})["bot_token"]}
+
+
+# --------------------------------------------------------------------------- #
 # 运行控制
 # --------------------------------------------------------------------------- #
 @router.post("/run/start")
@@ -260,6 +540,28 @@ async def api_run_start(
 @router.post("/run/stop")
 async def api_run_stop(runtime=Depends(get_runtime)) -> dict[str, Any]:
     return await runtime.stop()
+
+
+@router.post("/run/start/{name}")
+async def api_run_start_one(name: str, runtime=Depends(get_runtime)) -> dict[str, Any]:
+    """单独启动一个账号。
+
+    走 :meth:`RuntimeManager.start_account`，而不是 ``start([name])`` ——
+    后者在已有账号运行时只会返回「已经在运行中」，等于这个端点没法用。
+    """
+    record = runtime.store.get_account(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"账号 {name} 不存在")
+    return await runtime.start_account(name)
+
+
+@router.post("/run/stop/{name}")
+async def api_run_stop_one(name: str, runtime=Depends(get_runtime)) -> dict[str, Any]:
+    """单独停止一个账号（其余账号会被优雅重启）。"""
+    record = runtime.store.get_account(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"账号 {name} 不存在")
+    return await runtime.stop_account(name)
 
 
 @router.get("/run/status")
