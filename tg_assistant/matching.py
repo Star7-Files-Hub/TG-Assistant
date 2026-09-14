@@ -100,11 +100,17 @@ def chat_identity(message: Any) -> tuple[Optional[int], Optional[str], Optional[
 
 
 #: pyrogram ``ChatType.value`` → 归并后的会话类别。
+#: 必须覆盖 ``pyrogram.enums.ChatType`` 的**全部**取值：漏掉的类型会归一成 ``None``，
+#: 让下游 ``kind == "..."`` 的判断静默失效。见 tests 里的全覆盖测试。
 _CHAT_KIND = {
+    # 1:1 会话。``direct`` 是频道/商务直聊，同样是 1:1，不能当群组放行。
     "private": "private",
     "bot": "private",
+    "direct": "private",
+    # 群组。``forum`` 是论坛型超级群，pyrogram 的 ``filters.group`` 也算它。
     "group": "group",
     "supergroup": "group",
+    "forum": "group",
     "channel": "channel",
 }
 

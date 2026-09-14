@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import datetime as dt
+import types
 
 import pytest
 
 from tg_assistant.config import MatchConfig
 from tg_assistant.matching import (
+    _CHAT_KIND,
     CompiledMatcher,
     RefSet,
     apply_groups,
     build_variables,
     button_texts,
     chat_identity,
+    chat_kind,
     compile_patterns,
     first_match,
     message_link,
@@ -24,6 +27,68 @@ from tg_assistant.matching import (
 )
 
 from .conftest import FakeButton, FakeChat, FakeMarkup, FakeUser, make_message
+
+
+class TestChatKind:
+    """``chat_kind`` 是「未限定 sources 只监听群组/频道」的依据，必须精确。"""
+
+    def test_covers_every_pyrogram_chat_type(self):
+        """归一表要覆盖 pyrogram 的全部 ``ChatType``。
+
+        漏掉的类型会归一成 ``None``，而 ``chat_allowed()`` 对 ``None`` 是放行的 ——
+        等于悄悄开了一个后门。这里用集合相等，将来 pyrogram 新增枚举值会直接失败。
+        """
+        from pyrogram.enums import ChatType
+
+        values = {t.value for t in ChatType}
+        assert set(_CHAT_KIND) == values
+        assert set(_CHAT_KIND.values()) == {"private", "group", "channel"}
+
+    @pytest.mark.parametrize(
+        ("chat_type", "expected"),
+        [
+            ("private", "private"),
+            ("bot", "private"),
+            # 频道/商务直聊，同样是 1:1，不能当群组放行。
+            ("direct", "private"),
+            ("group", "group"),
+            ("supergroup", "group"),
+            # 论坛型超级群；pyrogram 的 filters.group 也算它。
+            ("forum", "group"),
+            ("channel", "channel"),
+        ],
+    )
+    def test_normalizes(self, chat_type, expected):
+        message = make_message("hi", chat=FakeChat(-1001, chat_type=chat_type))
+        assert chat_kind(message) == expected
+
+    def test_matches_pyrogram_filters_classification(self):
+        """与 pyrogram 自己的分类对齐：group/channel/private 三个过滤器互斥且完备。"""
+        from pyrogram.enums import ChatType
+
+        for chat_type in ChatType:
+            kind = _CHAT_KIND[chat_type.value]
+            if kind == "group":
+                assert chat_type in {
+                    ChatType.GROUP,
+                    ChatType.SUPERGROUP,
+                    ChatType.FORUM,
+                }
+            elif kind == "private":
+                assert chat_type in {ChatType.PRIVATE, ChatType.BOT, ChatType.DIRECT}
+            else:
+                assert chat_type is ChatType.CHANNEL
+
+    def test_unknown_value_returns_none(self):
+        message = make_message("hi", chat=FakeChat(-1001, chat_type="brand_new_type"))
+        assert chat_kind(message) is None
+
+    def test_message_without_chat_returns_none(self):
+        # 注意不能走 make_message：它内部是 ``chat or FakeChat(...)``，
+        # 传 None 会被换成默认群，测不到"没有 chat"这个分支。
+        assert chat_kind(object()) is None
+        assert chat_kind(types.SimpleNamespace(chat=None)) is None
+        assert chat_kind(types.SimpleNamespace(chat=types.SimpleNamespace(type=None))) is None
 
 
 class TestMessageText:
