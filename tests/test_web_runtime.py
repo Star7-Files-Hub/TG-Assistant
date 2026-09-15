@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from tg_assistant.config import AccountRecord
 from tg_assistant.web.runtime import RuntimeManager
 
 #: 单个用例里允许的最长等待；死锁会以超时形式暴露。
@@ -343,3 +344,120 @@ async def test_shutdown_stops_adopted_runner(monkeypatch: pytest.MonkeyPatch) ->
 
     assert external.shutdown_requested
     assert not manager.is_running
+
+
+# --------------------------------------------------------------------------- #
+# 账号列表里的「开了哪些功能」
+# --------------------------------------------------------------------------- #
+
+
+def _manager_with_configs(monkeypatch: pytest.MonkeyPatch, configs: dict[str, Any]):
+    """造一个 store：按名字返回给定配置（不存在的名字抛错）。"""
+    monkeypatch.setattr("tg_assistant.runner.MultiRunner", _FakeMultiRunner)
+    registry = types.SimpleNamespace(
+        accounts=[AccountRecord(name=n) for n in configs]
+    )
+
+    def load_config(name: str, create: bool = False):
+        cfg = configs.get(name)
+        if cfg is None:
+            raise FileNotFoundError(name)
+        return cfg
+
+    state = types.SimpleNamespace(
+        settings=types.SimpleNamespace(),
+        paths=types.SimpleNamespace(),
+        store=types.SimpleNamespace(
+            load_registry=lambda: registry,
+            load_account_config=load_config,
+            has_session=lambda name: True,
+        ),
+        web_settings=types.SimpleNamespace(heartbeat_interval=1.0, log_history_size=50),
+    )
+    return RuntimeManager(state)
+
+
+def _config(*, cf: bool = False, notify: bool = False, red_packet: bool = False):
+    return types.SimpleNamespace(
+        cloudflare_ip=types.SimpleNamespace(enabled=cf),
+        notify=types.SimpleNamespace(enabled=notify),
+        red_packet=types.SimpleNamespace(enabled=red_packet),
+    )
+
+
+def test_account_status_without_features_stays_cheap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/api/status`` 是 5 秒一次轮询的，默认不该去读配置文件。"""
+    called: list[str] = []
+
+    def load_config(name: str, create: bool = False):
+        called.append(name)
+        return _config(cf=True)
+
+    monkeypatch.setattr("tg_assistant.runner.MultiRunner", _FakeMultiRunner)
+    registry = types.SimpleNamespace(accounts=[AccountRecord(name="甲")])
+    state = types.SimpleNamespace(
+        settings=types.SimpleNamespace(),
+        paths=types.SimpleNamespace(),
+        store=types.SimpleNamespace(
+            load_registry=lambda: registry,
+            load_account_config=load_config,
+            has_session=lambda name: True,
+        ),
+        web_settings=types.SimpleNamespace(heartbeat_interval=1.0, log_history_size=50),
+    )
+    manager = RuntimeManager(state)
+
+    items = manager.account_status()
+
+    assert called == [], "默认不该读配置"
+    assert "features" not in items[0]
+
+
+def test_account_status_reports_feature_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """回归：面板要靠这个把下拉框默认选到真的配了功能的账号。
+
+    不这么做的话多账号时永远选中第一个 —— 而功能常配在另一个账号上，
+    用户打开页面看到空配置 + 「未运行」，会以为功能坏了（实测误判过）。
+    """
+    manager = _manager_with_configs(
+        monkeypatch,
+        {
+            "小白": _config(),
+            "SevenStar": _config(cf=True),
+        },
+    )
+
+    items = manager.account_status(with_features=True)
+    by_name = {i["name"]: i for i in items}
+
+    assert by_name["小白"]["features"] == {
+        "cloudflare_ip": False,
+        "notify": False,
+        "red_packet": False,
+    }
+    assert by_name["SevenStar"]["features"]["cloudflare_ip"] is True
+
+
+def test_broken_config_does_not_break_the_account_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """某个账号的配置读不出来时，列表仍要能返回，标记按「全没开」处理。"""
+    manager = _manager_with_configs(
+        monkeypatch,
+        {
+            "好的": _config(notify=True),
+            "坏的": None,  # load_account_config 会抛 FileNotFoundError
+        },
+    )
+
+    items = manager.account_status(with_features=True)
+    by_name = {i["name"]: i for i in items}
+
+    assert by_name["好的"]["features"]["notify"] is True
+    assert by_name["坏的"]["features"] == {
+        "cloudflare_ip": False,
+        "notify": False,
+        "red_packet": False,
+    }

@@ -263,8 +263,15 @@ class RuntimeManager:
     def is_running(self) -> bool:
         return self._runner_task is not None and not self._runner_task.done()
 
-    def account_status(self) -> list[dict[str, Any]]:
-        """全部账号的运行状态。"""
+    def account_status(self, *, with_features: bool = False) -> list[dict[str, Any]]:
+        """全部账号的运行状态。
+
+        ``with_features``
+            额外带上每个账号「开了哪些功能」。只有 ``/api/accounts`` 需要 ——
+            面板要靠它把下拉框默认选到**真的配了这个功能**的账号上。
+            ⚠️ ``/api/status`` 是 5 秒一次的轮询，走这个分支要读每个账号的
+            config.json，没必要，所以默认关闭。
+        """
         registry = self.store.load_registry()
         result = []
         for record in registry.accounts:
@@ -276,23 +283,41 @@ class RuntimeManager:
                         info.started_at = snapshot.get("uptime_s")
                         info.stats = snapshot
                         break
-            result.append(
-                {
-                    "name": info.name,
-                    "enabled": record.enabled,
-                    "running": info.running,
-                    "error": info.error,
-                    "user": record.label,
-                    "user_id": record.user_id,
-                    "username": record.username,
-                    "display_name": record.display_name,
-                    "session_exists": self.store.has_session(record.name),
-                    "proxy": record.proxy.to_url() if record.proxy else None,
-                    "last_login": record.last_login_at,
-                    "stats": info.stats,
-                }
-            )
+            item: dict[str, Any] = {
+                "name": info.name,
+                "enabled": record.enabled,
+                "running": info.running,
+                "error": info.error,
+                "user": record.label,
+                "user_id": record.user_id,
+                "username": record.username,
+                "display_name": record.display_name,
+                "session_exists": self.store.has_session(record.name),
+                "proxy": record.proxy.to_url() if record.proxy else None,
+                "last_login": record.last_login_at,
+                "stats": info.stats,
+            }
+            if with_features:
+                # 面板下拉框的默认选中项要靠这个。
+                # 不这么做的话，多账号时永远选中注册表里的第一个 ——
+                # 而功能常常只配在另一个账号上，于是用户打开页面看到的是
+                # 空配置 + 「未运行」，很容易以为功能坏了（实测就是这么误判的）。
+                item["features"] = self._feature_flags(record.name)
+            result.append(item)
         return result
+
+    def _feature_flags(self, name: str) -> dict[str, bool]:
+        """某个账号开了哪些功能。配置读不出来时一律当「没开」。"""
+        try:
+            config = self.store.load_account_config(name, create=False)
+        except Exception:  # pragma: no cover - 配置坏了不该拖垮账号列表
+            log.warning("读取账号 %s 的配置失败，功能标记按全部关闭处理", name, exc_info=True)
+            return {"cloudflare_ip": False, "notify": False, "red_packet": False}
+        return {
+            "cloudflare_ip": bool(config.cloudflare_ip.enabled),
+            "notify": bool(config.notify.enabled),
+            "red_packet": bool(config.red_packet.enabled),
+        }
 
     def get_account(self, name: str) -> Optional[dict[str, Any]]:
         record = self.store.get_account(name)

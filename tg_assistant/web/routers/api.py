@@ -35,7 +35,8 @@ async def api_status(runtime=Depends(get_runtime)) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 @router.get("/accounts")
 async def api_accounts(runtime=Depends(get_runtime)) -> dict[str, Any]:
-    return {"accounts": runtime.account_status()}
+    # 带上每个账号的功能开关：面板下拉框要靠它默认选到「真的配了这个功能」的账号。
+    return {"accounts": runtime.account_status(with_features=True)}
 
 
 @router.get("/accounts/{name}")

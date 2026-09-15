@@ -238,7 +238,10 @@
         data.accounts.forEach(a => {
             sel.innerHTML += `<option value="${escapeHtml(a.name)}">${escapeHtml(accountOptionText(a))}</option>`;
         });
-        if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
+        if (data.accounts.length > 0) {
+            sel.value = pickDefaultAccount(data.accounts, 'red_packet');
+            switchAccount();
+        }
     }
 
     async function switchAccount() {

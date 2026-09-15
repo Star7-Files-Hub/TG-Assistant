@@ -29,6 +29,23 @@ function accountOptionText(account) {
     return handle ? `${account.name}（${handle}）` : account.name;
 }
 
+// 账号下拉框默认该选哪个。
+//
+// ⚠️ **不要无脑选 `accounts[0]`**：功能往往只配在另一个账号上，于是用户打开
+// 「优选 IP」页看到的是空配置 + 状态卡「未运行」，很容易以为功能坏了
+// —— 实测就是这么误判的（优选 IP 配在 SevenStar 上，页面默认选中了小白）。
+//
+// 优先选「开了这个功能」的账号（`/api/accounts` 的 `features` 字段，
+// 见 `RuntimeManager._feature_flags`）；一个都没开就退回第一个。
+function pickDefaultAccount(accounts, feature) {
+    if (!accounts || !accounts.length) return '';
+    if (feature) {
+        const hit = accounts.find((a) => a.features && a.features[feature]);
+        if (hit) return hit.name;
+    }
+    return accounts[0].name;
+}
+
 // 把后端给的时间渲染成本地时间。
 //
 // 后端有两种时间格式，别搞混：

@@ -344,3 +344,53 @@ def test_rules_page_only_binds_static_inline_handlers() -> None:
     # 动态内容靠这两个属性找目标
     assert "data-action" in html and "data-rule-id" in html
     assert "data-remove-tag" in html
+
+
+# --------------------------------------------------------------------------- #
+# 下拉框默认选中项
+# --------------------------------------------------------------------------- #
+
+#: 页面 -> 它该用的功能标记（`/api/accounts` 的 `features` 键）。
+FEATURE_PAGES = {
+    "cloudflare_ip.html": "cloudflare_ip",
+    "notify.html": "notify",
+    "red_packet.html": "red_packet",
+}
+
+
+@pytest.mark.parametrize(("template", "feature"), sorted(FEATURE_PAGES.items()))
+def test_feature_pages_pick_a_configured_account(template: str, feature: str) -> None:
+    """功能页的账号下拉不能无脑选第一个账号。
+
+    多账号时功能往往只配在其中一个账号上，默认选中没配的那个，
+    用户打开页面看到的是空配置 + 状态卡「未运行」，会以为功能坏了。
+    （实测：优选 IP 配在 SevenStar 上，页面默认选中了小白。）
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / template).read_text(encoding="utf-8")
+
+    assert f"pickDefaultAccount(data.accounts, '{feature}')" in html, (
+        f"{template} 没用 pickDefaultAccount(data.accounts, '{feature}') 选默认账号"
+    )
+    assert "data.accounts[0].name" not in html, (
+        f"{template} 还在无脑选第一个账号"
+    )
+
+
+def test_pick_default_account_helper_exists() -> None:
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    js = (web_dir / "static" / "js" / "app.js").read_text(encoding="utf-8")
+
+    assert "function pickDefaultAccount(" in js
+    # 认得 /api/accounts 的 features 字段
+    assert "a.features" in js
+
+
+def test_account_status_defaults_to_cheap() -> None:
+    """``account_status()`` 默认不读配置文件 —— `/api/status` 是 5 秒一次的轮询。"""
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "tg_assistant" / "web" / "runtime.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def account_status(self, *, with_features: bool = False)" in src
