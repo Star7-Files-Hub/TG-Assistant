@@ -334,6 +334,53 @@ class TestPlanTargets:
         assert len(plan) == 1
         assert plan[0][2] == "9.9.9.9"
 
+    def test_duplicate_records_are_deduped(self):
+        """线上真实踩到：同一个 yx.7star.eu.cc 挂了两条 A，只有 proxied 不同。
+
+        不去重的话分流时每条记录各展开三家 —— 同一域名下反复创建/覆盖同一条
+        记录，最后留下哪条、proxied 取哪个全看顺序。
+        """
+        config = CloudflareIPConfig(
+            records=[
+                CloudflareDNSRecord(
+                    zone_id="z1", domain="7star.eu.cc", name="yx", proxied=False
+                ),
+                CloudflareDNSRecord(
+                    zone_id="z1", domain="7star.eu.cc", name="yx", proxied=True
+                ),
+            ]
+        )
+
+        plan = _plan_targets(config, None, {"mobile": "1.1.1.1", "telecom": "2.2.2.2"})
+
+        assert len(plan) == 3, "去重后只该剩一条记录 × 三家"
+        assert {isp for _, isp, _, _, _ in plan} == {"mobile", "telecom", "unicom"}
+        assert plan[0][0].proxied is False, "保留第一条"
+
+    def test_distinct_names_are_not_deduped(self):
+        config = CloudflareIPConfig(
+            records=[
+                CloudflareDNSRecord(zone_id="z1", domain="a.cc", name="yx"),
+                CloudflareDNSRecord(zone_id="z1", domain="a.cc", name="www"),
+                CloudflareDNSRecord(zone_id="z1", domain="b.cc", name="yx"),
+                CloudflareDNSRecord(zone_id="z2", domain="a.cc", name="yx"),
+            ]
+        )
+        plan = _plan_targets(config, "9.9.9.9", None)
+        assert len(plan) == 4
+
+    def test_dedup_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        config = CloudflareIPConfig(
+            records=[
+                CloudflareDNSRecord(zone_id="z1", domain="a.cc", name="yx"),
+                CloudflareDNSRecord(zone_id="z1", domain="a.cc", name="yx", proxied=False),
+            ]
+        )
+        with caplog.at_level("WARNING"):
+            _plan_targets(config, "9.9.9.9", None)
+
+        assert any("重复" in r.message for r in caplog.records)
+
 
 def _cloudflare_transport(records: list[dict]) -> httpx.MockTransport:
     """桩掉 Cloudflare 的记录查询接口。"""

@@ -580,6 +580,40 @@ async def _update_single_record(
         return _fail(f"网络错误: {exc}")
 
 
+def _dedupe_records(
+    records: list[CloudflareDNSRecord],
+) -> list[CloudflareDNSRecord]:
+    """按 ``(zone_id, domain, name, record_type)`` 去掉配置里重复的记录。
+
+    线上真实踩到过：配置里挂着**两条** ``7star.eu.cc / yx / A``，只有
+    ``proxied`` 不一样（一条 false 一条 true）。不分流时写两遍同一份 IP
+    还看不出问题，分流时会变成每条记录各展开三家 —— 同一个域名下反复
+    创建/覆盖同一条记录，最后留下哪条、``proxied`` 取哪个全看顺序。
+
+    保留**第一条**并告警。顺带一提：优选 IP 场景下 ``proxied`` 必须是
+    ``false``（DNS only）—— 开了代理的话 Cloudflare 返回的是它自己的
+    任播地址，写进去的优选 IP 根本不会生效。
+    """
+    seen: dict[tuple[str, str, str, str], CloudflareDNSRecord] = {}
+    for record in records:
+        key = (record.zone_id, record.domain, record.name, record.record_type)
+        if key in seen:
+            kept = seen[key]
+            log.warning(
+                "DNS 记录配置里有重复项 %s.%s (%s)：proxied=%s 与 proxied=%s 冲突，"
+                "本次只按第一条（proxied=%s）处理，建议到面板里删掉多余的那条",
+                record.name,
+                record.domain,
+                record.record_type,
+                kept.proxied,
+                record.proxied,
+                kept.proxied,
+            )
+            continue
+        seen[key] = record
+    return list(seen.values())
+
+
 def _plan_targets(
     config: CloudflareIPConfig,
     ip: Optional[str],
@@ -594,7 +628,7 @@ def _plan_targets(
     每个运营商各写一条 A 记录，靠 ``comment`` 区分。
     """
     plan = []
-    for record in config.records:
+    for record in _dedupe_records(config.records):
         if not ips_by_isp:
             plan.append((record, None, ip, None, None))
             continue
