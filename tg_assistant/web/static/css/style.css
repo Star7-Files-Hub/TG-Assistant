@@ -3,6 +3,9 @@
     --bg: #0f1117;
     --bg-card: #161b22;
     --bg-hover: #1c2333;
+    /* 卡片内部再嵌一层时的底色（优选 IP 的记录卡片、三网分行都用它）。
+       之前一直没定义，var() 拿不到值就退化成透明，那几块看着像没渲染出来。 */
+    --bg-secondary: #1a2029;
     --border: #30363d;
     --text: #e6edf3;
     --text-muted: #8b949e;
@@ -119,6 +122,9 @@ tr:hover td { background: var(--bg-hover); }
 }
 .badge-green { background: rgba(63, 185, 80, 0.15); color: var(--success); }
 .badge-red { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+/* 优选 IP 的「⊘ 跳过」徽章用的就是这个 —— 之前只定义了 green/red，
+   badge-yellow 一直是裸样式，看着像没渲染出来。 */
+.badge-yellow { background: rgba(210, 153, 34, 0.15); color: var(--warning); }
 
 /* 日志 */
 .log-box {
@@ -1474,6 +1480,8 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 .rp-account-select select, .nt-account-select select {
     padding: 8px 12px; background: rgba(13,17,23,0.6); border: 1px solid var(--border);
     border-radius: 8px; color: var(--text); font-size: 13px; min-width: 180px; cursor: pointer;
+    /* 选项文字最长可能是「小白（@meng5680）」，不给上限会把整个 header 挤变形 */
+    max-width: 260px;
 }
 .rp-master-toggle, .nt-master-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .rp-master-toggle input, .nt-master-toggle input { display: none; }
@@ -1496,6 +1504,9 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 .rp-grid, .nt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 8px; }
 @media (max-width: 600px) { .rp-grid, .nt-grid { grid-template-columns: 1fr; } }
 .rp-input-group, .nt-input-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+/* 纵向 flex 容器里的 <span class="badge"> 会被拉伸成整条（优选 IP 状态卡里
+   那个「未运行」就是这么被拉长的，看着像个空进度条）。让它按内容宽度收缩。 */
+.rp-input-group .badge, .nt-input-group .badge { align-self: flex-start; }
 .rp-input-group label, .nt-input-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
 .rp-input-group input, .nt-input-group input,
 .rp-input-group select, .nt-input-group select,
@@ -1558,6 +1569,10 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 .rp-save-bar, .nt-save-bar {
     position: sticky; bottom: 20px; display: flex; justify-content: center;
     margin-top: 24px; z-index: 10;
+    /* sticky 的元素会浮在正文上方：不给底色的话，滚动到中段时它就直接
+       盖在表单控件上，看着像排版错乱。 */
+    padding: 12px 0 4px 0;
+    background: linear-gradient(to bottom, rgba(15, 17, 23, 0) 0%, var(--bg) 45%);
 }
 .rp-save-bar button, .nt-save-bar button {
     padding: 12px 32px; font-size: 15px; box-shadow: 0 4px 20px rgba(47,129,247,0.3);
@@ -1847,3 +1862,33 @@ tr:hover td { background: var(--bg-hover); }
 .cf-record-item { padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); }
 .cf-record-item .nt-grid { margin-bottom: 8px; }
 .cf-record-item .btn-danger { margin-top: 4px; }
+
+/* 三网分流：记录卡片里的预览提示 */
+.cf-split-preview {
+    margin: 4px 0 8px 0;
+    padding: 6px 10px;
+    border-left: 3px solid var(--primary);
+    border-radius: 4px;
+    background: rgba(47, 129, 247, 0.08);
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* 三网分流：移动 / 电信 / 联通 每家一行 */
+.cf-isp-table { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.cf-isp-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    font-size: 13px;
+}
+.cf-isp-name { flex: 0 0 48px; font-weight: 600; }
+.cf-isp-ip { flex: 0 0 auto; font-family: var(--font-mono); }
+.cf-isp-speed { flex: 0 0 auto; color: var(--text-muted); }
+.cf-isp-threshold { flex: 0 0 auto; color: var(--text-muted); font-size: 12px; }
+.cf-isp-row .badge { margin-left: auto; }
+.cf-isp-reason { padding: 0 10px 4px 70px; color: var(--text-muted); font-size: 12px; }

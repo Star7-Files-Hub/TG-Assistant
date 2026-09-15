@@ -434,8 +434,8 @@
         div.innerHTML = data.accounts.map(a => `
             <div class="tg-account-card">
                 <div class="tg-account-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
-                <div class="tg-account-info"><div class="tg-account-name">${a.name}</div><div class="tg-account-user">${a.user || '未绑定'}</div></div>
-                <div class="tg-account-meta"><span class="tg-badge ${a.session_exists ? 'tg-badge-success' : 'tg-badge-error'}">${a.session_exists ? '已登录' : '未登录'}</span><a href="/config/${a.name}" class="tg-btn tg-btn-sm">配置</a></div>
+                <div class="tg-account-info"><div class="tg-account-name">${escapeHtml(a.name)}</div><div class="tg-account-user">${escapeHtml(a.username ? '@' + a.username : (a.display_name || '未绑定'))}</div></div>
+                <div class="tg-account-meta"><span class="tg-badge ${a.session_exists ? 'tg-badge-success' : 'tg-badge-error'}">${a.session_exists ? '已登录' : '未登录'}</span><a href="/config/${encodeURIComponent(a.name)}" class="tg-btn tg-btn-sm">配置</a></div>
             </div>
         `).join('');
     }

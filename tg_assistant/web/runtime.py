@@ -32,9 +32,24 @@ class AccountRuntime:
 
 
 class RuntimeManager:
-    """管理 MultiRunner 的生命周期。"""
+    """管理 MultiRunner 的生命周期。
 
-    def __init__(self, app_state: Any) -> None:
+    runner 有两个来源：
+
+    - ``tg-assistant web``：面板自己建（``runner=None``，走 :meth:`start`）；
+    - ``tg-assistant run --web``：CLI 建好之后交给本类**接管**（``runner=<那个对象>``）。
+
+    第二种必须接管而不是各建一个 —— 见 :meth:`_adopt_external_runner`。
+    """
+
+    def __init__(
+        self,
+        app_state: Any,
+        *,
+        runner: Any = None,
+        initial_accounts: list[str] | None = None,
+        run_options: dict[str, Any] | None = None,
+    ) -> None:
         self.state = app_state
         self.settings: Any = app_state.settings
         self.paths: Any = app_state.paths
@@ -46,16 +61,64 @@ class RuntimeManager:
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
+        #: CLI 预建、待接管的 runner 与其账号列表（``--web`` 模式）。
+        self._adopted_runner: Any = runner
+        self._adopted_accounts: Optional[list[str]] = list(initial_accounts) if initial_accounts else None
+        #: 透传给 ``MultiRunner.run()`` 的参数（heartbeat / restart_delay / max_restarts）。
+        #: 刻意**不**在这里补 heartbeat：``cli.py`` 是在 ``create_app()`` 返回之后
+        #: 才把真正的 WebSettings 换进 ``app.state`` 的，此刻读会拿到默认值。
+        #: 兜底在 :meth:`_supervise` 里延迟处理。
+        self._run_options: dict[str, Any] = dict(run_options or {})
 
     # ------------------------------------------------------------------ #
     async def startup(self) -> None:
-        """启动时挂接日志广播与优选 IP 定时任务。"""
+        """启动时挂接日志广播、优选 IP 定时任务，并接管 CLI 预建的 runner。"""
         self._log_handler = _BroadcastHandler(self._emit_log)
         self._log_handler.setLevel(logging.DEBUG)
         root = logging.getLogger("tg-assistant")
         root.addHandler(self._log_handler)
         self._cf_ip_task = asyncio.create_task(self._cloudflare_ip_loop(), name="cf-ip-scheduler")
         get_logger().info("Web 运行管理器已就绪", extra={"account": "-", "extra_fields": {}})
+        await self._adopt_external_runner()
+
+    async def _adopt_external_runner(self) -> None:
+        """接管 ``tg-assistant run --web`` 里 CLI 建好的那个 MultiRunner。
+
+        不接管的后果（都实测过）：
+
+        1. ``self._runner`` 永远是 ``None`` → ``/api/status`` 恒报 ``running: false``，
+           面板状态卡永远显示「未运行」；
+        2. 优选 IP 复用不到已登录的 client（那段代码判断 ``self._runner is not None``），
+           只能退化成 ``make_message_source_from_account()`` 另建一个 client，
+           跟正在跑的 runner 抢同一个 ``.session`` → 每 60 秒一次 ``database is locked``；
+        3. 面板点「启动」会**再拉起一套** runner，同一账号两个 client 同时登录，
+           同一条消息被转发两次。
+        """
+        runner = self._adopted_runner
+        self._adopted_runner = None
+        if runner is None:
+            return
+
+        names = self._adopted_accounts
+        if not names:
+            names = [record.name for record in self.store.load_registry().enabled_accounts]
+        if not names:
+            get_logger().info(
+                "没有可运行的账号，等待在面板中启动",
+                extra={"account": "-", "extra_fields": {}},
+            )
+            return
+
+        async with self._lock:
+            await self._launch(runner, names)
+
+    async def _launch(self, runner: Any, names: list[str]) -> None:
+        """登记 runner 并起看护任务（必须在持锁时调用）。"""
+        self._runner = runner
+        self._shutdown_event.clear()
+        self._runner_task = asyncio.create_task(self._supervise(runner, names), name="web-runner")
+        # 通知 /ws/status 订阅者：已开始运行。
+        self.push_event({"type": "status", "running": True, "accounts": names})
 
     async def shutdown(self) -> None:
         """停止全部账号并卸载日志。"""
@@ -80,6 +143,7 @@ class RuntimeManager:
     async def _cloudflare_ip_loop(self) -> None:
         """后台循环：检查所有账号的 Cloudflare IP 定时配置，到期执行。"""
         from tg_assistant.cloudflare_ip import (
+            ISP_LABELS,
             fetch_and_update,
             make_message_source,
             make_message_source_from_account,
@@ -121,7 +185,12 @@ class RuntimeManager:
                         extra={"account": record.name, "extra_fields": {"interval_h": cf_config.interval_hours}},
                     )
 
-                    # 获取消息源
+                    # 获取消息源：**优先复用账号正在跑的那个 client**。
+                    # 退化成 make_message_source_from_account() 会另建一个 client
+                    # 去抢同一个 .session，结果是每 60 秒一次 database is locked
+                    # （实测刷了整整一屏，优选 IP 永远更新不了）。
+                    # 这条分支依赖 self._runner 不为 None —— 由
+                    # _adopt_external_runner() 在 --web 模式下保证。
                     source = None
                     client_to_stop = None
                     running = self._running_accounts() if self._runner is not None else set()
@@ -157,6 +226,18 @@ class RuntimeManager:
                             "speed": summary.fetched.fastest_speed,
                             "updated_at": summary.updated_at,
                             "records_count": len(summary.results),
+                            "split_by_isp": cf_config.split_by_isp,
+                            "decisions": [
+                                {
+                                    "isp": isp,
+                                    "label": ISP_LABELS.get(isp, isp),
+                                    "should_update": d.should_update,
+                                    "ip": d.ip,
+                                    "speed": d.speed,
+                                    "reason": d.reason,
+                                }
+                                for isp, d in summary.decisions.items()
+                            ],
                         }
                         self.store.save_state(record.name, state)
                     except Exception as exc:
@@ -242,22 +323,19 @@ class RuntimeManager:
         async with self._lock:
             if self.is_running:
                 return {"ok": False, "message": "已经在运行中，请先停止"}
-            from tg_assistant.runner import MultiRunner
-
-            self._runner = MultiRunner(self.store, self.settings)
-            self._shutdown_event.clear()
             names = accounts or [r.name for r in self.store.load_registry().enabled_accounts]
             if not names:
                 return {"ok": False, "message": "没有可运行的账号。先 login 并用 accounts enable 启用。"}
-            # 把 runner 显式交给 _supervise：它原来是回头读 self._runner，
+
+            from tg_assistant.runner import MultiRunner
+
+            # 先确认有账号、再建 runner：原来是无条件建好之后才发现没账号就返回，
+            # 于是 self._runner 留着一个从没跑过的对象。
+            #
+            # 把 runner 显式交给 _launch：它原来是回头读 self._runner，
             # 于是「start() 之后立刻 stop()」这种时序下，任务还没开始跑
             # self._runner 就已经被摘成 None 了，任务一启动就撞 assert。
-            runner = self._runner
-            self._runner_task = asyncio.create_task(
-                self._supervise(runner, names), name="web-runner"
-            )
-            # 通知 /ws/status 订阅者：已开始运行。
-            self.push_event({"type": "status", "running": True, "accounts": names})
+            await self._launch(MultiRunner(self.store, self.settings), names)
             return {"ok": True, "accounts": names}
 
     async def stop(self) -> dict[str, Any]:
@@ -361,12 +439,16 @@ class RuntimeManager:
         ``stop()`` 会把它摘成 ``None``，而本任务可能还没开始跑。
         """
         error: Optional[str] = None
+        options: dict[str, Any] = {
+            "heartbeat": float(self.state.web_settings.heartbeat_interval)
+        }
+        options.update(self._run_options)
         try:
             await runner.run(
                 names,
-                heartbeat=float(self.state.web_settings.heartbeat_interval),
                 # 信号由 uvicorn 接管，这里不能再抢注
                 install_signals=False,
+                **options,
             )
         except asyncio.CancelledError:
             pass

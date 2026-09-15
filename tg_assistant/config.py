@@ -632,6 +632,11 @@ class RedPacketConfig(StrictModel):
 # --------------------------------------------------------------------------- #
 # Cloudflare 优选 IP 自动更新
 # --------------------------------------------------------------------------- #
+#: 支持的运营商标识。落盘和 API 一律用这几个英文 key，
+#: 中文名（移动/电信/联通）只出现在界面与日志里，见 ``cloudflare_ip.ISP_LABELS``。
+ISP_KEYS: tuple[str, ...] = ("mobile", "telecom", "unicom")
+
+
 class CloudflareDNSRecord(StrictModel):
     """一条要更新的 DNS 记录。"""
 
@@ -673,21 +678,60 @@ class CloudflareIPConfig(StrictModel):
     api_token: Optional[str] = None
     #: 源 Telegram 频道：抓取该频道最近消息中的优选 IP
     source_channel: Optional[ChatRef] = None
-    #: 抓取最近多少条消息（默认 5 条，一般最快 IP 在最新消息里）
-    fetch_limit: int = Field(default=5, ge=1, le=100)
+    #: 抓取最近多少条消息。这类频道是「一条消息只讲一个运营商」的格式
+    #: （如 ``@cfyxip`` 首行标 ``(移动)``/``(电信)``/``(联通)``），
+    #: 所以要够多才能凑齐三网 —— 默认 20 条。
+    fetch_limit: int = Field(default=20, ge=1, le=100)
     #: 要更新的 DNS 记录列表
     records: list[CloudflareDNSRecord] = Field(default_factory=list)
     #: 定时检查间隔（小时），0 = 仅手动触发 / 实时监听
     interval_hours: float = Field(default=0.0, ge=0.0, le=168.0)
     #: 最低速度阈值（MB/s）。频道解析出来的最快 IP 低于此值时不更新。
-    #: 0 = 不限制。
+    #: 0 = 不限制。三网分流时作为**兜底值**，某个运营商没在
+    #: ``min_speed_threshold_by_isp`` 里单独配才用它。
     min_speed_threshold: float = Field(default=0.0, ge=0.0)
+    #: 三网分流：同一个域名下**每个运营商各写一条 A 记录**，
+    #: 用 Cloudflare 记录的 comment 标记区分（移动/电信/联通各一条），
+    #: 客户端按自己所在的网自动选到最近的那条。
+    #:
+    #: 关闭时维持原行为：所有记录都写「整体最快」的那一个 IP。
+    split_by_isp: bool = False
+    #: 按运营商分别设的最低速度阈值（MB/s），键取 ``ISP_KEYS``。
+    #:
+    #: 为什么必须分开设：三网测速差距极大 —— 同一天里电信能跑到 166 MB/s、
+    #: 联通 80 MB/s，而移动最好只有 27 MB/s。共用一个阈值的话，
+    #: 移动那条记录会永远不更新。
+    min_speed_threshold_by_isp: dict[str, float] = Field(default_factory=dict)
     #: 开启后，更新前会对比当前 DNS 记录对应 IP 的「上次更新速度」，
     #: 只有新 IP 速度 > 当前速度才更新；否则保留现有记录。
     only_update_if_faster: bool = True
     #: 实时监听：账号在线时是否监听源频道的新消息。
     #: 关闭后只走定时轮询 / 手动触发。
     real_time_listen: bool = True
+
+    @field_validator("min_speed_threshold_by_isp", mode="before")
+    @classmethod
+    def _check_isp_thresholds(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("min_speed_threshold_by_isp 必须是 {运营商: 阈值} 形式")
+        cleaned: dict[str, float] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            if key not in ISP_KEYS:
+                raise ValueError(
+                    f"min_speed_threshold_by_isp 里的键 {key!r} 不是运营商标识，"
+                    f"只能是 {'、'.join(ISP_KEYS)} 之一"
+                )
+            try:
+                number = float(raw_value)
+            except (TypeError, ValueError):
+                raise ValueError(f"运营商 {key} 的阈值 {raw_value!r} 不是数字") from None
+            if number < 0:
+                raise ValueError(f"运营商 {key} 的阈值不能为负数")
+            cleaned[key] = number
+        return cleaned
 
     @field_validator("api_token", mode="before")
     @classmethod

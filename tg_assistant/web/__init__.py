@@ -21,10 +21,20 @@ def create_app(
     api_hash: str | None = None,
     proxy_url: str | None = None,
     log_level: str = "INFO",
+    *,
+    runner: object | None = None,
+    initial_accounts: list[str] | None = None,
+    run_options: dict | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用。
 
     把数据目录、全局设置等注入到 app.state，供各 router 通过 Depends 获取。
+
+    ``runner`` / ``initial_accounts`` / ``run_options``
+        供 ``tg-assistant run --web`` 使用：CLI 已经建好了 MultiRunner，
+        这里把它交给 :class:`RuntimeManager` **接管**（而不是让面板另建一个，
+        那样会有两套对象抢同一个 session 文件）。``tg-assistant web``
+        不传，面板自己建。
     """
     from tg_assistant.config import Settings
     from tg_assistant.logging_setup import configure_logging
@@ -53,7 +63,12 @@ def create_app(
     app.state.paths = paths
     app.state.store = store
     app.state.web_settings = WebSettings()
-    app.state.runtime = RuntimeManager(app.state)
+    app.state.runtime = RuntimeManager(
+        app.state,
+        runner=runner,
+        initial_accounts=initial_accounts,
+        run_options=run_options,
+    )
 
     # 静态文件与模板
     web_dir = Path(__file__).parent

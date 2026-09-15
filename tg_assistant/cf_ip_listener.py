@@ -21,6 +21,7 @@ from pyrogram.handlers import MessageHandler
 from pyrogram.types import Message
 
 from .cloudflare_ip import (
+    ISP_LABELS,
     fetch_and_update,
     make_message_source,
     parse_ips_from_text,
@@ -34,6 +35,11 @@ _MIN_MESSAGE_LENGTH = 50
 
 #: 快速预检：消息里是否含有看起来像 IP 的字符串
 _QUICK_IP_PRESEARCH = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+
+
+def _record_label(result: Any) -> str:
+    """``yx.7star.eu.cc`` 这种给人看的域名写法。"""
+    return result.domain if result.name == "@" else f"{result.name}.{result.domain}"
 
 
 class CFIPListener:
@@ -117,12 +123,22 @@ class CFIPListener:
         fetched.message_id = message.id
 
         # 决策
-        decision = should_update(fetched, self.config, state)
-        if not decision.should_update:
-            self.alog.info("决策跳过: %s", decision.reason)
-            return
-
-        self.alog.info("决策通过: %s", decision.reason)
+        if self.config.split_by_isp:
+            # ⚠️ 三网分流时**不能**拿「这一条消息」做预检。这类频道一条消息
+            # 只讲一个运营商，用它去卡阈值会把另外两家一起挡掉 ——
+            # 比如这条是联通的 3 MB/s，而电信刚发了 166 MB/s 的好 IP，
+            # 预检不过就直接 return，电信那条永远不会更新。
+            # 这里直接走完整抓取（它会拉 fetch_limit 条消息、逐家决策）。
+            self.alog.info(
+                "三网分流：跳过单条预检，改为抓取最近 %d 条逐家决策",
+                self.config.fetch_limit,
+            )
+        else:
+            decision = should_update(fetched, self.config, state)
+            if not decision.should_update:
+                self.alog.info("决策跳过: %s", decision.reason)
+                return
+            self.alog.info("决策通过: %s", decision.reason)
 
         # 更新
         from .proxy import resolve_proxy
@@ -140,38 +156,34 @@ class CFIPListener:
         if summary.skipped:
             self.alog.info("更新跳过: %s", summary.skipped_reason)
         elif summary.all_ok:
-            self._notify_success(decision, summary)
+            self._notify_success(summary)
         else:
             self._notify_failure(summary)
 
-    def _notify_success(self, decision: Any, summary: Any) -> None:
+    def _notify_success(self, summary: Any) -> None:
+        """成功通知。三网分流与不分流共用 —— 都从 ``summary.results`` 取。"""
+        changed = [r for r in summary.results if r.ok and not r.skipped]
+        domains = ", ".join(_record_label(r) for r in changed)
         self.alog.info(
-            "DNS 更新成功: %s → %s (%.2f MB/s)",
-            decision.ip,
-            ", ".join(
-                r.name == "@" and r.domain or f"{r.name}.{r.domain}"
-                for r in summary.results
-            ),
-            decision.speed or 0,
+            "DNS 更新成功: %s → %s",
+            ", ".join(f"{ISP_LABELS.get(r.isp, '整体')}={r.ip}" for r in changed),
+            domains,
         )
-        if self.notifier is not None:
-            from .notify import NotifyTask
+        if self.notifier is None:
+            return
 
-            domains = ", ".join(
-                r.name == "@" and r.domain or f"{r.name}.{r.domain}"
-                for r in summary.results
+        from .notify import NotifyTask
+
+        lines = "\n".join(
+            f"{ISP_LABELS.get(r.isp, '') + ' ' if r.isp else ''}<code>{r.ip}</code>"
+            for r in changed
+        )
+        self.notifier.submit(
+            NotifyTask(
+                event="forward",
+                text=f"⚡ Cloudflare IP 已更新\n{lines}\n域名: {domains}",
             )
-            self.notifier.submit(
-                NotifyTask(
-                    event="forward",
-                    text=(
-                        f"⚡ Cloudflare IP 已更新\n"
-                        f"IP: <code>{decision.ip}</code>\n"
-                        f"速度: {decision.speed:.2f} MB/s\n"
-                        f"域名: {domains}"
-                    ),
-                )
-            )
+        )
 
     def _notify_failure(self, summary: Any) -> None:
         failed = [r for r in summary.results if not r.ok]
@@ -180,18 +192,20 @@ class CFIPListener:
             summary.changed_count,
             len(summary.results),
         )
-        if self.notifier is not None:
-            from .notify import NotifyTask
+        if self.notifier is None:
+            return
 
-            errors = "; ".join(
-                f"{r.name}.{r.domain}: {r.error}" for r in failed
+        from .notify import NotifyTask
+
+        errors = "; ".join(
+            f"{ISP_LABELS.get(r.isp, '')}{_record_label(r)}: {r.error}" for r in failed
+        )
+        self.notifier.submit(
+            NotifyTask(
+                event="error",
+                text=f"⚠️ Cloudflare IP 更新失败\n{errors}",
             )
-            self.notifier.submit(
-                NotifyTask(
-                    event="error",
-                    text=f"⚠️ Cloudflare IP 更新失败\n{errors}",
-                )
-            )
+        )
 
 
 __all__ = ["CFIPListener"]

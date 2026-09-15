@@ -495,17 +495,17 @@
     // ==================== 账号级操作 ====================
     async function startAccount(name) {
         if (!name) return;
-        // ⚠️ 这里必须先问一句，原因是个已知的架构问题（不是这个页面的）：
-        // 服务用 `tg-assistant run --web` 启动时，真正在跑的 MultiRunner 属于 CLI
-        // 进程，而面板里的 WebRuntime 是另一个对象（它的 _runner 是 None）。于是
-        // /api/status 永远报 running=false，面板也控制不了那个 runner。此时点「启动」
-        // 会**再拉起一套**，同一个账号被两个 client 同时登录 —— 同一条消息转发两次。
-        if (!confirm(
-            `确定启动账号「${name}」吗？\n\n`
-            + '如果服务是用 run --web 起的，账号其实已经在跑了，而面板读不到这个状态'
-            + '（状态点会一直显示「已登录」）。这种情况下再启动会多出一套 runner，'
-            + '导致同一条消息被转发两次。'
-        )) return;
+        // 这里**不再**弹确认框。
+        //
+        // 以前弹是因为一个架构缺陷：服务用 `tg-assistant run --web` 启动时，
+        // 真正在跑的 MultiRunner 属于 CLI，而面板里的 WebRuntime 是另一个对象
+        // （`_runner` 恒为 None）→ `/api/status` 永远报 running=false，面板也控制不了
+        // 那个 runner，点「启动」会再拉起一套、同一条消息转发两次。
+        //
+        // 现在 `create_app(runner=...)` 会把 CLI 建好的 runner 交给 RuntimeManager
+        // **接管**（见 `runtime.py:_adopt_external_runner`），面板就是唯一的控制方：
+        // 状态真实、启停都生效。重复点「启动」会被 `RuntimeManager.start()` 直接
+        // 拒掉（「已经在运行中，请先停止」），不需要前端再拦一道。
         const res = await fetch(`/api/run/start/${encodeURIComponent(name)}`, {method: 'POST'});
         const data = await res.json().catch(() => ({}));
         toast(data.ok ? `已启动「${name}」` : (detailText(data) || '启动失败'), !!data.ok);

@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import os
 import sys
@@ -445,6 +444,16 @@ def run_cmd(
 
     click.secho(f"日志目录：{ctx.paths.log_dir}", fg="cyan")
 
+    # runner 提前建好：Web 模式下它会被 create_app 交给 RuntimeManager **接管**
+    # （见 RuntimeManager._adopt_external_runner），所以必须早于 create_app 存在。
+    # MultiRunner 的构造函数不碰网络、不读 session，提前建没有副作用。
+    runner = MultiRunner(ctx.store, ctx.settings)
+    run_options = {
+        "heartbeat": heartbeat,
+        "restart_delay": restart_delay,
+        "max_restarts": max_restarts,
+    }
+
     app = None
     if web:
         from tg_assistant.web import create_app
@@ -477,6 +486,9 @@ def run_cmd(
             api_hash=ctx.settings.api_hash,
             proxy_url=ctx.settings.proxy.to_url() if ctx.settings.proxy else None,
             log_level=ctx.settings.log_level,
+            runner=runner,
+            initial_accounts=names,
+            run_options=run_options,
         )
         app.state.web_settings = WebSettings(
             host=web_host,
@@ -484,17 +496,10 @@ def run_cmd(
             secret_key=password,
         )
 
-    runner = MultiRunner(ctx.store, ctx.settings)
-
     async def _run_all() -> int:
         """跑转发 runner；开了 ``--web`` 就把 Web 控制台一起跑起来。"""
         if app is None:
-            return await runner.run(
-                names,
-                heartbeat=heartbeat,
-                restart_delay=restart_delay,
-                max_restarts=max_restarts,
-            )
+            return await runner.run(names, **run_options)
 
         import uvicorn
 
@@ -509,21 +514,17 @@ def run_cmd(
 
         if not names:
             click.secho("等待在 Web 界面扫码登录…（Ctrl-C 退出）", fg="cyan")
-            await server.serve()
-            return 0
+        else:
+            click.secho("账号由面板托管：启停请用面板上的按钮（Ctrl-C 退出）", fg="cyan")
 
-        web_task = asyncio.create_task(server.serve())
-        try:
-            return await runner.run(
-                names,
-                heartbeat=heartbeat,
-                restart_delay=restart_delay,
-                max_restarts=max_restarts,
-            )
-        finally:
-            web_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await web_task
+        # ⚠️ Web 模式下**不要**在这里 await runner.run()。
+        # 那个 runner 已经交给 app.state.runtime 接管了，两边都跑的话：
+        # 面板既控制不了 CLI 这一套（它的 self._runner 是 None，状态恒为
+        # 「未运行」、优选 IP 复用不到已登录的 client），点「启动」还会
+        # 再拉起第二套 runner，同一条消息被转发两次。
+        # 这里只负责把 Web 服务跑起来；账号的启停归面板。
+        await server.serve()
+        return 0
 
     try:
         code = asyncio.run(_run_all())

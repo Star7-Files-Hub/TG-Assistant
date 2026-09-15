@@ -37,26 +37,33 @@
             tbody.innerHTML = '<tr><td colspan="6" class="muted">还没有账号。<a href="/login">扫码登录</a></td></tr>';
             return;
         }
-        // a.user / a.proxy / a.last_login 可能来自 Telegram 或用户输入，
-        // 拼进 innerHTML 前必须转义。
-        tbody.innerHTML = data.accounts.map(a => `
+        // a.proxy / a.last_login 可能来自 Telegram 或用户输入，拼进 innerHTML 前必须转义。
+        //
+        // 身份列**不要**用 a.user：那是 `小白 @meng5680 id=5608153118` 这种带
+        // user_id 的调试用长标签，表格里又长又没用。这里用 `@username`（没有就退回显示名）。
+        // 时间列用 formatDateTime() 转本地时间 —— 后端给的是 ISO 字符串
+        // （`2026-09-15T11:23:16+00:00`），直接拼出来没人看得懂本地是几点。
+        tbody.innerHTML = data.accounts.map(a => {
+            const handle = a.username ? '@' + a.username : (a.display_name || '');
+            return `
             <tr>
                 <td><strong>${escapeHtml(a.name)}</strong></td>
-                <td>${escapeHtml(a.user) || '-'}</td>
+                <td>${escapeHtml(handle) || '-'}</td>
                 <td>
                     <span class="badge ${a.running ? 'badge-green' : (a.session_exists ? '' : 'badge-red')}">
                         ${a.running ? '运行中' : (a.session_exists ? '已登录' : '未登录')}
                     </span>
                 </td>
                 <td>${escapeHtml(a.proxy) || '直连'}</td>
-                <td>${escapeHtml(a.last_login) || '-'}</td>
+                <td>${escapeHtml(formatDateTime(a.last_login)) || '-'}</td>
                 <td>
                     <button class="btn btn-sm" onclick="toggleEnable('${escapeHtml(a.name)}', ${!a.enabled})">${a.enabled ? '停用' : '启用'}</button>
                     <a href="/config/${encodeURIComponent(a.name)}" class="btn btn-sm">配置</a>
                     <button class="btn btn-sm btn-danger" onclick="deleteAccount('${escapeHtml(a.name)}')">删除</button>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
     async function toggleEnable(name, enabled) {
         const res = await fetch(`/api/accounts/${name}/${enabled ? 'enable' : 'disable'}`, {method: 'POST'});

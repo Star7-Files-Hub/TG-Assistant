@@ -19,6 +19,38 @@ function redirectToAuth() {
     location.href = url.toString();
 }
 
+// 账号下拉选项的显示文本。
+//
+// ⚠️ 别直接用 /api/accounts 的 `user` 字段：它是 `小白 @meng5680 id=5608153118`
+// 这种带 user_id 的调试用长标签，塞进 <option> 会把页面头部整个撑变形
+// （优选 IP / 通知 / 抢红包 三个页面都踩过）。这里只取账号名 + 用户名。
+function accountOptionText(account) {
+    const handle = account.username ? '@' + account.username : (account.display_name || '');
+    return handle ? `${account.name}（${handle}）` : account.name;
+}
+
+// 把后端给的时间渲染成本地时间。
+//
+// 后端有两种时间格式，别搞混：
+//   * 账号的 `last_login` 是 **ISO 字符串**（`utc_now_iso()`，形如
+//     `2026-09-15T11:23:16+00:00`）—— 直接丢给 `new Date()` 就行；
+//   * 优选 IP 的 `updated_at` / 消息时间戳是 **Unix 秒** —— 要 `* 1000`。
+// 以前账号页是 `${escapeHtml(a.last_login)}` 直接拼，表格里就是一坨
+// `2026-09-15T11:23:16+00:00`，又长又看不懂本地是几点。
+function formatDateTime(value) {
+    if (value === null || value === undefined || value === '') return '';
+    let date;
+    if (typeof value === 'number') {
+        date = new Date(value * 1000);           // Unix 秒
+    } else if (/^\d+(\.\d+)?$/.test(String(value))) {
+        date = new Date(Number(value) * 1000);   // 数字字符串也当 Unix 秒
+    } else {
+        date = new Date(value);                  // ISO 字符串
+    }
+    if (Number.isNaN(date.getTime())) return String(value);   // 解析不了就原样显示，别显示 Invalid Date
+    return date.toLocaleString('zh-CN', { hour12: false });
+}
+
 // 统一的 401 处理：未鉴权或会话过期时直接送去 /auth，
 // 省得每个页面的每个请求各写一遍判断。
 const _nativeFetch = window.fetch.bind(window);

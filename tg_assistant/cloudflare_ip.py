@@ -20,11 +20,34 @@ from typing import Any, Callable, Optional
 
 import httpx
 
-from .config import CloudflareDNSRecord, CloudflareIPConfig
+from .config import ISP_KEYS, CloudflareDNSRecord, CloudflareIPConfig
 from .logging_setup import get_logger
 from .proxy import ProxyConfig, httpx_proxy
 
 log = get_logger("cloudflare_ip")
+
+#: 运营商标识 → 中文名。落盘和 API 一律用英文 key，中文只出现在界面与日志里。
+ISP_LABELS: dict[str, str] = {
+    "mobile": "移动",
+    "telecom": "电信",
+    "unicom": "联通",
+}
+
+#: 频道消息首行的运营商标注，如「✅ Cloudflare 优选IP更新 (联通)」。
+#: 这类频道是**一条消息只讲一个运营商**，所以想凑齐三网必须多看几条消息。
+_ISP_LABEL_PATTERN = re.compile(r"[（(]\s*(移动|电信|联通)\s*[)）]")
+
+#: 中文名 → 标识
+_ISP_BY_LABEL = {label: key for key, label in ISP_LABELS.items()}
+
+#: 写进 Cloudflare 记录 comment 的标记，用来在同一域名下区分三网的 A 记录。
+#: 用 comment 而不是靠顺序：用户随时可能在 Cloudflare 后台删掉再重建记录，
+#: 靠顺序会错位；comment 是记录自身的属性，重建后照样能重新认领。
+ISP_COMMENT_PREFIX = "tg-assistant:isp="
+
+#: state.json 里按运营商记录的上次速度 / IP（供 only_update_if_faster 比较）。
+LAST_SPEED_BY_ISP_KEY = "cloudflare_ip_last_speed_by_isp"
+LAST_IP_BY_ISP_KEY = "cloudflare_ip_last_ip_by_isp"
 
 #: 匹配 IPv4 地址
 _IPV4_PATTERN = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
@@ -42,6 +65,31 @@ _LINE_IP_PATTERN = re.compile(
 
 
 @dataclass
+class IPUpdateDecision:
+    """决策结果：是否应该更新，以及原因。"""
+
+    should_update: bool
+    ip: Optional[str] = None
+    speed: Optional[float] = None
+    reason: str = ""
+    current_speed: Optional[float] = None
+
+
+@dataclass
+class ISPBest:
+    """某个运营商在本次抓取里的最优结果。"""
+
+    isp: str
+    ip: str
+    speed: float
+    message_id: Optional[int] = None
+
+    @property
+    def label(self) -> str:
+        return ISP_LABELS.get(self.isp, self.isp)
+
+
+@dataclass
 class IPFetchResult:
     """从频道消息里解析出的 IP 结果。"""
 
@@ -51,16 +99,29 @@ class IPFetchResult:
     all_speeds: dict[str, float] = None  # type: ignore[assignment]
     raw_text: Optional[str] = None
     message_id: Optional[int] = None
+    #: 这条消息属于哪个运营商（``mobile``/``telecom``/``unicom``）；认不出是 ``None``。
+    isp: Optional[str] = None
+    #: 按运营商聚合出的最优结果，键是运营商标识。
+    #: 只有 :func:`fetch_ips_from_channel` 会填 —— 单条消息解析
+    #: （:func:`parse_ips_from_text`）只知道自己那一条，聚合是调用方的事。
+    best_by_isp: dict[str, ISPBest] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.all_ips is None:
             self.all_ips = []
         if self.all_speeds is None:
             self.all_speeds = {}
+        if self.best_by_isp is None:
+            self.best_by_isp = {}
 
     @property
     def has_ip(self) -> bool:
         return self.fastest is not None
+
+    @property
+    def has_isp_split(self) -> bool:
+        """是否至少认出了一个运营商的归属。"""
+        return bool(self.best_by_isp)
 
 
 @dataclass
@@ -70,10 +131,18 @@ class DNSUpdateResult:
     domain: str
     name: str
     record_type: str
-    ip: str
+    ip: Optional[str]
     ok: bool
     record_id: Optional[str] = None
     error: Optional[str] = None
+    #: 三网分流时这条记录属于哪个运营商。
+    isp: Optional[str] = None
+    #: 本次**没有**动这条记录（拿不到该运营商的 IP、或本来就没配），
+    #: 原因写在 ``error`` 里。
+    skipped: bool = False
+    #: 这条记录原本没有运营商标记，被本次更新「认领」成了某个运营商那条
+    #: （避免同域名下残留一条游离的旧记录）。
+    adopted: bool = False
 
 
 @dataclass
@@ -84,10 +153,14 @@ class UpdateSummary:
     results: list[DNSUpdateResult] = None  # type: ignore[assignment]
     updated_at: Optional[str] = None
     skipped_reason: Optional[str] = None
+    #: 三网分流时，每个运营商各自的决策结果（键是运营商标识）。
+    decisions: dict[str, IPUpdateDecision] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.results is None:
             self.results = []
+        if self.decisions is None:
+            self.decisions = {}
 
     @property
     def all_ok(self) -> bool:
@@ -95,22 +168,11 @@ class UpdateSummary:
 
     @property
     def changed_count(self) -> int:
-        return sum(1 for r in self.results if r.ok)
+        return sum(1 for r in self.results if r.ok and not r.skipped)
 
     @property
     def skipped(self) -> bool:
         return self.skipped_reason is not None
-
-
-@dataclass
-class IPUpdateDecision:
-    """决策结果：是否应该更新，以及原因。"""
-
-    should_update: bool
-    ip: Optional[str] = None
-    speed: Optional[float] = None
-    reason: str = ""
-    current_speed: Optional[float] = None
 
 
 def _is_valid_ipv4(ip: str) -> bool:
@@ -126,6 +188,21 @@ def _is_valid_ipv4(ip: str) -> bool:
         if num < 0 or num > 255:
             return False
     return True
+
+
+def parse_isp(text: str) -> Optional[str]:
+    """认出这条频道消息属于哪个运营商；认不出返回 ``None``。
+
+    只看**首行**。这类频道的格式是「✅ Cloudflare 优选IP更新 (联通)」，
+    标注固定在第一行；扫全文的话，正文里的城市名之类可能误伤。
+    """
+    if not text:
+        return None
+    first_line = text.split("\n", 1)[0]
+    match = _ISP_LABEL_PATTERN.search(first_line)
+    if not match:
+        return None
+    return _ISP_BY_LABEL.get(match.group(1))
 
 
 def parse_ips_from_text(text: str) -> IPFetchResult:
@@ -171,7 +248,67 @@ def parse_ips_from_text(text: str) -> IPFetchResult:
         result.fastest = result.all_ips[0]
         result.fastest_speed = result.all_speeds.get(result.fastest)
 
+    result.isp = parse_isp(text)
+
     return result
+
+
+def threshold_for(config: CloudflareIPConfig, isp: Optional[str]) -> float:
+    """取某个运营商的最低速度阈值；没单独配就回退到全局值。
+
+    为什么需要按运营商分别设：三网的测速差距非常大 —— 同一天里电信能跑到
+    166 MB/s、联通 80 MB/s，而移动最好只有 27 MB/s。共用一个阈值的话，
+    移动那条记录会永远不更新。
+    """
+    if isp is not None:
+        configured = config.min_speed_threshold_by_isp.get(isp)
+        if configured is not None:
+            return float(configured)
+    return config.min_speed_threshold
+
+
+def _decide(
+    *,
+    ip: Optional[str],
+    speed: float,
+    threshold: float,
+    only_if_faster: bool,
+    current_speed: Optional[float],
+    label: str = "",
+) -> IPUpdateDecision:
+    """阈值 + 「是否更快」两条检查，分流与不分流共用。"""
+    prefix = f"{label} " if label else ""
+
+    if ip is None:
+        return IPUpdateDecision(False, reason=f"{prefix}没有可用的 IP")
+
+    if threshold > 0 and speed < threshold:
+        return IPUpdateDecision(
+            False,
+            ip=ip,
+            speed=speed,
+            reason=f"{prefix}速度 {speed:.2f} MB/s 低于阈值 {threshold:.2f} MB/s",
+        )
+
+    if only_if_faster and current_speed is not None and speed <= float(current_speed):
+        return IPUpdateDecision(
+            False,
+            ip=ip,
+            speed=speed,
+            current_speed=float(current_speed),
+            reason=f"{prefix}速度 {speed:.2f} MB/s 未超过当前 {float(current_speed):.2f} MB/s",
+        )
+
+    reason_parts = [f"{prefix}IP={ip}", f"速度={speed:.2f} MB/s"]
+    if threshold > 0:
+        reason_parts.append(f"≥ 阈值 {threshold:.2f}")
+    if only_if_faster:
+        if current_speed is not None:
+            reason_parts.append(f"> 当前 {float(current_speed):.2f}")
+        else:
+            reason_parts.append("（首次更新）")
+
+    return IPUpdateDecision(True, ip=ip, speed=speed, reason="，".join(reason_parts))
 
 
 def should_update(
@@ -179,7 +316,7 @@ def should_update(
     config: CloudflareIPConfig,
     state: dict[str, Any],
 ) -> IPUpdateDecision:
-    """决策：这次解析出的 IP 是否值得更新 DNS。
+    """决策：这次解析出的「整体最快 IP」是否值得更新 DNS（不分流时用）。
 
     ``state`` 是 ``store.load_state(account)`` 的返回值，用于读取
     ``cloudflare_ip_last_speed`` 等历史数据。
@@ -187,42 +324,99 @@ def should_update(
     if not fetched.has_ip:
         return IPUpdateDecision(False, reason="频道消息未解析到任何 IP")
 
-    ip = fetched.fastest
-    speed = fetched.fastest_speed or 0.0
+    return _decide(
+        ip=fetched.fastest,
+        speed=fetched.fastest_speed or 0.0,
+        threshold=config.min_speed_threshold,
+        only_if_faster=config.only_update_if_faster,
+        current_speed=state.get("cloudflare_ip_last_speed"),
+    )
 
-    # 阈值检查
-    if config.min_speed_threshold > 0 and speed < config.min_speed_threshold:
-        return IPUpdateDecision(
-            False,
-            ip=ip,
-            speed=speed,
-            reason=f"速度 {speed:.2f} MB/s 低于阈值 {config.min_speed_threshold:.2f} MB/s",
-        )
 
-    # 对比检查
-    if config.only_update_if_faster:
-        current_speed = state.get("cloudflare_ip_last_speed")
-        if current_speed is not None and speed <= float(current_speed):
-            return IPUpdateDecision(
-                False,
-                ip=ip,
+def should_update_isp(
+    best: ISPBest,
+    config: CloudflareIPConfig,
+    state: dict[str, Any],
+) -> IPUpdateDecision:
+    """决策：某个运营商的这次结果是否值得更新它对应的那条 DNS 记录。
+
+    与 :func:`should_update` 的区别是阈值和「上次速度」都**按运营商各算一份** ——
+    否则移动永远过不了电信能轻松越过的阈值，或者三家互相把对方的记录比下去。
+    """
+    speed_map = state.get(LAST_SPEED_BY_ISP_KEY) or {}
+    current = speed_map.get(best.isp) if isinstance(speed_map, dict) else None
+
+    return _decide(
+        ip=best.ip,
+        speed=best.speed,
+        threshold=threshold_for(config, best.isp),
+        only_if_faster=config.only_update_if_faster,
+        current_speed=float(current) if current is not None else None,
+        label=f"[{best.label}]",
+    )
+
+
+def aggregate_messages(texts: list[str]) -> IPFetchResult:
+    """把若干条频道消息聚合成一次抓取结果（纯函数，便于单测）。
+
+    ``texts`` 按**从新到旧**排列，与 ``client.get_chat_history()`` 的顺序一致。
+
+    聚合规则：
+
+    - 每条消息先用 :func:`parse_ips_from_text` 解析出它自己那个「⚡️ 最快」IP；
+    - 首行认得出运营商的，参与该运营商的最优评选（同运营商取速度最高的那条）；
+    - 认不出运营商的（格式变了、或是三网汇总帖），只进候选池、不参与评选，
+      但会作为「最新一条含 IP 的消息」用于兜底；
+    - ``all_ips`` / ``all_speeds`` 是**所有消息里出现过的 IP 的并集**，
+      同名 IP 保留见过的最高速度 —— 这是给「测试抓取」页展示用的候选池。
+    """
+    result = IPFetchResult()
+    newest: Optional[IPFetchResult] = None
+    all_speeds: dict[str, float] = {}
+
+    for text in texts:
+        parsed = parse_ips_from_text(text)
+        if not parsed.has_ip:
+            continue
+
+        if newest is None:
+            newest = parsed
+
+        for ip, speed in parsed.all_speeds.items():
+            if speed > all_speeds.get(ip, float("-inf")):
+                all_speeds[ip] = speed
+
+        isp = parsed.isp
+        if isp is None:
+            continue
+
+        speed = parsed.fastest_speed or 0.0
+        current = result.best_by_isp.get(isp)
+        if current is None or speed > current.speed:
+            result.best_by_isp[isp] = ISPBest(
+                isp=isp,
+                ip=parsed.fastest,  # type: ignore[arg-type]
                 speed=speed,
-                current_speed=float(current_speed),
-                reason=f"速度 {speed:.2f} MB/s 未超过当前 {float(current_speed):.2f} MB/s",
+                message_id=parsed.message_id,
             )
 
-    # 通过
-    reason_parts = [f"IP={ip}, 速度={speed:.2f} MB/s"]
-    if config.min_speed_threshold > 0:
-        reason_parts.append(f"≥ 阈值 {config.min_speed_threshold:.2f}")
-    if config.only_update_if_faster:
-        current = state.get("cloudflare_ip_last_speed")
-        if current is not None:
-            reason_parts.append(f"> 当前 {float(current):.2f}")
-        else:
-            reason_parts.append("（首次更新）")
+    result.all_speeds = all_speeds
+    result.all_ips = list(all_speeds)
 
-    return IPUpdateDecision(True, ip=ip, speed=speed, reason="，".join(reason_parts))
+    if result.best_by_isp:
+        top = max(result.best_by_isp.values(), key=lambda b: b.speed)
+        result.fastest = top.ip
+        result.fastest_speed = top.speed
+    elif newest is not None:
+        result.fastest = newest.fastest
+        result.fastest_speed = newest.fastest_speed
+        result.message_id = newest.message_id
+
+    # raw_text 一律给「最新一条含 IP 的消息」，供面板预览用 ——
+    # 聚合之后已经没有「那一条消息」了，给最新的最容易对照。
+    result.raw_text = newest.raw_text if newest is not None else (texts[0] if texts else None)
+
+    return result
 
 
 async def fetch_ips_from_channel(
@@ -230,7 +424,13 @@ async def fetch_ips_from_channel(
     fetch_limit: int,
     message_source: Callable,
 ) -> IPFetchResult:
-    """从 Telegram 频道拉取最近消息，返回解析出的 IP。"""
+    """从 Telegram 频道拉取最近消息，按运营商聚合出各自最快的 IP。
+
+    ⚠️ 这里必须把 ``fetch_limit`` 条消息**全部**看一遍。
+    原来只取「第一条含 IP 的消息」就返回，而这类频道（如 ``@cfyxip``）
+    是**一条消息只讲一个运营商**的格式，于是永远只会拿到最近发过消息的
+    那一家，另外两家一个都轮不到 —— 三网分流根本无从谈起。
+    """
     texts: list[str] = []
     try:
         texts = await message_source(source_channel, fetch_limit)
@@ -242,13 +442,7 @@ async def fetch_ips_from_channel(
         log.warning("频道没有返回任何消息")
         return IPFetchResult()
 
-    # 从新到旧逐条找，第一条包含 IP 的就采用
-    for text in reversed(texts):
-        parsed = parse_ips_from_text(text)
-        if parsed.has_ip:
-            return parsed
-
-    return IPFetchResult(raw_text=texts[0] if texts else None)
+    return aggregate_messages(texts)
 
 
 async def _resolve_record(
@@ -258,8 +452,20 @@ async def _resolve_record(
     domain: str,
     name: str,
     record_type: str,
-) -> Optional[str]:
-    """查询现有 DNS 记录 ID。返回 None 表示记录不存在。"""
+    *,
+    comment: Optional[str] = None,
+) -> tuple[Optional[str], bool]:
+    """查询现有 DNS 记录 ID。
+
+    返回 ``(record_id, adopted)``：
+
+    - ``record_id`` 为 ``None`` 表示没有可复用的记录，调用方应该新建；
+    - ``adopted`` 表示这次用的是**同域名下那条没有运营商标记的旧记录** ——
+      首次开启三网分流时会出现这种情况（用户原来只有一条记录），
+      认领它就不会在同域名下多留一条游离的旧记录。
+      只有「恰好一条」无标记记录时才认领：多条说明情况不明，宁可新建，
+      也不去猜该动哪一条。
+    """
     fqdn = domain if name == "@" else f"{name}.{domain}"
     url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
     params = {"name": fqdn, "type": record_type}
@@ -269,12 +475,36 @@ async def _resolve_record(
 
     if not data.get("ok"):
         log.warning("查询 DNS 记录失败: %s", data.get("errors"))
-        return None
+        return None, False
 
     records = data.get("result", [])
-    if records:
-        return records[0].get("id")
-    return None
+    if comment is None:
+        if records:
+            return records[0].get("id"), False
+        return None, False
+
+    tagged = [r for r in records if (r.get("comment") or "") == comment]
+    if tagged:
+        return tagged[0].get("id"), False
+
+    untagged = [r for r in records if not (r.get("comment") or "").strip()]
+    if len(untagged) == 1:
+        log.info(
+            "复用同域名下已有的无标记记录作为 %s 那条: %s %s",
+            comment,
+            fqdn,
+            untagged[0].get("id"),
+        )
+        return untagged[0].get("id"), True
+
+    if len(untagged) > 1:
+        log.warning(
+            "%s 下已有 %d 条没有运营商标记的记录，无法判断该复用哪一条，"
+            "本次新建。建议在 Cloudflare 后台清理后重试。",
+            fqdn,
+            len(untagged),
+        )
+    return None, False
 
 
 async def _update_single_record(
@@ -282,6 +512,9 @@ async def _update_single_record(
     api_token: str,
     record: CloudflareDNSRecord,
     ip: str,
+    *,
+    isp: Optional[str] = None,
+    comment: Optional[str] = None,
 ) -> DNSUpdateResult:
     """更新（或创建）一条 Cloudflare DNS 记录。"""
     fqdn = record.domain if record.name == "@" else f"{record.name}.{record.domain}"
@@ -293,10 +526,30 @@ async def _update_single_record(
         "ttl": record.ttl,
         "proxied": record.proxied,
     }
+    # 只有三网分流才带 comment：不分流时不去碰用户自己写的备注。
+    if comment is not None:
+        payload["comment"] = comment
 
-    record_id = await _resolve_record(
-        http, api_token, record.zone_id, record.domain, record.name, record.record_type
+    record_id, adopted = await _resolve_record(
+        http,
+        api_token,
+        record.zone_id,
+        record.domain,
+        record.name,
+        record.record_type,
+        comment=comment,
     )
+
+    def _fail(error: str) -> DNSUpdateResult:
+        return DNSUpdateResult(
+            domain=record.domain,
+            name=record.name,
+            record_type=record.record_type,
+            ip=ip,
+            ok=False,
+            error=error,
+            isp=isp,
+        )
 
     try:
         if record_id:
@@ -315,37 +568,72 @@ async def _update_single_record(
                 ip=ip,
                 ok=True,
                 record_id=data.get("result", {}).get("id", record_id),
+                isp=isp,
+                adopted=adopted,
             )
-        else:
-            errors = data.get("errors", [])
-            error_msg = "; ".join(e.get("message", str(e)) for e in errors) or "未知错误"
-            log.error("DNS 记录更新失败 %s: %s", fqdn, error_msg)
-            return DNSUpdateResult(
-                domain=record.domain,
-                name=record.name,
-                record_type=record.record_type,
-                ip=ip,
-                ok=False,
-                error=error_msg,
-            )
+        errors = data.get("errors", [])
+        error_msg = "; ".join(e.get("message", str(e)) for e in errors) or "未知错误"
+        log.error("DNS 记录更新失败 %s: %s", fqdn, error_msg)
+        return _fail(error_msg)
     except httpx.HTTPError as exc:
         log.error("Cloudflare API 请求失败 %s: %s", fqdn, exc)
-        return DNSUpdateResult(
-            domain=record.domain,
-            name=record.name,
-            record_type=record.record_type,
-            ip=ip,
-            ok=False,
-            error=f"网络错误: {exc}",
-        )
+        return _fail(f"网络错误: {exc}")
+
+
+def _plan_targets(
+    config: CloudflareIPConfig,
+    ip: Optional[str],
+    ips_by_isp: Optional[dict[str, str]],
+) -> list[tuple[CloudflareDNSRecord, Optional[str], Optional[str], Optional[str], Optional[str]]]:
+    """算出每条记录该写哪个 IP。
+
+    返回 ``(record, isp, target_ip, comment, skip_reason)`` 五元组列表：
+    ``skip_reason`` 非空表示这次不动这条记录。
+
+    ``ips_by_isp`` 有值时按三网分流处理 —— 同一个 ``domain``/``name`` 下
+    每个运营商各写一条 A 记录，靠 ``comment`` 区分。
+    """
+    plan = []
+    for record in config.records:
+        if not ips_by_isp:
+            plan.append((record, None, ip, None, None))
+            continue
+
+        for isp in ISP_KEYS:
+            comment = f"{ISP_COMMENT_PREFIX}{isp}"
+            target = ips_by_isp.get(isp)
+            if target is None:
+                # 拿不到就跳过 —— **绝不能拿别家的 IP 顶替**，
+                # 否则移动的用户会被解析到电信的 IP 上去。
+                plan.append(
+                    (
+                        record,
+                        isp,
+                        None,
+                        comment,
+                        f"本次抓取没有拿到{ISP_LABELS[isp]}的 IP，保留现有记录",
+                    )
+                )
+            else:
+                plan.append((record, isp, target, comment, None))
+    return plan
 
 
 async def update_dns_records(
     config: CloudflareIPConfig,
-    ip: str,
+    ip: Optional[str],
     proxy: Optional[ProxyConfig] = None,
+    *,
+    ips_by_isp: Optional[dict[str, str]] = None,
 ) -> list[DNSUpdateResult]:
-    """把 ``ip`` 写入配置中的所有 Cloudflare DNS 记录。"""
+    """把 IP 写入配置中的 Cloudflare DNS 记录。
+
+    ``ip``
+        兜底 IP：写给所有记录（不分流模式）。
+    ``ips_by_isp``
+        三网分流模式：``{"mobile": "1.2.3.4", ...}``。每条记录会展开成
+        三条同域名、同类型的 A 记录，各自带一个运营商标记的 comment。
+    """
     results: list[DNSUpdateResult] = []
     proxy_url = httpx_proxy(proxy)
 
@@ -357,11 +645,33 @@ async def update_dns_records(
             "Content-Type": "application/json",
         },
     ) as http:
-        for record in config.records:
-            result = await _update_single_record(
-                http, config.api_token, record, ip
+        for record, isp, target_ip, comment, skip_reason in _plan_targets(
+            config, ip, ips_by_isp
+        ):
+            if skip_reason is not None:
+                results.append(
+                    DNSUpdateResult(
+                        domain=record.domain,
+                        name=record.name,
+                        record_type=record.record_type,
+                        ip=None,
+                        ok=False,
+                        error=skip_reason,
+                        isp=isp,
+                        skipped=True,
+                    )
+                )
+                continue
+            results.append(
+                await _update_single_record(
+                    http,
+                    config.api_token,
+                    record,
+                    target_ip,  # type: ignore[arg-type]
+                    isp=isp,
+                    comment=comment,
+                )
             )
-            results.append(result)
 
     return results
 
@@ -401,7 +711,10 @@ async def fetch_and_update(
         log.error(summary.skipped_reason)
         return summary
 
-    # 2. 决策
+    # 2. 决策 + 更新
+    if config.split_by_isp:
+        return await _update_split_by_isp(config, fetched, state, proxy, summary)
+
     decision = should_update(fetched, config, state)
     if not decision.should_update:
         summary.skipped_reason = decision.reason
@@ -430,6 +743,88 @@ async def fetch_and_update(
             len(results),
         )
 
+    return summary
+
+
+async def _update_split_by_isp(
+    config: CloudflareIPConfig,
+    fetched: IPFetchResult,
+    state: dict[str, Any],
+    proxy: Optional[ProxyConfig],
+    summary: UpdateSummary,
+) -> UpdateSummary:
+    """三网分流：每个运营商各自决策，再一次性写它自己那条 A 记录。
+
+    三家**互不牵连**：移动没过阈值 / 没抓到，不影响电信和联通照常更新。
+    这也是为什么不复用 :func:`should_update` —— 那个是「一个 IP 决定一切」。
+    """
+    decisions: dict[str, IPUpdateDecision] = {}
+    for isp in ISP_KEYS:
+        best = fetched.best_by_isp.get(isp)
+        if best is None:
+            decisions[isp] = IPUpdateDecision(
+                False,
+                reason=(
+                    f"[{ISP_LABELS[isp]}] 最近 {config.fetch_limit} 条消息里"
+                    f"没有这个运营商的 IP"
+                ),
+            )
+            continue
+        decisions[isp] = should_update_isp(best, config, state)
+    summary.decisions = decisions
+
+    for isp, decision in decisions.items():
+        log.info(
+            "Cloudflare IP 三网分流 %s: %s（%s）",
+            ISP_LABELS[isp],
+            "更新" if decision.should_update else "跳过",
+            decision.reason,
+        )
+
+    approved = {isp: d.ip for isp, d in decisions.items() if d.should_update and d.ip}
+    if not approved:
+        summary.skipped_reason = "；".join(d.reason for d in decisions.values())
+        return summary
+
+    summary.results = await update_dns_records(config, None, proxy, ips_by_isp=approved)
+
+    # 只把**真的写成功**的那几家记进 state，否则失败的运营商会被误标成
+    # 「当前速度已经是新的」，下一轮 only_update_if_faster 就会把它挡住。
+    speed_map = state.get(LAST_SPEED_BY_ISP_KEY)
+    if not isinstance(speed_map, dict):
+        speed_map = {}
+    ip_map = state.get(LAST_IP_BY_ISP_KEY)
+    if not isinstance(ip_map, dict):
+        ip_map = {}
+
+    for result in summary.results:
+        if not result.ok or result.skipped or result.isp is None:
+            continue
+        decision = decisions.get(result.isp)
+        if decision is None or not decision.should_update:
+            continue
+        speed_map[result.isp] = decision.speed
+        ip_map[result.isp] = decision.ip
+
+    state[LAST_SPEED_BY_ISP_KEY] = speed_map
+    state[LAST_IP_BY_ISP_KEY] = ip_map
+
+    # 旧的整体字段一并维护：面板状态卡和「上次速度」展示还在用。
+    changed = [r for r in summary.results if r.ok and not r.skipped]
+    if changed:
+        top = max(
+            (decisions[r.isp] for r in changed if r.isp in decisions),
+            key=lambda d: d.speed or 0.0,
+        )
+        state["cloudflare_ip_last_speed"] = top.speed
+        state["cloudflare_ip_last_ip"] = top.ip
+
+    log.info(
+        "Cloudflare IP 三网分流完成: %d 条记录写成功、%d 条跳过、%d 条失败",
+        len(changed),
+        sum(1 for r in summary.results if r.skipped),
+        sum(1 for r in summary.results if not r.ok and not r.skipped),
+    )
     return summary
 
 
@@ -466,15 +861,24 @@ async def make_message_source_from_account(
 
 
 __all__ = [
+    "ISP_COMMENT_PREFIX",
+    "ISP_LABELS",
+    "LAST_IP_BY_ISP_KEY",
+    "LAST_SPEED_BY_ISP_KEY",
     "DNSUpdateResult",
     "IPFetchResult",
+    "ISPBest",
     "IPUpdateDecision",
     "UpdateSummary",
+    "aggregate_messages",
     "fetch_and_update",
     "fetch_ips_from_channel",
     "make_message_source",
     "make_message_source_from_account",
     "parse_ips_from_text",
+    "parse_isp",
     "should_update",
+    "should_update_isp",
+    "threshold_for",
     "update_dns_records",
 ]

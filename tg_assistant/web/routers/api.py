@@ -749,6 +749,49 @@ def _mask_api_token(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _isp_rows(config: Any, fetched: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
+    """三网分流：每个运营商一行的决策预览（不写 DNS）。
+
+    按 ``ISP_KEYS`` 固定顺序输出，面板就能稳定地按 移动/电信/联通 排三行 ——
+    某一家这次没抓到也要占位显示，否则用户会以为「漏了」。
+    """
+    from tg_assistant.cloudflare_ip import ISP_LABELS, should_update_isp, threshold_for
+    from tg_assistant.config import ISP_KEYS
+
+    rows: list[dict[str, Any]] = []
+    for isp in ISP_KEYS:
+        label = ISP_LABELS[isp]
+        threshold = threshold_for(config, isp)
+        best = fetched.best_by_isp.get(isp)
+        if best is None:
+            rows.append(
+                {
+                    "isp": isp,
+                    "label": label,
+                    "ip": None,
+                    "speed": None,
+                    "threshold": threshold,
+                    "should_update": False,
+                    "reason": f"最近 {config.fetch_limit} 条消息里没有{label}的 IP",
+                }
+            )
+            continue
+        decision = should_update_isp(best, config, state)
+        rows.append(
+            {
+                "isp": isp,
+                "label": label,
+                "ip": best.ip,
+                "speed": best.speed,
+                "threshold": threshold,
+                "should_update": decision.should_update,
+                "reason": decision.reason,
+                "message_id": best.message_id,
+            }
+        )
+    return rows
+
+
 @router.get("/config/{name}/cloudflare_ip")
 async def api_cloudflare_ip_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
     _require_account(store, name)
@@ -809,6 +852,7 @@ async def api_cloudflare_ip_trigger(
 ) -> dict[str, Any]:
     """手动触发一次优选 IP 抓取 + DNS 更新。"""
     from tg_assistant.cloudflare_ip import (
+        ISP_LABELS,
         fetch_and_update,
         make_message_source,
         make_message_source_from_account,
@@ -855,11 +899,23 @@ async def api_cloudflare_ip_trigger(
         "ok": summary.all_ok and not summary.skipped,
         "skipped": summary.skipped,
         "skipped_reason": summary.skipped_reason,
+        "split_by_isp": cf_config.split_by_isp,
         "fastest_ip": summary.fetched.fastest,
         "fastest_speed": summary.fetched.fastest_speed,
         "all_ips": summary.fetched.all_ips,
         "all_speeds": summary.fetched.all_speeds,
         "current_speed": state.get("cloudflare_ip_last_speed"),
+        "decisions": [
+            {
+                "isp": isp,
+                "label": ISP_LABELS.get(isp, isp),
+                "should_update": d.should_update,
+                "ip": d.ip,
+                "speed": d.speed,
+                "reason": d.reason,
+            }
+            for isp, d in summary.decisions.items()
+        ],
         "results": [
             {
                 "domain": r.domain,
@@ -868,6 +924,9 @@ async def api_cloudflare_ip_trigger(
                 "ip": r.ip,
                 "ok": r.ok,
                 "error": r.error,
+                "isp": r.isp,
+                "skipped": r.skipped,
+                "adopted": r.adopted,
             }
             for r in summary.results
         ],
@@ -927,10 +986,13 @@ async def api_cloudflare_ip_test(
 
     return {
         "ok": fetched.has_ip,
+        "split_by_isp": cf_config.split_by_isp,
         "fastest_ip": fetched.fastest,
         "fastest_speed": fetched.fastest_speed,
         "all_ips": fetched.all_ips,
         "all_speeds": fetched.all_speeds,
+        #: 三网分流时每家的决策预览（不分流时也返回，方便对照看抓到了什么）。
+        "isp_rows": _isp_rows(cf_config, fetched, state),
         "decision": {
             "should_update": decision.should_update if decision else False,
             "reason": decision.reason if decision else "未解析到 IP",
@@ -973,10 +1035,15 @@ async def api_cloudflare_ip_status(
         "enabled": cf_config.enabled,
         "real_time_listen": cf_config.real_time_listen,
         "listener_running": listener_running,
+        "split_by_isp": cf_config.split_by_isp,
         "min_speed_threshold": cf_config.min_speed_threshold,
+        "min_speed_threshold_by_isp": cf_config.min_speed_threshold_by_isp,
         "only_update_if_faster": cf_config.only_update_if_faster,
         "current_ip": state.get("cloudflare_ip_last_ip"),
         "current_speed": state.get("cloudflare_ip_last_speed"),
+        #: 三网分流时各家上次写入的速度 / IP。
+        "last_speed_by_isp": state.get("cloudflare_ip_last_speed_by_isp") or {},
+        "last_ip_by_isp": state.get("cloudflare_ip_last_ip_by_isp") or {},
         "last_run": state.get("cloudflare_ip_last_run"),
         "last_result": last_result,
         "source_channel": cf_config.source_channel,

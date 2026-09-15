@@ -115,7 +115,9 @@
         const data = await res.json();
         const sel = document.getElementById('account-selector');
         sel.innerHTML = '<option value="">选择账号...</option>';
-        data.accounts.forEach(a => { sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + a.user + ')' : ''}</option>`; });
+        data.accounts.forEach(a => {
+            sel.innerHTML += `<option value="${escapeHtml(a.name)}">${escapeHtml(accountOptionText(a))}</option>`;
+        });
         if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
     }
     async function switchAccount() {

@@ -55,12 +55,15 @@
             tbody.innerHTML = '<tr><td colspan="7" class="muted">还没有账号。先 <a href="/login">扫码登录</a></td></tr>';
             return;
         }
-        // a.user 里含 Telegram 侧的 display_name / username，由第三方控制，
-        // 拼进 innerHTML 前必须转义（账号名本身受字符集限制，一并转义保持一致）。
-        tbody.innerHTML = data.accounts.map(a => `
+        // 身份列用 `@username`（退回显示名），**不要**用 a.user ——
+        // 那是 `小白 @meng5680 id=5608153118` 这种带 user_id 的调试用长标签，
+        // 会把表格这一列撑得很宽。文本仍来自 Telegram 侧，必须转义。
+        tbody.innerHTML = data.accounts.map(a => {
+            const handle = a.username ? '@' + a.username : (a.display_name || '');
+            return `
             <tr>
                 <td><strong>${escapeHtml(a.name)}</strong></td>
-                <td>${escapeHtml(a.user) || '-'}</td>
+                <td>${escapeHtml(handle) || '-'}</td>
                 <td>${a.running ? '<span class="badge badge-green">运行中</span>' : (a.session_exists ? '<span class="badge">已登录</span>' : '<span class="badge badge-red">未登录</span>')}</td>
                 <td>${a.stats?.forward?.forwarded ?? '-'}</td>
                 <td>${a.stats?.forward?.matched ?? '-'}</td>
@@ -70,7 +73,8 @@
                     <a href="/chats/${encodeURIComponent(a.name)}" class="btn btn-sm">会话</a>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
     async function startRun() {
         const res = await fetch('/api/run/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})});
@@ -80,8 +84,10 @@
     }
     async function stopRun() {
         const res = await fetch('/api/run/stop', {method: 'POST'});
-        const data = await res.json();
-        toast('已停止', true);
+        const data = await res.json().catch(() => ({}));
+        // 原来是 `toast('已停止', true)` 硬报成功，哪怕后端返回 ok:false
+        // （比如本来就没在跑）也照样弹「已停止」，纯误导。
+        toast(data.ok ? '已停止' : (data.message || '停止失败'), !!data.ok);
         refreshStatus();
     }
     refreshStatus();

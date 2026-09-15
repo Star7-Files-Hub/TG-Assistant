@@ -233,6 +233,64 @@ class TestCloudflareDNSRecord:
         assert record.ttl == 1
 
 
+class TestSplitByIspConfig:
+    """三网分流相关字段的默认值与校验。"""
+
+    def test_defaults_are_off(self):
+        config = CloudflareIPConfig()
+        assert config.split_by_isp is False
+        assert config.min_speed_threshold_by_isp == {}
+
+    def test_fetch_limit_defaults_to_20(self):
+        """源频道一条消息只讲一个运营商，5 条很容易凑不齐三家。"""
+        assert CloudflareIPConfig().fetch_limit == 20
+
+    def test_accepts_known_isps(self):
+        config = CloudflareIPConfig(
+            min_speed_threshold_by_isp={"mobile": 20, "telecom": 100.0, "unicom": 60}
+        )
+        assert config.min_speed_threshold_by_isp == {
+            "mobile": 20.0,
+            "telecom": 100.0,
+            "unicom": 60.0,
+        }
+
+    def test_none_becomes_empty(self):
+        config = CloudflareIPConfig(min_speed_threshold_by_isp=None)
+        assert config.min_speed_threshold_by_isp == {}
+
+    def test_rejects_unknown_isp_key(self):
+        """写错键名要当场报错，别静默忽略 —— 否则用户以为配上了。"""
+        with pytest.raises(ValidationError, match="不是运营商标识"):
+            CloudflareIPConfig(min_speed_threshold_by_isp={"ct": 50.0})
+
+    def test_rejects_non_numeric_value(self):
+        with pytest.raises(ValidationError, match="不是数字"):
+            CloudflareIPConfig(min_speed_threshold_by_isp={"mobile": "快"})
+
+    def test_rejects_negative_value(self):
+        with pytest.raises(ValidationError, match="不能为负数"):
+            CloudflareIPConfig(min_speed_threshold_by_isp={"mobile": -1})
+
+    def test_rejects_non_dict(self):
+        with pytest.raises(ValidationError, match="必须是"):
+            CloudflareIPConfig(min_speed_threshold_by_isp=["mobile"])
+
+    def test_roundtrip_preserves_split(self):
+        original = CloudflareIPConfig(
+            enabled=True,
+            api_token="tok",
+            source_channel="@cfyxip",
+            records=[CloudflareDNSRecord(zone_id="z", domain="yx.example.cc")],
+            split_by_isp=True,
+            min_speed_threshold_by_isp={"mobile": 20.0, "telecom": 100.0},
+        )
+        restored = CloudflareIPConfig.model_validate(original.model_dump(mode="json"))
+
+        assert restored.split_by_isp is True
+        assert restored.min_speed_threshold_by_isp == {"mobile": 20.0, "telecom": 100.0}
+
+
 class TestAccountConfigIntegration:
     def test_default_has_empty_cloudflare_ip(self):
         config = AccountConfig.default()

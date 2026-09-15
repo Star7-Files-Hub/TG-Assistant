@@ -34,6 +34,7 @@
                     <div class="nt-input-group"><label>当前速度</label><span id="cf-status-speed" class="muted">-</span></div>
                     <div class="nt-input-group"><label>上次更新</label><span id="cf-status-last" class="muted">-</span></div>
                 </div>
+                <div id="cf-status-isp" class="cf-isp-table" style="display:none;"></div>
                 <div id="cf-status-detail" class="muted" style="margin-top:8px;font-size:12px;"></div>
             </div>
         </div>
@@ -44,12 +45,20 @@
                 <div class="nt-input-group"><label>API Token</label><input id="cf-api-token" type="password" placeholder="从 Cloudflare 控制台获取" /></div>
                 <div class="nt-input-group">
                     <label>源频道</label>
-                    <p class="nt-hint">发布优选 IP 的 Telegram 频道，如 @CFIP 或频道 chat_id</p>
+                    <p class="nt-hint">发布优选 IP 的 Telegram 频道，如 @cfyxip 或频道 chat_id</p>
                     <input id="cf-source-channel" type="text" placeholder="@channel 或 -100..." />
                 </div>
                 <div class="nt-grid">
-                    <div class="nt-input-group"><label>抓取消息数</label><input id="cf-fetch-limit" type="number" value="5" min="1" max="100" /></div>
-                    <div class="nt-input-group"><label>定时间隔（小时，0=仅手动）</label><input id="cf-interval" type="number" value="0" min="0" max="168" step="0.5" /></div>
+                    <div class="nt-input-group">
+                        <label>抓取消息数</label>
+                        <p class="nt-hint">频道是「一条消息只讲一个运营商」，三网分流建议 ≥ 20</p>
+                        <input id="cf-fetch-limit" type="number" value="20" min="1" max="100" />
+                    </div>
+                    <div class="nt-input-group">
+                        <label>定时间隔（小时，0=仅手动）</label>
+                        <p class="nt-hint">每隔多久自动检查一次；实时监听开着时也照常生效</p>
+                        <input id="cf-interval" type="number" value="0" min="0" max="168" step="0.5" />
+                    </div>
                 </div>
             </div>
         </div>
@@ -57,19 +66,42 @@
         <div class="nt-card">
             <div class="nt-card-header"><h3>⚙️ 更新策略</h3><p>控制何时更新 DNS 记录</p></div>
             <div class="nt-card-body">
+                <label class="tg-checkbox">
+                    <input id="cf-split-isp" type="checkbox" onchange="toggleSplit()" />
+                    <span class="tg-checkmark"></span>
+                    <span>三网分流：同一域名下按 移动 / 电信 / 联通 各写一条 A 记录</span>
+                </label>
+                <p class="nt-hint" style="margin:6px 0 12px 0;">
+                    开启后，上面「DNS 记录」里的每一条都会展开成三条同域名、同类型的 A 记录，
+                    各自带上运营商标记（写进 Cloudflare 记录的备注），客户端按自己所在的网自动选。
+                    某一家这次没抓到 IP 就**保留原记录不动**，绝不会拿别家的 IP 顶替。
+                </p>
+
                 <div class="nt-grid">
                     <div class="nt-input-group">
                         <label>最低速度阈值（MB/s）</label>
-                        <p class="nt-hint">频道最快 IP 低于此值时不更新，0 = 不限制</p>
+                        <p class="nt-hint">兜底值：某个运营商没单独设就用它。0 = 不限制</p>
                         <input id="cf-min-speed" type="number" value="0" min="0" step="0.1" />
                     </div>
-                    <div class="nt-input-group">
-                        <label>定时检查间隔（小时）</label>
-                        <input id="cf-interval" type="number" value="0" min="0" max="168" step="0.5" style="display:none;" />
+                    <div class="nt-input-group" id="cf-only-faster-cell">
+                        <label>&nbsp;</label>
+                        <label class="tg-checkbox"><input id="cf-only-if-faster" type="checkbox" checked /><span class="tg-checkmark"></span><span>仅当新 IP 比当前更快时才更新</span></label>
                     </div>
                 </div>
-                <div class="nt-grid">
-                    <label class="tg-checkbox"><input id="cf-only-if-faster" type="checkbox" checked /><span class="tg-checkmark"></span><span>仅当新 IP 比当前更快时才更新</span></label>
+
+                <div id="cf-isp-thresholds" style="display:none;">
+                    <p class="nt-hint" style="margin-top:10px;">按运营商分别设阈值 —— 三网测速差距极大，共用一个阈值会让移动那条永远不更新。</p>
+                    <div class="nt-grid">
+                        <div class="nt-input-group"><label>移动阈值（MB/s）</label><input id="cf-min-speed-mobile" type="number" value="0" min="0" step="0.1" /></div>
+                        <div class="nt-input-group"><label>电信阈值（MB/s）</label><input id="cf-min-speed-telecom" type="number" value="0" min="0" step="0.1" /></div>
+                    </div>
+                    <div class="nt-grid">
+                        <div class="nt-input-group"><label>联通阈值（MB/s）</label><input id="cf-min-speed-unicom" type="number" value="0" min="0" step="0.1" /></div>
+                        <div class="nt-input-group"><label>&nbsp;</label></div>
+                    </div>
+                </div>
+
+                <div class="nt-grid" style="margin-top:10px;">
                     <label class="tg-checkbox"><input id="cf-real-time" type="checkbox" checked /><span class="tg-checkmark"></span><span>实时监听频道新消息（账号在线时自动生效）</span></label>
                 </div>
             </div>
@@ -78,7 +110,7 @@
         <div class="nt-card">
             <div class="nt-card-header">
                 <h3>DNS 记录</h3>
-                <p>要更新的记录列表</p>
+                <p id="cf-records-hint">要更新的记录列表</p>
             </div>
             <div class="nt-card-body">
                 <div id="cf-records-list" class="cf-records-list"></div>
@@ -111,20 +143,32 @@
 
 {% block scripts %}
 <script>
+    //: 与后端 cloudflare_ip.ISP_KEYS / ISP_LABELS 保持一致。
+    const ISP_LABELS = {mobile: '移动', telecom: '电信', unicom: '联通'};
+    const ISP_KEYS = ['mobile', 'telecom', 'unicom'];
+
+    // 每个运营商的阈值输入框 id。**显式列出来**，不要用 `'cf-min-speed-' + k` 拼：
+    // 拼出来的 id 只存在于运行时，静态检查（tests/test_web_pages.py 那条
+    // 「每个 getElementById 都要有对应 id=」）看不到，改模板时也容易和
+    // 上面三个 <input> 的实际 id 对不上。这里一一对应，改一处就能一起看到。
+    const ISP_THRESHOLD_ID = {
+        mobile: 'cf-min-speed-mobile',
+        telecom: 'cf-min-speed-telecom',
+        unicom: 'cf-min-speed-unicom',
+    };
+
     let currentAccount = '', cfData = {};
     let records = [];
 
     function init() { loadAccounts(); }
 
-    function escapeHtml(s) {
-        if (s === null || s === undefined) return '';
-        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
+    // escapeHtml / formatDateTime 都由 app.js 提供（base.html 里先于本块加载）。
+    // 这里原来各抄了一份，两份实现会各自漂移 —— 时间戳那条尤其危险：
+    // 本页的 `last_run` 是 Unix 秒（要 *1000），而账号页的 `last_login` 是
+    // ISO 字符串（不能 *1000），抄来抄去迟早搞混。
 
-    function formatTime(ts) {
-        if (!ts) return '-';
-        const d = new Date(ts * 1000);
-        return d.toLocaleString('zh-CN', { hour12: false });
+    function recordLabel(r) {
+        return r.name === '@' ? r.domain : r.name + '.' + r.domain;
     }
 
     async function loadAccounts() {
@@ -133,7 +177,7 @@
         const sel = document.getElementById('account-selector');
         sel.innerHTML = '<option value="">选择账号...</option>';
         data.accounts.forEach(a => {
-            sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + escapeHtml(a.user) + ')' : ''}</option>`;
+            sel.innerHTML += `<option value="${escapeHtml(a.name)}">${escapeHtml(accountOptionText(a))}</option>`;
         });
         if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
     }
@@ -153,36 +197,78 @@
     }
 
     async function loadCfConfig() {
-        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip`);
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip`);
         if (!res.ok) return;
         cfData = await res.json();
         document.getElementById('cf-enabled').checked = cfData.enabled;
-        document.getElementById('cf-api-token').value = (cfData.api_token || '').replace(/\w{3}$/, '') ? (cfData.api_token || '') : '';
+        // 后端回显的是脱敏 token（`cfut_y***`）。直接填进去会让人以为
+        // 那就是完整 token；这里只保留原样回显，保存时后端会识别 `***`
+        // 结尾并沿用旧 token，不会把脱敏值当新 token 存下来。
+        document.getElementById('cf-api-token').value = cfData.api_token || '';
         document.getElementById('cf-source-channel').value = cfData.source_channel || '';
-        document.getElementById('cf-fetch-limit').value = cfData.fetch_limit || 5;
+        document.getElementById('cf-fetch-limit').value = cfData.fetch_limit || 20;
         document.getElementById('cf-interval').value = cfData.interval_hours || 0;
         document.getElementById('cf-min-speed').value = cfData.min_speed_threshold || 0;
+        document.getElementById('cf-split-isp').checked = cfData.split_by_isp === true;
+        const byIsp = cfData.min_speed_threshold_by_isp || {};
+        ISP_KEYS.forEach(k => {
+            const el = document.getElementById(ISP_THRESHOLD_ID[k]);
+            if (el) el.value = byIsp[k] != null ? byIsp[k] : 0;
+        });
         document.getElementById('cf-only-if-faster').checked = cfData.only_update_if_faster !== false;
         document.getElementById('cf-real-time').checked = cfData.real_time_listen !== false;
         records = cfData.records || [];
         renderRecords();
+        toggleSplit();
     }
 
     async function loadCfStatus() {
-        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/status`);
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/status`);
         if (!res.ok) return;
         const s = await res.json();
         document.getElementById('cf-status-listener').textContent = s.listener_running ? '✅ 运行中' : '⏸ 未运行';
         document.getElementById('cf-status-listener').className = 'badge ' + (s.listener_running ? 'badge-green' : 'badge-gray');
         document.getElementById('cf-status-ip').textContent = s.current_ip || '-';
         document.getElementById('cf-status-speed').textContent = s.current_speed ? s.current_speed.toFixed(2) + ' MB/s' : '-';
-        document.getElementById('cf-status-last').textContent = s.last_run ? formatTime(s.last_run) : '-';
+        document.getElementById('cf-status-last').textContent = s.last_run ? formatDateTime(s.last_run) : '-';
+
+        // 三网分流：把各家上次写入的 IP / 速度单独列出来
+        const box = document.getElementById('cf-status-isp');
+        const lastIp = s.last_ip_by_isp || {};
+        const lastSpeed = s.last_speed_by_isp || {};
+        if (s.split_by_isp) {
+            box.innerHTML = ISP_KEYS.map(k => `
+                <div class="cf-isp-row">
+                    <span class="cf-isp-name">${escapeHtml(ISP_LABELS[k])}</span>
+                    <span class="cf-isp-ip">${escapeHtml(lastIp[k] || '—')}</span>
+                    <span class="cf-isp-speed">${lastSpeed[k] != null ? lastSpeed[k].toFixed(2) + ' MB/s' : '—'}</span>
+                </div>`).join('');
+            box.style.display = 'block';
+        } else {
+            box.innerHTML = '';
+            box.style.display = 'none';
+        }
+
         const detail = [];
         if (s.last_result && s.last_result.ip) {
             detail.push(`上次结果: ${s.last_result.speed ? s.last_result.speed.toFixed(2) + ' MB/s' : '-'} (${s.last_result.ok ? '成功' : '失败'})`);
-            if (s.last_result.skipped) detail.push(`跳过: ${escapeHtml(s.last_result.skipped_reason || '-')}`);
+            if (s.last_result.skipped) detail.push(`跳过: ${s.last_result.skipped_reason || '-'}`);
+        }
+        if (s.enabled && !s.listener_running) {
+            // 「启用」开关只代表配置生效；真正监听要靠账号在线 —— 不写清楚的话，
+            // 用户会以为开关没生效。
+            detail.push('已启用，但账号当前未在运行 → 实时监听不会生效（定时轮询仍会执行）');
         }
         document.getElementById('cf-status-detail').textContent = detail.join(' | ');
+    }
+
+    function toggleSplit() {
+        const on = document.getElementById('cf-split-isp').checked;
+        document.getElementById('cf-isp-thresholds').style.display = on ? 'block' : 'none';
+        document.getElementById('cf-records-hint').textContent = on
+            ? '每条记录会展开成 移动 / 电信 / 联通 三条同域名的 A 记录'
+            : '要更新的记录列表';
+        renderRecords();
     }
 
     function renderRecords() {
@@ -191,6 +277,7 @@
             container.innerHTML = '<p class="muted">暂无记录，点击下方按钮添加</p>';
             return;
         }
+        const splitOn = document.getElementById('cf-split-isp').checked;
         container.innerHTML = records.map((r, i) => `
             <div class="cf-record-item">
                 <div class="nt-grid">
@@ -199,28 +286,51 @@
                 </div>
                 <div class="nt-grid">
                     <div class="nt-input-group"><label>记录名</label><input value="${escapeHtml(r.name)}" onchange="records[${i}].name=this.value" placeholder="@ 或 www" /></div>
-                    <div class="nt-input-group"><label>类型</label><select onchange="records[${i}].record_type=this.value"><option value="A" ${r.record_type==='A'?'selected':''}>A</option><option value="AAAA" ${r.record_type==='AAAA'?'selected':''}>AAAA</option></select></div>
+                    <div class="nt-input-group"><label>类型</label><select onchange="records[${i}].record_type=this.value"><option value="A" ${r.record_type === 'A' ? 'selected' : ''}>A</option><option value="AAAA" ${r.record_type === 'AAAA' ? 'selected' : ''}>AAAA</option></select></div>
                 </div>
                 <div class="nt-grid">
-                    <label class="tg-checkbox"><input type="checkbox" ${r.proxied!==false?'checked':''} onchange="records[${i}].proxied=this.checked" /><span class="tg-checkmark"></span><span>代理（小黄云）</span></label>
-                    <div class="nt-input-group"><label>TTL</label><input type="number" value="${r.ttl||1}" min="1" onchange="records[${i}].ttl=parseInt(this.value)||1" /></div>
+                    <label class="tg-checkbox"><input type="checkbox" ${r.proxied !== false ? 'checked' : ''} onchange="records[${i}].proxied=this.checked" /><span class="tg-checkmark"></span><span>代理（小黄云）</span></label>
+                    <div class="nt-input-group"><label>TTL</label><input type="number" value="${r.ttl || 1}" min="1" onchange="records[${i}].ttl=parseInt(this.value)||1" /></div>
                 </div>
-                <button class="btn btn-danger btn-sm" onclick="records.splice(${i},1);renderRecords()">删除</button>
+                ${splitOn ? `<div class="cf-split-preview">三网分流：将写 3 条 A 记录 → ${escapeHtml(recordLabel(r))}</div>` : ''}
+                <button class="btn btn-danger btn-sm" onclick="removeRecord(${i})">删除</button>
             </div>
         `).join('');
     }
 
+    function removeRecord(index) {
+        records.splice(index, 1);
+        renderRecords();
+    }
+
     function addRecord() {
-        records.push({zone_id: '', domain: '', name: '@', record_type: 'A', proxied: true, ttl: 1});
+        records.push({ zone_id: '', domain: '', name: '@', record_type: 'A', proxied: false, ttl: 1 });
         renderRecords();
     }
 
     async function toggleCf() {
         const enabled = document.getElementById('cf-enabled').checked;
-        await fetch(`/api/config/${currentAccount}/cloudflare_ip/enabled`, {
-            method: 'PUT', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({enabled})
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/enabled`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
         });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            toast('启用失败: ' + (data.detail || res.status), false);
+            document.getElementById('cf-enabled').checked = !enabled;
+            return;
+        }
+        // 状态卡里的「实时监听」要靠账号在线，刷新一下免得看起来像没生效
+        loadCfStatus();
+    }
+
+    function readIspThresholds() {
+        const out = {};
+        ISP_KEYS.forEach(k => {
+            const el = document.getElementById(ISP_THRESHOLD_ID[k]);
+            out[k] = el ? (parseFloat(el.value) || 0) : 0;
+        });
+        return out;
     }
 
     async function saveCfConfig() {
@@ -228,38 +338,73 @@
             enabled: document.getElementById('cf-enabled').checked,
             api_token: document.getElementById('cf-api-token').value || null,
             source_channel: document.getElementById('cf-source-channel').value || null,
-            fetch_limit: parseInt(document.getElementById('cf-fetch-limit').value) || 5,
+            fetch_limit: parseInt(document.getElementById('cf-fetch-limit').value) || 20,
             interval_hours: parseFloat(document.getElementById('cf-interval').value) || 0,
             min_speed_threshold: parseFloat(document.getElementById('cf-min-speed').value) || 0,
+            split_by_isp: document.getElementById('cf-split-isp').checked,
+            min_speed_threshold_by_isp: readIspThresholds(),
             only_update_if_faster: document.getElementById('cf-only-if-faster').checked,
             real_time_listen: document.getElementById('cf-real-time').checked,
             records: records
         };
-        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip`, {
-            method: 'PUT', headers: {'Content-Type': 'application/json'},
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (data.ok) { toast('保存成功', true); loadCfConfig(); loadCfStatus(); }
-        else { toast('保存失败: ' + (data.detail || ''), false); }
+        else { toast('保存失败: ' + (data.detail || res.status), false); }
+    }
+
+    function ispRowsHtml(rows) {
+        if (!rows || !rows.length) return '';
+        return '<div class="cf-isp-table">' + rows.map(r => {
+            const badge = r.should_update
+                ? '<span class="badge badge-green">✓ 会更新</span>'
+                : '<span class="badge badge-yellow">⊘ 跳过</span>';
+            const speed = (r.speed != null) ? r.speed.toFixed(2) + ' MB/s' : '—';
+            const threshold = (r.threshold != null && r.threshold > 0)
+                ? `<span class="cf-isp-threshold">阈值 ${r.threshold}</span>` : '';
+            return `
+                <div class="cf-isp-row">
+                    <span class="cf-isp-name">${escapeHtml(r.label || ISP_LABELS[r.isp] || r.isp)}</span>
+                    <span class="cf-isp-ip">${escapeHtml(r.ip || '—')}</span>
+                    <span class="cf-isp-speed">${speed}</span>
+                    ${threshold}
+                    ${badge}
+                </div>
+                <div class="cf-isp-reason">${escapeHtml(r.reason || '')}</div>`;
+        }).join('') + '</div>';
+    }
+
+    function resultsHtml(results) {
+        return results.map(r => {
+            const label = r.isp ? (ISP_LABELS[r.isp] || r.isp) + ' ' : '';
+            const name = escapeHtml(recordLabel(r));
+            if (r.skipped) {
+                return `<div class="log-line log-warning">⊘ ${label}${name} 未改动：${escapeHtml(r.error || '')}</div>`;
+            }
+            const mark = r.ok ? '✓' : '✗';
+            const adopted = r.adopted ? ' <span class="muted">(复用了原有记录)</span>' : '';
+            return `<div class="log-line ${r.ok ? '' : 'log-error'}">${mark} ${label}${name} → ${escapeHtml(r.ip || '')}${adopted}${r.error ? ' (' + escapeHtml(r.error) + ')' : ''}</div>`;
+        }).join('');
     }
 
     async function testFetch() {
         const box = document.getElementById('cf-result');
         box.innerHTML = '<span class="muted">抓取中...</span>';
-        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/test`, {method: 'POST'});
-        const data = await res.json();
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/test`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
         let html = '';
-        if (data.ok && data.decision) {
-            const d = data.decision;
-            const badge = d.should_update ? '<span class="badge badge-green">✓ 会更新</span>' : '<span class="badge badge-yellow">⊘ 跳过</span>';
-            html += `<div class="log-line ${d.should_update ? 'log-success' : ''}">${badge} ${escapeHtml(d.reason)}</div>`;
-            html += `<div class="log-line">最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
-            if (d.current_speed) html += `<div class="log-line">当前记录速度: ${d.current_speed.toFixed(2)} MB/s</div>`;
-            if (d.min_speed_threshold > 0) html += `<div class="log-line">阈值: ${d.min_speed_threshold} MB/s</div>`;
-            html += `<div class="log-line">候选 IP 数: ${data.all_ips ? data.all_ips.length : 0}</div>`;
+        if (data.ok) {
+            html += `<div class="log-line">模式：<b>${data.split_by_isp ? '三网分流' : '单一最快 IP'}</b> · 候选 IP ${data.all_ips ? data.all_ips.length : 0} 个</div>`;
+            html += ispRowsHtml(data.isp_rows);
+            if (data.decision) {
+                html += `<div class="log-line">整体最快：<b>${escapeHtml(data.fastest_ip || '-')}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
+                html += `<div class="log-line muted">${escapeHtml(data.decision.reason)}</div>`;
+            }
         } else {
-            html += `<div class="log-line log-error">✗ 未解析到 IP</div>`;
+            html += '<div class="log-line log-error">✗ 未解析到 IP</div>';
             html += `<div class="log-line muted">${escapeHtml(data.raw_text_preview || data.detail || '')}</div>`;
         }
         box.innerHTML = html;
@@ -268,25 +413,21 @@
     async function triggerUpdate() {
         const box = document.getElementById('cf-result');
         box.innerHTML = '<span class="muted">更新中...</span>';
-        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/trigger`, {method: 'POST'});
-        const data = await res.json();
+        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/trigger`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
         let html = '';
         if (data.skipped) {
-            html += `<div class="log-line log-warning">⊘ 跳过: ${escapeHtml(data.skipped_reason || '-')}</div>`;
-            html += `<div class="log-line">最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
-        } else if (data.ok && data.results) {
-            html += `<div class="log-line log-success">✓ 最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s) — ${data.results.filter(r=>r.ok).length}/${data.results.length} 成功</div>`;
-            data.results.forEach(r => {
-                html += `<div class="log-line ${r.ok ? '' : 'log-error'}">${r.ok ? '✓' : '✗'} ${escapeHtml(r.name==='@' ? r.domain : r.name+'.'+r.domain)} → ${escapeHtml(r.ip)}${r.error ? ' ('+escapeHtml(r.error)+')' : ''}</div>`;
-            });
+            html += `<div class="log-line log-warning">⊘ 跳过：${escapeHtml(data.skipped_reason || '-')}</div>`;
+            html += ispRowsHtml(data.decisions);
+        } else if (data.results) {
+            html += ispRowsHtml(data.decisions);
+            const okCount = data.results.filter(r => r.ok).length;
+            html += `<div class="log-line log-success">✓ 写入 ${okCount}/${data.results.length} 条记录</div>`;
+            html += resultsHtml(data.results);
         } else {
-            html += `<div class="log-line log-error">✗ ${escapeHtml(data.detail || data.skipped_reason || JSON.stringify(data))}</div>`;
-        }
-        if (data.current_speed) {
-            html += `<div class="log-line muted">记录速度: ${data.current_speed.toFixed(2)} MB/s → ${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s</div>`;
+            html += `<div class="log-line log-error">✗ ${escapeHtml(data.detail || JSON.stringify(data))}</div>`;
         }
         box.innerHTML = html;
-        // 刷新状态
         setTimeout(loadCfStatus, 1000);
     }
 
