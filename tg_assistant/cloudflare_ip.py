@@ -190,6 +190,31 @@ def _is_valid_ipv4(ip: str) -> bool:
     return True
 
 
+def _cf_ok(data: Any) -> bool:
+    """判断 Cloudflare API v4 的响应是不是成功。
+
+    🔴 **Cloudflare 返回的字段叫 ``success``，不叫 ``ok``。**
+
+    这里原来两处都写成 ``data.get("ok")``（``_resolve_record`` 与
+    ``_update_single_record``），于是恒为 ``None``、恒判失败。线上实测后果：
+
+    * ``_resolve_record`` 永远返回 ``(None, False)`` → **每次都新建一条 A 记录，
+      永远不去更新已有的那条**（记录会越堆越多，而且老的脏记录一直生效）；
+    * ``_update_single_record`` 里记录其实**写成功了**，却报「未知错误」，
+      面板显示 0/1 成功 —— 因为 ``errors`` 是空数组，连错误原因都拼不出来。
+
+    实测响应：``{"result": [...], "success": true, "errors": [], ...}``。
+
+    两个字段都认（``success`` 优先）是为了兼容测试里的桩数据，
+    不改变「只要不是明确的成功就当失败」这个保守判定。
+    """
+    if not isinstance(data, dict):
+        return False
+    if "success" in data:
+        return bool(data["success"])
+    return bool(data.get("ok"))
+
+
 def parse_isp(text: str) -> Optional[str]:
     """认出这条频道消息属于哪个运营商；认不出返回 ``None``。
 
@@ -473,7 +498,7 @@ async def _resolve_record(
     response = await http.get(url, params=params)
     data = response.json()
 
-    if not data.get("ok"):
+    if not _cf_ok(data):
         log.warning("查询 DNS 记录失败: %s", data.get("errors"))
         return None, False
 
@@ -559,7 +584,7 @@ async def _update_single_record(
 
         data = resp.json()
 
-        if data.get("ok"):
+        if _cf_ok(data):
             log.info("DNS 记录更新成功: %s %s → %s", fqdn, record.record_type, ip)
             return DNSUpdateResult(
                 domain=record.domain,

@@ -447,6 +447,160 @@ class TestSplitSummaryState:
         assert IPFetchResult().has_isp_split is False
 
 
+# --------------------------------------------------------------------------- #
+# Cloudflare API v4 的响应字段名
+# --------------------------------------------------------------------------- #
+
+#: Cloudflare 真实响应的形状（注意是 ``success``，不是 ``ok``）。
+CF_LIST_RESPONSE = {
+    "result": [
+        {
+            "id": "rec-1",
+            "name": "yx.example.cc",
+            "type": "A",
+            "content": "1.1.1.1",
+            "proxiable": True,
+            "proxied": False,
+            "ttl": 1,
+            "comment": None,
+            "created_on": "2026-09-15T14:19:41.098209Z",
+        }
+    ],
+    "success": True,
+    "errors": [],
+    "messages": [],
+    "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
+}
+
+
+class TestCfOk:
+    """🔴 回归：Cloudflare 返回的字段是 ``success``，代码原来读的是 ``ok``。"""
+
+    def test_real_cloudflare_response_is_ok(self):
+        from tg_assistant.cloudflare_ip import _cf_ok
+
+        assert _cf_ok(CF_LIST_RESPONSE) is True
+
+    def test_success_false_is_not_ok(self):
+        from tg_assistant.cloudflare_ip import _cf_ok
+
+        assert _cf_ok({"success": False, "errors": [{"message": "boom"}]}) is False
+
+    def test_ok_field_still_accepted(self):
+        """测试里的桩数据还在用 ``ok``，继续认。"""
+        from tg_assistant.cloudflare_ip import _cf_ok
+
+        assert _cf_ok({"ok": True}) is True
+        assert _cf_ok({"ok": False}) is False
+
+    def test_success_wins_over_ok(self):
+        from tg_assistant.cloudflare_ip import _cf_ok
+
+        assert _cf_ok({"success": False, "ok": True}) is False
+
+    @pytest.mark.parametrize("bad", [None, [], "yes", 0, {}])
+    def test_garbage_is_not_ok(self, bad):
+        from tg_assistant.cloudflare_ip import _cf_ok
+
+        assert _cf_ok(bad) is False
+
+
+class TestCloudflareApiSuccessField:
+    """端到端：拿真实形状的响应跑一遍查询与写入。"""
+
+    def _transport(self, get_body: dict, write_body: dict, calls: list) -> httpx.MockTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, str(request.url)))
+            if request.method == "GET":
+                return httpx.Response(200, json=get_body)
+            return httpx.Response(200, json=write_body)
+
+        return httpx.MockTransport(handler)
+
+    async def test_resolve_reuses_existing_record(self):
+        """回归：原来判失败 → 返回 None → **每次都新建一条记录**。"""
+        from tg_assistant.cloudflare_ip import _resolve_record
+
+        calls: list = []
+        transport = self._transport(CF_LIST_RESPONSE, {}, calls)
+        async with httpx.AsyncClient(transport=transport) as http:
+            record_id, adopted = await _resolve_record(
+                http, "tok", "zone", "example.cc", "yx", "A"
+            )
+
+        assert record_id == "rec-1", "应该复用已有记录，而不是返回 None 去新建"
+        assert adopted is False
+
+    async def test_update_reports_success(self):
+        """回归：写成功却报「未知错误」（errors 是空数组，连原因都拼不出来）。"""
+        from tg_assistant.cloudflare_ip import _update_single_record
+
+        calls: list = []
+        transport = self._transport(
+            CF_LIST_RESPONSE,
+            {"result": {"id": "rec-1"}, "success": True, "errors": []},
+            calls,
+        )
+        async with httpx.AsyncClient(transport=transport) as http:
+            result = await _update_single_record(
+                http,
+                "tok",
+                CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="yx"),
+                "9.9.9.9",
+            )
+
+        assert result.ok is True, f"写成功却报失败: {result.error}"
+        assert result.error is None
+        assert result.record_id == "rec-1"
+        assert any(m == "PUT" for m, _ in calls), "有记录就该 PUT，而不是 POST 新建"
+
+    async def test_update_creates_when_no_record(self):
+        from tg_assistant.cloudflare_ip import _update_single_record
+
+        calls: list = []
+        transport = self._transport(
+            {"result": [], "success": True, "errors": []},
+            {"result": {"id": "new-1"}, "success": True, "errors": []},
+            calls,
+        )
+        async with httpx.AsyncClient(transport=transport) as http:
+            result = await _update_single_record(
+                http,
+                "tok",
+                CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="yx"),
+                "9.9.9.9",
+            )
+
+        assert result.ok is True
+        assert result.record_id == "new-1"
+        assert any(m == "POST" for m, _ in calls), "没有记录才该 POST 新建"
+
+    async def test_update_surfaces_real_error_message(self):
+        """真的失败时要把 Cloudflare 给的 message 带出来，别只说「未知错误」。"""
+        from tg_assistant.cloudflare_ip import _update_single_record
+
+        calls: list = []
+        transport = self._transport(
+            CF_LIST_RESPONSE,
+            {
+                "result": None,
+                "success": False,
+                "errors": [{"code": 1004, "message": "DNS Validation Error"}],
+            },
+            calls,
+        )
+        async with httpx.AsyncClient(transport=transport) as http:
+            result = await _update_single_record(
+                http,
+                "tok",
+                CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="yx"),
+                "9.9.9.9",
+            )
+
+        assert result.ok is False
+        assert "DNS Validation Error" in (result.error or "")
+
+
 class TestIspRows:
     """面板「测试抓取」里的三行预览。"""
 
