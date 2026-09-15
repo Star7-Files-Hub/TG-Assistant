@@ -407,5 +407,8 @@ def test_cloudflare_status_card_is_split_aware() -> None:
 
     assert "lr.ok_count" in html
     assert "lr.failed_count" in html
-    assert "lr.skipped_count" in html
     assert "lr.split_by_isp" in html, "分流与不分流必须走不同文案"
+    # ⚠️ 「三家都没更快所以跳过」是正常结果，不能写成「有异常」——
+    # 实测三家一起被跳过时面板会显示成故障，用户据此以为功能坏了。
+    assert "'已跳过'" in html, "全跳过时要显示「已跳过」，不能报成异常/失败"
+    assert "有异常" not in html

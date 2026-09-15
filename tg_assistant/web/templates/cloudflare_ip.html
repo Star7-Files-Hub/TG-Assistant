@@ -260,11 +260,15 @@
                 // 旧数据（split_by_isp=false 时代留下的）会走到下面的 else 分支。
                 const parts = [];
                 if (lr.ok_count) parts.push(`${lr.ok_count} 条写入成功`);
-                if (lr.skipped_count) parts.push(`${lr.skipped_count} 条跳过`);
                 if (lr.failed_count) parts.push(`${lr.failed_count} 条失败`);
-                detail.push(`上次结果: ${lr.ok ? '成功' : '有异常'}（${parts.join('、') || '未写任何记录'}）`);
+                // ⚠️ 「全部因为没更快而跳过」是**正常**结果，不能报成故障 ——
+                // 那会让用户以为出错了（实测三家一起被跳过时就是这个场景）。
+                const verdict = lr.ok
+                    ? '成功'
+                    : (lr.failed_count ? '有失败' : (lr.skipped ? '已跳过' : '未写入'));
+                detail.push(`上次结果: ${verdict}（${parts.join('、') || '未写任何记录'}）`);
             } else {
-                detail.push(`上次结果: ${lr.speed ? lr.speed.toFixed(2) + ' MB/s' : '-'} (${lr.ok ? '成功' : '失败'})`);
+                detail.push(`上次结果: ${lr.speed ? lr.speed.toFixed(2) + ' MB/s' : '-'} (${lr.ok ? '成功' : (lr.skipped ? '已跳过' : '失败')})`);
             }
             if (lr.skipped) detail.push(`跳过: ${lr.skipped_reason || '-'}`);
         }
