@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query
@@ -891,8 +892,12 @@ async def api_cloudflare_ip_trigger(
 
         summary = await fetch_and_update(cf_config, source, state, proxy)
         # 落盘（速度已在 fetch_and_update 内部写入 state）
-        # ⚠️ 「上次结果」也要写 —— 不写的话，用户点完「立即触发」明明成功了，
-        # 面板上还挂着上一次**定时调度**留下的「失败」，看起来像功能没生效。
+        # ⚠️ 「上次结果」和「上次更新」都要写 —— 不写的话，用户点完「立即触发」
+        # 明明成功了，面板上还挂着上一次**定时调度**留下的结果和时间，
+        # 看起来像功能没生效。
+        # 写 ``last_run`` 还有一层作用：它同时是调度器的到期判据，
+        # 刚手动跑过就不该马上再自动跑一遍（顺延一个 interval）。
+        state["cloudflare_ip_last_run"] = time.time()
         state["cloudflare_ip_last_result"] = summary_to_last_result(summary, cf_config)
         store.save_state(name, state)
     finally:

@@ -984,6 +984,8 @@ class TestTriggerPersistsLastResult:
         return app, store
 
     def test_trigger_writes_last_result(self, tmp_path, monkeypatch):
+        import time as _time
+
         from fastapi.testclient import TestClient
 
         import tg_assistant.cloudflare_ip as cf
@@ -1002,6 +1004,7 @@ class TestTriggerPersistsLastResult:
         monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
         monkeypatch.setattr(cf, "fetch_and_update", fake_fetch)
 
+        before = _time.time()
         # 不用 with：不跑 lifespan，免得后台调度循环插一脚
         client = TestClient(app)
         res = client.post("/api/config/acct/cloudflare_ip/trigger")
@@ -1015,6 +1018,10 @@ class TestTriggerPersistsLastResult:
         assert last["split_by_isp"] is True
         assert last["ok_count"] == 3
         assert last["failed_count"] == 0
+
+        # 「上次更新」也要刷新 —— 它同时是调度器的到期判据，
+        # 刚手动跑过就不该马上再自动跑一遍。
+        assert state.get("cloudflare_ip_last_run", 0) >= before
 
     def test_trigger_result_survives_reload(self, tmp_path, monkeypatch):
         """落盘的结果要能被 status 端点读回来（面板就是走这个接口）。"""
