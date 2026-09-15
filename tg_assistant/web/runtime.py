@@ -143,10 +143,10 @@ class RuntimeManager:
     async def _cloudflare_ip_loop(self) -> None:
         """后台循环：检查所有账号的 Cloudflare IP 定时配置，到期执行。"""
         from tg_assistant.cloudflare_ip import (
-            ISP_LABELS,
             fetch_and_update,
             make_message_source,
             make_message_source_from_account,
+            summary_to_last_result,
         )
         from tg_assistant.proxy import resolve_proxy
 
@@ -218,27 +218,11 @@ class RuntimeManager:
                         summary = await fetch_and_update(cf_config, source, state, proxy)
                         # 记录执行时间（速度已在 fetch_and_update 内部写入 state）
                         state["cloudflare_ip_last_run"] = now
-                        state["cloudflare_ip_last_result"] = {
-                            "ok": summary.all_ok and not summary.skipped,
-                            "skipped": summary.skipped,
-                            "skipped_reason": summary.skipped_reason,
-                            "ip": summary.fetched.fastest,
-                            "speed": summary.fetched.fastest_speed,
-                            "updated_at": summary.updated_at,
-                            "records_count": len(summary.results),
-                            "split_by_isp": cf_config.split_by_isp,
-                            "decisions": [
-                                {
-                                    "isp": isp,
-                                    "label": ISP_LABELS.get(isp, isp),
-                                    "should_update": d.should_update,
-                                    "ip": d.ip,
-                                    "speed": d.speed,
-                                    "reason": d.reason,
-                                }
-                                for isp, d in summary.decisions.items()
-                            ],
-                        }
+                        # ⚠️ 必须和手动「立即触发」共用这一个函数，
+                        # 否则两条路径写出来的「上次结果」会不一致。
+                        state["cloudflare_ip_last_result"] = summary_to_last_result(
+                            summary, cf_config
+                        )
                         self.store.save_state(record.name, state)
                     except Exception as exc:
                         log.exception(

@@ -253,9 +253,20 @@
         }
 
         const detail = [];
-        if (s.last_result && s.last_result.ip) {
-            detail.push(`上次结果: ${s.last_result.speed ? s.last_result.speed.toFixed(2) + ' MB/s' : '-'} (${s.last_result.ok ? '成功' : '失败'})`);
-            if (s.last_result.skipped) detail.push(`跳过: ${s.last_result.skipped_reason || '-'}`);
+        const lr = s.last_result;
+        if (lr && (lr.ip || lr.split_by_isp)) {
+            if (lr.split_by_isp) {
+                // 分流模式下「上次结果」是**三条记录**的结果，不能拿单个运营商的速度冒充。
+                // 旧数据（split_by_isp=false 时代留下的）会走到下面的 else 分支。
+                const parts = [];
+                if (lr.ok_count) parts.push(`${lr.ok_count} 条写入成功`);
+                if (lr.skipped_count) parts.push(`${lr.skipped_count} 条跳过`);
+                if (lr.failed_count) parts.push(`${lr.failed_count} 条失败`);
+                detail.push(`上次结果: ${lr.ok ? '成功' : '有异常'}（${parts.join('、') || '未写任何记录'}）`);
+            } else {
+                detail.push(`上次结果: ${lr.speed ? lr.speed.toFixed(2) + ' MB/s' : '-'} (${lr.ok ? '成功' : '失败'})`);
+            }
+            if (lr.skipped) detail.push(`跳过: ${lr.skipped_reason || '-'}`);
         }
         if (s.enabled && !s.listener_running) {
             // 「启用」开关只代表配置生效；真正监听要靠账号在线 —— 不写清楚的话，

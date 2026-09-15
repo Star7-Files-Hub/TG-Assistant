@@ -857,6 +857,7 @@ async def api_cloudflare_ip_trigger(
         fetch_and_update,
         make_message_source,
         make_message_source_from_account,
+        summary_to_last_result,
     )
 
     _require_account(store, name)
@@ -890,6 +891,9 @@ async def api_cloudflare_ip_trigger(
 
         summary = await fetch_and_update(cf_config, source, state, proxy)
         # 落盘（速度已在 fetch_and_update 内部写入 state）
+        # ⚠️ 「上次结果」也要写 —— 不写的话，用户点完「立即触发」明明成功了，
+        # 面板上还挂着上一次**定时调度**留下的「失败」，看起来像功能没生效。
+        state["cloudflare_ip_last_result"] = summary_to_last_result(summary, cf_config)
         store.save_state(name, state)
     finally:
         if client_to_stop is not None:

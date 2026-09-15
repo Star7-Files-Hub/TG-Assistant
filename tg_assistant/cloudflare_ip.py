@@ -175,6 +175,46 @@ class UpdateSummary:
         return self.skipped_reason is not None
 
 
+def summary_to_last_result(
+    summary: "UpdateSummary", config: "CloudflareIPConfig"
+) -> dict[str, Any]:
+    """把一次更新的汇总压成存进 state、给面板「上次结果」用的字典。
+
+    ⚠️ **定时调度（``web/runtime.py``）和手动「立即触发」（``web/routers/api.py``）
+    必须共用这一个函数。** 原来只有调度器写 ``cloudflare_ip_last_result``，
+    手动触发不写 —— 用户点完「立即触发」明明写成功了，面板上还挂着上一次调度
+    留下的「失败」，看起来就像功能没生效。
+
+    分流模式下 ``ok`` 只代表「三家都没被跳过」，所以另外给出
+    ``ok_count`` / ``skipped_count`` / ``failed_count``，让面板能说清
+    「3 条写成功」还是「1 条失败」，而不是拿单个运营商的速度冒充整体结果。
+    """
+    return {
+        "ok": summary.all_ok and not summary.skipped,
+        "skipped": summary.skipped,
+        "skipped_reason": summary.skipped_reason,
+        "ip": summary.fetched.fastest,
+        "speed": summary.fetched.fastest_speed,
+        "updated_at": summary.updated_at,
+        "records_count": len(summary.results),
+        "ok_count": sum(1 for r in summary.results if r.ok and not r.skipped),
+        "failed_count": sum(1 for r in summary.results if not r.ok and not r.skipped),
+        "skipped_count": sum(1 for r in summary.results if r.skipped),
+        "split_by_isp": bool(config.split_by_isp),
+        "decisions": [
+            {
+                "isp": isp,
+                "label": ISP_LABELS.get(isp, isp),
+                "should_update": d.should_update,
+                "ip": d.ip,
+                "speed": d.speed,
+                "reason": d.reason,
+            }
+            for isp, d in summary.decisions.items()
+        ],
+    }
+
+
 def _is_valid_ipv4(ip: str) -> bool:
     """简单校验 IPv4 地址合法性。"""
     parts = ip.split(".")

@@ -394,3 +394,18 @@ def test_account_status_defaults_to_cheap() -> None:
     ).read_text(encoding="utf-8")
 
     assert "def account_status(self, *, with_features: bool = False)" in src
+
+
+def test_cloudflare_status_card_is_split_aware() -> None:
+    """分流模式下「上次结果」要按**条数**说，不能拿单个运营商的速度冒充整体结果。
+
+    线上踩过：面板显示「上次结果: 97.96 MB/s（失败）」，而实际三条记录全写成功
+    —— 那 97.96 只是联通一家的速度，而且是**开启分流之前**那次调度留下的陈旧值。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "cloudflare_ip.html").read_text(encoding="utf-8")
+
+    assert "lr.ok_count" in html
+    assert "lr.failed_count" in html
+    assert "lr.skipped_count" in html
+    assert "lr.split_by_isp" in html, "分流与不分流必须走不同文案"

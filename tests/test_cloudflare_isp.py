@@ -18,11 +18,13 @@ import pytest
 
 from tg_assistant.cloudflare_ip import (
     ISP_COMMENT_PREFIX,
+    ISP_KEYS,
     ISP_LABELS,
     LAST_IP_BY_ISP_KEY,
     LAST_SPEED_BY_ISP_KEY,
     DNSUpdateResult,
     IPFetchResult,
+    IPUpdateDecision,
     ISPBest,
     UpdateSummary,
     _plan_targets,
@@ -30,6 +32,7 @@ from tg_assistant.cloudflare_ip import (
     aggregate_messages,
     parse_isp,
     should_update_isp,
+    summary_to_last_result,
     threshold_for,
 )
 from tg_assistant.config import CloudflareDNSRecord, CloudflareIPConfig
@@ -800,3 +803,239 @@ class TestUpdateSplitByIsp:
         assert summary.decisions["mobile"].should_update is False
         assert "没有这个运营商的 IP" in summary.decisions["mobile"].reason
         assert summary.changed_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# 「上次结果」：定时调度与手动触发必须写同一份
+# --------------------------------------------------------------------------- #
+
+
+def _split_summary(ok_isps=None, failed_isps=(), skipped_isps=()):
+    """造一个三网分流的 UpdateSummary。
+
+    ``ok_isps`` 默认是「除失败/跳过之外的全部运营商」—— 显式传的时候要注意
+    别让同一个运营商同时出现在两个集合里（否则会多造出一条结果）。
+    """
+    if ok_isps is None:
+        ok_isps = tuple(
+            k for k in ISP_KEYS if k not in failed_isps and k not in skipped_isps
+        )
+    results = [
+        DNSUpdateResult(
+            domain="example.cc",
+            name="yx",
+            record_type="A",
+            ip="1.1.1.1",
+            ok=True,
+            isp=isp,
+        )
+        for isp in ok_isps
+    ]
+    results += [
+        DNSUpdateResult(
+            domain="example.cc",
+            name="yx",
+            record_type="A",
+            ip=None,
+            ok=False,
+            isp=isp,
+            error="boom",
+        )
+        for isp in failed_isps
+    ]
+    results += [
+        DNSUpdateResult(
+            domain="example.cc",
+            name="yx",
+            record_type="A",
+            ip=None,
+            ok=False,
+            isp=isp,
+            skipped=True,
+            error="跳过",
+        )
+        for isp in skipped_isps
+    ]
+    summary = UpdateSummary(
+        fetched=IPFetchResult(fastest="1.1.1.1", fastest_speed=99.0),
+        updated_at="2026-09-16T00:00:00+00:00",
+    )
+    summary.results = results
+    return summary
+
+
+class TestSummaryToLastResult:
+    """面板「上次结果」的数据来源。
+
+    ⚠️ 这个字典**必须由调度器和手动触发共用同一个函数**产出 ——
+    原来只有调度器写，手动触发不写，于是用户点完「立即触发」看到的是
+    上一次调度留下的陈旧结果（线上就出现了「明明写成功却显示失败」）。
+    """
+
+    def test_split_all_ok_reports_counts(self):
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(_split_summary(), config)
+
+        assert data["ok"] is True
+        assert data["split_by_isp"] is True
+        assert data["records_count"] == 3
+        assert data["ok_count"] == 3
+        assert data["skipped_count"] == 0
+        assert data["failed_count"] == 0
+
+    def test_split_partial_failure_is_not_ok(self):
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(
+            _split_summary(failed_isps=("unicom",)), config
+        )
+
+        # 只要有一条真失败就不能报成功 —— 否则用户以为三家都写好了。
+        assert data["ok"] is False
+        assert data["ok_count"] == 2
+        assert data["failed_count"] == 1
+
+    def test_skipped_records_are_counted_separately_from_failures(self):
+        """「跳过」不是「失败」：面板要能分开说，日志也不会虚报写入条数。"""
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(
+            _split_summary(ok_isps=("telecom",), skipped_isps=("mobile", "unicom")),
+            config,
+        )
+
+        assert data["ok_count"] == 1
+        assert data["skipped_count"] == 2
+        assert data["failed_count"] == 0
+
+    def test_decisions_carry_human_labels(self):
+        config = CloudflareIPConfig(split_by_isp=True)
+        summary = _split_summary(ok_isps=("mobile",))
+        summary.decisions = {"mobile": IPUpdateDecision(True, ip="1.1.1.1", speed=30.0)}
+        data = summary_to_last_result(summary, config)
+
+        assert data["decisions"] == [
+            {
+                "isp": "mobile",
+                "label": "移动",
+                "should_update": True,
+                "ip": "1.1.1.1",
+                "speed": 30.0,
+                "reason": data["decisions"][0]["reason"],
+            }
+        ]
+
+    def test_non_split_keeps_flat_shape(self):
+        config = CloudflareIPConfig(split_by_isp=False)
+        summary = UpdateSummary(
+            fetched=IPFetchResult(fastest="2.2.2.2", fastest_speed=42.5),
+            updated_at="2026-09-16T00:00:00+00:00",
+        )
+        summary.results = [
+            DNSUpdateResult(
+                domain="example.cc", name="yx", record_type="A", ip="2.2.2.2", ok=True
+            )
+        ]
+        data = summary_to_last_result(summary, config)
+
+        assert data["split_by_isp"] is False
+        assert data["ip"] == "2.2.2.2"
+        assert data["speed"] == 42.5
+        assert data["ok"] is True
+        assert data["decisions"] == []
+
+    def test_skipped_reason_propagates(self):
+        config = CloudflareIPConfig(split_by_isp=True)
+        summary = UpdateSummary(fetched=IPFetchResult())
+        summary.skipped_reason = "未能从频道解析到任何 IP"
+        data = summary_to_last_result(summary, config)
+
+        assert data["skipped"] is True
+        assert data["ok"] is False
+        assert data["skipped_reason"] == "未能从频道解析到任何 IP"
+
+
+class TestTriggerPersistsLastResult:
+    """🔴 回归：手动「立即触发」原来**不写** ``cloudflare_ip_last_result``。
+
+    线上症状：点「立即触发」三条记录全写成功，面板状态卡却还挂着上一次
+    **定时调度**留下的「上次结果: 97.96 MB/s（失败）」→ 用户以为功能坏了。
+    """
+
+    @staticmethod
+    def _app_with_account(tmp_path):
+        from tg_assistant.config import AccountRecord, utc_now_iso
+        from tg_assistant.web import create_app
+
+        app = create_app(tmp_path / "data")
+        store = app.state.store
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        config = store.load_account_config("acct", create=True)
+        # ⚠️ 顺序不能反：模型开了 validate_assignment，enabled=True 会立刻校验
+        # 「必须有 api_token / 至少一条 records」，所以依赖项要先赋值。
+        config.cloudflare_ip.api_token = "tok"
+        config.cloudflare_ip.source_channel = "@cfyxip"
+        config.cloudflare_ip.records = [
+            CloudflareDNSRecord(
+                zone_id="zone", domain="example.cc", name="yx", record_type="A"
+            )
+        ]
+        config.cloudflare_ip.split_by_isp = True
+        config.cloudflare_ip.enabled = True
+        store.save_account_config("acct", config)
+        return app, store
+
+    def test_trigger_writes_last_result(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, store = self._app_with_account(tmp_path)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), (lambda *a, **k: None)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            summary = _split_summary()
+            # 真实现会顺手把速度写进 state，这里也模拟一下
+            state["cloudflare_ip_last_speed_by_isp"] = {"mobile": 30.0}
+            return summary
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_and_update", fake_fetch)
+
+        # 不用 with：不跑 lifespan，免得后台调度循环插一脚
+        client = TestClient(app)
+        res = client.post("/api/config/acct/cloudflare_ip/trigger")
+
+        assert res.status_code == 200, res.text
+        assert res.json()["ok"] is True
+
+        state = store.load_state("acct")
+        last = state.get("cloudflare_ip_last_result")
+        assert last is not None, "手动触发必须落盘「上次结果」"
+        assert last["split_by_isp"] is True
+        assert last["ok_count"] == 3
+        assert last["failed_count"] == 0
+
+    def test_trigger_result_survives_reload(self, tmp_path, monkeypatch):
+        """落盘的结果要能被 status 端点读回来（面板就是走这个接口）。"""
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, store = self._app_with_account(tmp_path)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), (lambda *a, **k: None)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            return _split_summary()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_and_update", fake_fetch)
+
+        client = TestClient(app)
+        client.post("/api/config/acct/cloudflare_ip/trigger")
+
+        status = client.get("/api/config/acct/cloudflare_ip/status").json()
+        assert status["last_result"]["ok_count"] == 3
+        assert status["last_result"]["split_by_isp"] is True
