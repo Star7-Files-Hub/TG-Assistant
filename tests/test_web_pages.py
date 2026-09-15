@@ -424,3 +424,99 @@ def test_cloudflare_status_card_is_split_aware() -> None:
     )
     # 跳过原因行原来只在 lr.skipped 时显示，部分跳过时会漏掉原因。
     assert "if (lr.skipped_reason)" in html
+
+
+# --------------------------------------------------------------------------- #
+# 「测试抓取」/「立即触发」：按钮不能永远停在「抓取中...」
+# --------------------------------------------------------------------------- #
+def _cf_html() -> str:
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    return (web_dir / "templates" / "cloudflare_ip.html").read_text(encoding="utf-8")
+
+
+def _js_function_body(html: str, name: str) -> str:
+    """截出 ``async function <name>(...) { ... }`` 的函数体（按大括号配平）。
+
+    ⚠️ 不能用「从头截到下一个 ``function``」那种土办法：这两个函数体里都有
+    ``} catch (err) {``，而且都是文件里最后两个函数，不配平根本截不对。
+    """
+    match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", html)
+    assert match, f"模板里找不到 {name}()"
+    start = html.index("{", match.end())
+    depth = 0
+    for index in range(start, len(html)):
+        char = html[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start : index + 1]
+    raise AssertionError(f"{name}() 的大括号没配平")
+
+
+@pytest.mark.parametrize(
+    "func,spinner",
+    [("testFetch", "抓取中..."), ("triggerUpdate", "更新中...")],
+)
+def test_cloudflare_buttons_always_clear_the_spinner(func: str, spinner: str) -> None:
+    """🔴 回归：线上「测试抓取」一直停在「抓取中...」，只能刷新页面。
+
+    原因是这两个函数**既没有 ``try/catch`` 也没有超时** —— 只要请求不返回
+    （服务重启、后端卡住、网络中断），就没人去把 spinner 换掉。
+    所以这里钉三条：
+
+    1. 请求走带超时的 ``postJson()``（``AbortController``）；
+    2. 异常有 ``catch``，并且会渲染成一行明确的提示；
+    3. ``box.innerHTML = html`` 必须在 ``try`` **外面** —— 放进 try 里的话，
+       异常一抛它就执行不到，spinner 照样留着。
+    """
+    body = _js_function_body(_cf_html(), func)
+
+    assert spinner in body, f"{func}() 没有先渲染「{spinner}」占位"
+    assert "postJson(" in body, f"{func}() 没用带超时的 postJson()，请求会永远挂着"
+    assert "} catch (err) {" in body, f"{func}() 没有 catch，异常时 spinner 永远留在页面上"
+    assert "requestErrorHtml(err)" in body, f"{func}() 的异常分支没有给用户任何文案"
+
+    # 3. spinner 的清除必须无条件执行：出现在 catch 之后
+    catch_at = body.index("} catch (err) {")
+    clear_at = body.rindex("box.innerHTML = html;")
+    assert clear_at > catch_at, (
+        f"{func}() 把「换掉 spinner」写进了 try 里 —— 抛异常时它就执行不到，"
+        "按钮会永远转圈"
+    )
+
+
+def test_post_json_has_a_timeout_and_clears_it() -> None:
+    """``postJson`` 是这两个按钮唯一的请求出口，超时逻辑只许写在这里。"""
+    body = _js_function_body(_cf_html(), "postJson")
+
+    assert "AbortController" in body
+    assert "ctrl.abort()" in body, "建了 AbortController 却没人 abort —— 等于没有超时"
+    assert "signal: ctrl.signal" in body, "没把 signal 传给 fetch，abort 不会生效"
+    assert "clearTimeout(timer)" in body, "正常返回后要清掉定时器"
+    assert "finally" in body, "清定时器要放 finally，抛异常时也得清"
+
+
+def test_frontend_timeout_outlasts_the_backend_one() -> None:
+    """前端兜底超时必须**长于**后端超时之和。
+
+    反过来的话前端先 abort，用户看到的是笼统的「请求超时」，
+    而后端那条更精确的 504（「账号可能正被其它任务占用，稍后重试」）
+    永远没机会显示 —— 排查时又得回到「服务端日志一片空白」的境地。
+    """
+    root = Path(__file__).resolve().parents[1] / "tg_assistant"
+    api_src = (root / "web" / "routers" / "api.py").read_text(encoding="utf-8")
+
+    front = re.search(r"CF_REQUEST_TIMEOUT_MS\s*=\s*(\d+)", _cf_html())
+    assert front, "cloudflare_ip.html 里找不到 CF_REQUEST_TIMEOUT_MS"
+    client_timeout = re.search(r"^CLIENT_TIMEOUT\s*=\s*([\d.]+)", api_src, re.M)
+    fetch_timeout = re.search(r"^FETCH_TIMEOUT\s*=\s*([\d.]+)", api_src, re.M)
+    assert client_timeout and fetch_timeout, "api.py 里的超时常量改名了？"
+
+    backend_worst = float(client_timeout.group(1)) + float(fetch_timeout.group(1))
+    frontend = int(front.group(1)) / 1000
+    assert frontend > backend_worst, (
+        f"前端 {frontend:.0f}s 撑不到后端最坏情况 {backend_worst:.0f}s"
+        f"（建 client {client_timeout.group(1)}s + 抓取 {fetch_timeout.group(1)}s）"
+    )

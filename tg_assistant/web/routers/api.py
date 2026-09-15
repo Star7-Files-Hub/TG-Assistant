@@ -5,16 +5,30 @@
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query
 
 from tg_assistant.config import ProxyConfig
+from tg_assistant.logging_setup import get_logger
 from tg_assistant.paths import InvalidAccountName, validate_account_name
 from tg_assistant.proxy import probe_proxy, summarize
 
 from ..deps import get_runtime, get_settings, get_store
+
+log = get_logger("web.api")
+
+#: 「测试抓取」/「立即触发」里，临时新建 Telegram client 的超时（秒）。
+CLIENT_TIMEOUT = 30.0
+#: 抓取频道消息 / 写入 DNS 的超时（秒）。
+FETCH_TIMEOUT = 45.0
+# ⚠️ 前端 ``CF_REQUEST_TIMEOUT_MS``（cloudflare_ip.html）必须 **大于这两者之和**。
+# 否则前端先 abort，用户看到的是笼统的「请求超时」，后端那条更精确的 504
+# （「账号可能正被其它任务占用」）永远没机会显示出来。
+# 有静态契约钉住这个大小关系（tests/test_web_pages.py）。
 
 router = APIRouter()
 
@@ -844,6 +858,68 @@ async def api_cloudflare_ip_enabled(
     return {"ok": True, "enabled": config.cloudflare_ip.enabled}
 
 
+async def _cf_make_source(
+    name: str,
+    store: Any,
+    settings: Any,
+    runtime: Any,
+    *,
+    what: str,
+) -> tuple[Any, Any]:
+    """给优选 IP 的「测试抓取」/「立即触发」拿一个能读频道消息的 source。
+
+    返回 ``(source, client_to_stop)``。``client_to_stop is None`` 表示复用了
+    正在运行的账号 client，调用方**不要**去 stop 它。
+
+    ⚠️ 日志和超时缺一不可，两条都是踩出来的：
+
+    * **日志**：线上出现过前端一直停在「抓取中...」、而服务端**一条日志都没有**
+      —— 连「请求到底有没有到服务端」都判断不了。所以这里进出都打日志。
+    * **超时**：临时新建的 client 要抢同一个 ``.session``，一旦卡在连接/登录上，
+      请求就永远不返回，前端按钮也就永远停在「抓取中...」，只能刷新页面。
+    """
+    from tg_assistant.cloudflare_ip import (
+        make_message_source,
+        make_message_source_from_account,
+    )
+
+    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
+    if name in running and runtime._runner is not None:
+        for runner in runtime._runner.runners.values():
+            if runner.name == name and runner.client is not None:
+                log.info(
+                    "%s：复用正在运行的 client",
+                    what,
+                    extra={"account": name, "extra_fields": {}},
+                )
+                return make_message_source(runner.client), None
+
+    log.info(
+        "%s：没有可复用的 client，临时新建一个",
+        what,
+        extra={"account": name, "extra_fields": {"timeout_s": CLIENT_TIMEOUT}},
+    )
+    try:
+        client, source = await asyncio.wait_for(
+            make_message_source_from_account(name, store, settings),
+            timeout=CLIENT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "%s：临时新建 client 超时",
+            what,
+            extra={"account": name, "extra_fields": {"timeout_s": CLIENT_TIMEOUT}},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"创建 Telegram client 超时（{CLIENT_TIMEOUT:.0f} 秒）。"
+                "账号可能正被其它任务占用，稍后重试。"
+            ),
+        ) from None
+    return source, client
+
+
 @router.post("/config/{name}/cloudflare_ip/trigger")
 async def api_cloudflare_ip_trigger(
     name: str,
@@ -854,11 +930,12 @@ async def api_cloudflare_ip_trigger(
     """手动触发一次优选 IP 抓取 + DNS 更新。"""
     from tg_assistant.cloudflare_ip import (
         fetch_and_update,
-        make_message_source,
-        make_message_source_from_account,
         persist_run,
         summary_to_last_result,
     )
+
+    started = time.monotonic()
+    log.info("收到「立即触发」请求", extra={"account": name, "extra_fields": {}})
 
     _require_account(store, name)
     account_config = store.load_account_config(name, create=False)
@@ -867,20 +944,9 @@ async def api_cloudflare_ip_trigger(
     if not cf_config.api_token or not cf_config.source_channel:
         raise HTTPException(status_code=400, detail="缺少 api_token 或 source_channel")
 
-    # 1. 尝试复用已在运行的账号 client
-    source = None
-    client_to_stop = None
-    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
-    if name in running and runtime._runner is not None:
-        for runner in runtime._runner.runners.values():
-            if runner.name == name and runner.client is not None:
-                source = make_message_source(runner.client)
-                break
-
-    # 2. 没在跑就临时起一个 client
-    if source is None:
-        client, source = await make_message_source_from_account(name, store, settings)
-        client_to_stop = client
+    source, client_to_stop = await _cf_make_source(
+        name, store, settings, runtime, what="立即触发"
+    )
 
     try:
         from tg_assistant.proxy import resolve_proxy
@@ -889,7 +955,20 @@ async def api_cloudflare_ip_trigger(
         proxy = resolve_proxy(record, settings)
         state = store.load_state(name)
 
-        summary = await fetch_and_update(cf_config, source, state, proxy)
+        try:
+            summary = await asyncio.wait_for(
+                fetch_and_update(cf_config, source, state, proxy),
+                timeout=FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "「立即触发」抓取/更新超时",
+                extra={"account": name, "extra_fields": {"timeout_s": FETCH_TIMEOUT}},
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=f"抓取或写入超时（{FETCH_TIMEOUT:.0f} 秒），稍后重试。",
+            ) from None
         # ⚠️ 「上次结果」和「上次更新」都要落盘，且必须和定时调度、实时监听
         # 共用 persist_run —— 少写一处，用户点完「立即触发」看到的就是
         # 上一次**调度**留下的陈旧结果，会以为功能没生效。
@@ -904,6 +983,19 @@ async def api_cloudflare_ip_trigger(
     # （原来这里自己写了一遍 ``summary.all_ok and not summary.skipped``，
     # 于是「写了 1 条、跳过 2 家」时接口说失败、面板说未写入，而实际写成功了）。
     shared = summary_to_last_result(summary, cf_config)
+    log.info(
+        "「立即触发」完成",
+        extra={
+            "account": name,
+            "extra_fields": {
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "reused_client": client_to_stop is None,
+                "ok_count": shared["ok_count"],
+                "failed_count": shared["failed_count"],
+                "skipped_count": shared["skipped_count"],
+            },
+        },
+    )
     return {
         "ok": shared["ok"],
         "skipped": shared["skipped"],
@@ -944,13 +1036,18 @@ async def api_cloudflare_ip_test(
     settings=Depends(get_settings),
     runtime=Depends(get_runtime),
 ) -> dict[str, Any]:
-    """测试抓取频道消息并解析 IP，展示决策结果（不更新 DNS）。"""
+    """测试抓取频道消息并解析 IP，展示决策结果（不更新 DNS）。
+
+    ⚠️ 进出都要记日志、两条路径都要有超时。线上出现过前端一直停在
+    「抓取中...」而服务端**一条日志都没有**，连请求到没到都判断不了。
+    """
     from tg_assistant.cloudflare_ip import (
         fetch_ips_from_channel,
-        make_message_source,
-        make_message_source_from_account,
         should_update,
     )
+
+    started = time.monotonic()
+    log.info("收到「测试抓取」请求", extra={"account": name, "extra_fields": {}})
 
     _require_account(store, name)
     account_config = store.load_account_config(name, create=False)
@@ -959,25 +1056,29 @@ async def api_cloudflare_ip_test(
     if not cf_config.source_channel:
         raise HTTPException(status_code=400, detail="缺少 source_channel")
 
-    source = None
-    client_to_stop = None
-    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
-    if name in running and runtime._runner is not None:
-        for runner in runtime._runner.runners.values():
-            if runner.name == name and runner.client is not None:
-                source = make_message_source(runner.client)
-                break
-
-    if source is None:
-        client, source = await make_message_source_from_account(name, store, settings)
-        client_to_stop = client
+    source, client_to_stop = await _cf_make_source(
+        name, store, settings, runtime, what="测试抓取"
+    )
 
     try:
-        fetched = await fetch_ips_from_channel(
-            cf_config.source_channel,
-            cf_config.fetch_limit,
-            source,
-        )
+        try:
+            fetched = await asyncio.wait_for(
+                fetch_ips_from_channel(
+                    cf_config.source_channel,
+                    cf_config.fetch_limit,
+                    source,
+                ),
+                timeout=FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "「测试抓取」抓取频道超时",
+                extra={"account": name, "extra_fields": {"timeout_s": FETCH_TIMEOUT}},
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=f"抓取频道超时（{FETCH_TIMEOUT:.0f} 秒），稍后重试。",
+            ) from None
     finally:
         if client_to_stop is not None:
             with contextlib.suppress(Exception):
@@ -986,6 +1087,19 @@ async def api_cloudflare_ip_test(
     # 决策预览
     state = store.load_state(name)
     decision = should_update(fetched, cf_config, state) if fetched.has_ip else None
+
+    log.info(
+        "「测试抓取」完成",
+        extra={
+            "account": name,
+            "extra_fields": {
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "reused_client": client_to_stop is None,
+                "has_ip": fetched.has_ip,
+                "ips": len(fetched.all_ips or []),
+            },
+        },
+    )
 
     return {
         "ok": fetched.has_ip,

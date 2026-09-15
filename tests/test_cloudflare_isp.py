@@ -13,8 +13,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -1131,6 +1135,305 @@ class TestTriggerPersistsLastResult:
         assert body["ok"] is True, "写成功 1 条就该算成功"
         assert body["ok"] == last["ok"], "接口和面板必须是同一个结论"
         assert body["skipped_count"] == last["skipped_count"]
+
+
+# --------------------------------------------------------------------------- #
+# 「测试抓取」/「立即触发」不能挂住
+# --------------------------------------------------------------------------- #
+
+
+def _api_module():
+    """取 ``web/routers/api.py`` **模块本身**。
+
+    ⚠️ ``from tg_assistant.web.routers import api`` 拿到的是 **APIRouter 对象** ——
+    ``routers/__init__.py`` 里的 ``from .api import router as api`` 把同名子模块的
+    属性覆盖掉了，直接往它身上 setattr 会 AttributeError。
+    """
+    import importlib
+
+    return importlib.import_module("tg_assistant.web.routers.api")
+
+
+@contextlib.contextmanager
+def _capture_api_logs():
+    """抓 ``tg-assistant.web.api`` 自己打出的日志。
+
+    ⚠️ 不能用 ``caplog``：``configure_logging`` 把 ``tg-assistant`` 这个 logger
+    的 ``propagate`` 设成了 ``False``，记录传到 ``tg-assistant`` 就停了，
+    而 caplog 的 handler 挂在 **root** 上 —— 什么都收不到。
+    直接挂到子 logger 上才不受 ``propagate`` 影响。
+    """
+    messages: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    sink = _Sink()
+    target = logging.getLogger("tg-assistant.web.api")
+    target.addHandler(sink)
+    try:
+        yield messages
+    finally:
+        target.removeHandler(sink)
+
+
+class TestFetchEndpointsNeverHang:
+    """🔴 回归：线上「测试抓取」一直停在「抓取中...」。
+
+    排查结论是**后端当时其实是好的**（实测 HTTP 200、0.2 秒返回），真正的问题是
+    「只要请求不返回，按钮就永远转圈」：
+
+    * 后端 —— ``/test`` 与 ``/trigger`` 两条路径都**没有超时**。临时新建的 client
+      要抢同一个 ``.session``，一旦卡住请求就永远不返回；而且**一条日志都不打**，
+      连「请求到底有没有到服务端」都判断不了（当时只能靠 curl 手工复现）。
+    * 前端 —— ``testFetch`` / ``triggerUpdate`` 既没有 ``try/catch`` 也没有超时
+      （前端那半边在 ``test_web_pages.py`` 里钉静态契约）。
+
+    这一组钉后端。⚠️ 故意让「会卡住」的替身只睡 **1 秒**：万一哪天超时被人删了，
+    用例会**失败**（等到 1 秒后拿到 200），而不是把整个测试套件挂死。
+    """
+
+    @staticmethod
+    def _app(tmp_path, *, api_token: str = "tok"):
+        from tg_assistant.config import AccountRecord, utc_now_iso
+        from tg_assistant.web import create_app
+
+        app = create_app(tmp_path / "data")
+        store = app.state.store
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        config = store.load_account_config("acct", create=True)
+        config.cloudflare_ip.api_token = api_token
+        config.cloudflare_ip.source_channel = "@cfyxip"
+        config.cloudflare_ip.records = [
+            CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="yx", record_type="A")
+        ]
+        store.save_account_config("acct", config)
+        return app, store
+
+    @staticmethod
+    def _fake_fetched() -> IPFetchResult:
+        return IPFetchResult(
+            fastest="104.16.11.144",
+            fastest_speed=27.96,
+            all_ips=["104.16.11.144"],
+            all_speeds={"104.16.11.144": 27.96},
+            raw_text="✅ Cloudflare 优选IP更新 (移动)",
+            isp="mobile",
+        )
+
+    def test_test_endpoint_returns_504_when_client_creation_hangs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """临时新建 client 卡住时必须 **504**，不能挂到天荒地老。"""
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+        api_mod = _api_module()
+
+        app, _ = self._app(tmp_path)
+
+        async def hanging_source_from_account(*args, **kwargs):
+            await asyncio.sleep(1.0)
+            return object(), object()
+
+        async def fake_fetch_ips(*args, **kwargs):
+            return self._fake_fetched()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", hanging_source_from_account)
+        monkeypatch.setattr(cf, "fetch_ips_from_channel", fake_fetch_ips)
+        monkeypatch.setattr(api_mod, "CLIENT_TIMEOUT", 0.05)
+
+        client = TestClient(app)
+        started = time.monotonic()
+        res = client.post("/api/config/acct/cloudflare_ip/test")
+        elapsed = time.monotonic() - started
+
+        assert res.status_code == 504, res.text
+        assert "超时" in res.json()["detail"]
+        assert elapsed < 0.9, f"没走超时分支，等了 {elapsed:.2f}s（前端会一直转圈）"
+
+    def test_test_endpoint_returns_504_when_channel_fetch_hangs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """拿到 client 了、但读频道卡住 → 同样 504，而且**临时 client 要收掉**。"""
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+        api_mod = _api_module()
+
+        app, _ = self._app(tmp_path)
+        stopped: list[bool] = []
+
+        class FakeClient:
+            async def stop(self, block: bool = False) -> None:
+                stopped.append(block)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return FakeClient(), object()
+
+        async def hanging_fetch_ips(*args, **kwargs):
+            await asyncio.sleep(1.0)
+            return self._fake_fetched()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_ips_from_channel", hanging_fetch_ips)
+        monkeypatch.setattr(api_mod, "FETCH_TIMEOUT", 0.05)
+
+        res = TestClient(app).post("/api/config/acct/cloudflare_ip/test")
+
+        assert res.status_code == 504, res.text
+        assert stopped == [True], (
+            "超时返回前必须把临时 client 收掉 —— 否则它一直占着 .session，"
+            "下一次请求就撞 database is locked"
+        )
+
+    def test_trigger_endpoint_returns_504_when_update_hangs(self, tmp_path, monkeypatch) -> None:
+        """「立即触发」卡在抓取/写入时也要 504，且**不能留下半截结果**。"""
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+        api_mod = _api_module()
+
+        app, store = self._app(tmp_path)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), object()
+
+        async def hanging_fetch_and_update(*args, **kwargs):
+            await asyncio.sleep(1.0)
+            return _split_summary()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_and_update", hanging_fetch_and_update)
+        monkeypatch.setattr(api_mod, "FETCH_TIMEOUT", 0.05)
+
+        res = TestClient(app).post("/api/config/acct/cloudflare_ip/trigger")
+
+        assert res.status_code == 504, res.text
+        assert "超时" in res.json()["detail"]
+        assert "cloudflare_ip_last_result" not in store.load_state("acct"), (
+            "超时了却落了盘 —— 面板会显示一个根本没发生过的结果"
+        )
+
+    def test_reuses_running_client_and_never_stops_it(self, tmp_path, monkeypatch) -> None:
+        """账号正在跑时必须复用它的 client，而且**不许 stop** —— 那是它的活连接。
+
+        ⚠️ 这是 ``_cf_make_source`` 返回 ``(source, None)`` 的唯一理由。
+        原来两处端点各自抄了一遍这段逻辑，只要有一处把「复用来的 client」
+        也丢进 ``client_to_stop``，点一次「测试抓取」就会把账号的连接掐断。
+        """
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, _ = self._app(tmp_path)
+        sentinel_source = object()
+        seen: list[Any] = []
+
+        class LiveClient:
+            async def stop(self, block: bool = False) -> None:
+                raise AssertionError("复用来的 client 被 stop 了 —— 账号连接会被掐断")
+
+        app.state.runtime._runner = types.SimpleNamespace(
+            runners={"acct": types.SimpleNamespace(name="acct", client=LiveClient())},
+            snapshot=lambda: [{"account": "acct"}],
+        )
+
+        async def must_not_create(*args, **kwargs):
+            raise AssertionError("账号明明在跑，却又新建了一个 client 去抢同一个 .session")
+
+        async def fake_fetch_ips(channel, limit, source, *args, **kwargs):
+            seen.append(source)
+            return self._fake_fetched()
+
+        monkeypatch.setattr(cf, "make_message_source", lambda client: sentinel_source)
+        monkeypatch.setattr(cf, "make_message_source_from_account", must_not_create)
+        monkeypatch.setattr(cf, "fetch_ips_from_channel", fake_fetch_ips)
+
+        res = TestClient(app).post("/api/config/acct/cloudflare_ip/test")
+
+        assert res.status_code == 200, res.text
+        assert seen == [sentinel_source], "没有用运行中 client 的 source"
+
+    def test_both_endpoints_log_entry_and_completion(self, tmp_path, monkeypatch) -> None:
+        """进出都要有日志。
+
+        线上那次「一直抓取中」最难受的地方不是卡住，而是服务端**一片空白** ——
+        连「请求到底有没有到服务端」都判断不了，只能写脚本手工 curl 复现。
+        """
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, _ = self._app(tmp_path)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), object()
+
+        async def fake_fetch_ips(*args, **kwargs):
+            return self._fake_fetched()
+
+        async def fake_fetch_and_update(*args, **kwargs):
+            return _split_summary()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_ips_from_channel", fake_fetch_ips)
+        monkeypatch.setattr(cf, "fetch_and_update", fake_fetch_and_update)
+
+        client = TestClient(app)
+        with _capture_api_logs() as messages:
+            res_test = client.post("/api/config/acct/cloudflare_ip/test")
+            res_trigger = client.post("/api/config/acct/cloudflare_ip/trigger")
+
+        assert res_test.status_code == 200, res_test.text
+        assert res_trigger.status_code == 200, res_trigger.text
+
+        joined = "\n".join(messages)
+        for expected in (
+            "收到「测试抓取」请求",
+            "「测试抓取」完成",
+            "收到「立即触发」请求",
+            "「立即触发」完成",
+        ):
+            assert expected in joined, f"少了日志：{expected}\n实际日志：\n{joined}"
+
+    def test_completion_log_records_elapsed_and_reuse(self, tmp_path, monkeypatch) -> None:
+        """完成日志要带耗时和「是不是复用来的 client」—— 排查卡顿全靠这两个字段。"""
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, _ = self._app(tmp_path)
+        seen: list[logging.LogRecord] = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                seen.append(record)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), object()
+
+        async def fake_fetch_ips(*args, **kwargs):
+            return self._fake_fetched()
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_ips_from_channel", fake_fetch_ips)
+
+        sink = _Sink()
+        target = logging.getLogger("tg-assistant.web.api")
+        target.addHandler(sink)
+        try:
+            TestClient(app).post("/api/config/acct/cloudflare_ip/test")
+        finally:
+            target.removeHandler(sink)
+
+        done = [r for r in seen if "「测试抓取」完成" in r.getMessage()]
+        assert done, "没有完成日志"
+        fields = getattr(done[0], "extra_fields", {})
+        assert "elapsed_ms" in fields, "没有耗时字段，无法判断是慢还是卡"
+        assert fields.get("reused_client") is False, "临时新建的 client 应报 reused_client=False"
+        assert fields.get("ips") == 1
 
 
 class TestPersistRun:

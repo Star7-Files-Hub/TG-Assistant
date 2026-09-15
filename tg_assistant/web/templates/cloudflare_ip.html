@@ -416,42 +416,97 @@
         }).join('');
     }
 
+    //: 「测试抓取」/「立即触发」请求的超时（毫秒）。后端自己也有 45/60 秒的超时，
+    //: 这里多留一点余量，保证后端先返回、前端只是兜底。
+    const CF_REQUEST_TIMEOUT_MS = 90000;
+
+    /**
+     * 带超时的 POST。
+     *
+     * ⚠️ 为什么必须要有：原来 fetch 既没有 try/catch 也没有超时 ——
+     * 只要请求不返回（服务正在重启、后端卡住、网络中断），按钮就**永远**
+     * 停在「抓取中...」，用户只能刷新页面。线上真出现过这种情况，
+     * 而且服务端日志里一条痕迹都没有，连「请求到没到服务端」都判断不了。
+     */
+    async function postJson(url) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), CF_REQUEST_TIMEOUT_MS);
+        try {
+            const res = await fetch(url, { method: 'POST', signal: ctrl.signal });
+            // 非 2xx 也要尽量读出 detail（FastAPI 的错误体是 {"detail": "..."}）
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** 把异常变成一行明确的提示 —— 绝不能让 spinner 留在页面上。 */
+    function requestErrorHtml(err) {
+        const aborted = err && err.name === 'AbortError';
+        const msg = aborted
+            ? `请求超时（${CF_REQUEST_TIMEOUT_MS / 1000} 秒没有响应）。服务可能正在重启，请刷新页面后重试。`
+            : `请求失败：${(err && err.message) || err}`;
+        return `<div class="log-line log-error">✗ ${escapeHtml(msg)}</div>`;
+    }
+
     async function testFetch() {
         const box = document.getElementById('cf-result');
         box.innerHTML = '<span class="muted">抓取中...</span>';
-        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/test`, { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
         let html = '';
-        if (data.ok) {
-            html += `<div class="log-line">模式：<b>${data.split_by_isp ? '三网分流' : '单一最快 IP'}</b> · 候选 IP ${data.all_ips ? data.all_ips.length : 0} 个</div>`;
-            html += ispRowsHtml(data.isp_rows);
-            if (data.decision) {
-                html += `<div class="log-line">整体最快：<b>${escapeHtml(data.fastest_ip || '-')}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
-                html += `<div class="log-line muted">${escapeHtml(data.decision.reason)}</div>`;
+        try {
+            if (!currentAccount) {
+                throw new Error('还没选账号 —— 请在上方「账号」下拉里选一个配了优选 IP 的账号');
             }
-        } else {
-            html += '<div class="log-line log-error">✗ 未解析到 IP</div>';
-            html += `<div class="log-line muted">${escapeHtml(data.raw_text_preview || data.detail || '')}</div>`;
+            const { res, data } = await postJson(
+                `/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/test`
+            );
+            if (!res.ok) {
+                html = `<div class="log-line log-error">✗ HTTP ${res.status}：${escapeHtml(data.detail || '请求被拒绝')}</div>`;
+            } else if (data.ok) {
+                html += `<div class="log-line">模式：<b>${data.split_by_isp ? '三网分流' : '单一最快 IP'}</b> · 候选 IP ${data.all_ips ? data.all_ips.length : 0} 个</div>`;
+                html += ispRowsHtml(data.isp_rows);
+                if (data.decision) {
+                    html += `<div class="log-line">整体最快：<b>${escapeHtml(data.fastest_ip || '-')}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
+                    html += `<div class="log-line muted">${escapeHtml(data.decision.reason)}</div>`;
+                }
+            } else {
+                html += '<div class="log-line log-error">✗ 未解析到 IP</div>';
+                html += `<div class="log-line muted">${escapeHtml(data.raw_text_preview || data.detail || '')}</div>`;
+            }
+        } catch (err) {
+            html = requestErrorHtml(err);
         }
+        // ⚠️ 放在 try 外面：不管成功、失败还是抛异常，都必须把「抓取中...」换掉。
         box.innerHTML = html;
     }
 
     async function triggerUpdate() {
         const box = document.getElementById('cf-result');
         box.innerHTML = '<span class="muted">更新中...</span>';
-        const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/trigger`, { method: 'POST' });
-        const data = await res.json().catch(() => ({}));
         let html = '';
-        if (data.skipped) {
-            html += `<div class="log-line log-warning">⊘ 跳过：${escapeHtml(data.skipped_reason || '-')}</div>`;
-            html += ispRowsHtml(data.decisions);
-        } else if (data.results) {
-            html += ispRowsHtml(data.decisions);
-            const okCount = data.results.filter(r => r.ok).length;
-            html += `<div class="log-line log-success">✓ 写入 ${okCount}/${data.results.length} 条记录</div>`;
-            html += resultsHtml(data.results);
-        } else {
-            html += `<div class="log-line log-error">✗ ${escapeHtml(data.detail || JSON.stringify(data))}</div>`;
+        try {
+            if (!currentAccount) {
+                throw new Error('还没选账号 —— 请在上方「账号」下拉里选一个配了优选 IP 的账号');
+            }
+            const { res, data } = await postJson(
+                `/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip/trigger`
+            );
+            if (!res.ok) {
+                html = `<div class="log-line log-error">✗ HTTP ${res.status}：${escapeHtml(data.detail || '请求被拒绝')}</div>`;
+            } else if (data.skipped) {
+                html += `<div class="log-line log-warning">⊘ 跳过：${escapeHtml(data.skipped_reason || '-')}</div>`;
+                html += ispRowsHtml(data.decisions);
+            } else if (data.results) {
+                html += ispRowsHtml(data.decisions);
+                const okCount = data.results.filter(r => r.ok).length;
+                html += `<div class="log-line log-success">✓ 写入 ${okCount}/${data.results.length} 条记录</div>`;
+                html += resultsHtml(data.results);
+            } else {
+                html += `<div class="log-line log-error">✗ ${escapeHtml(data.detail || JSON.stringify(data))}</div>`;
+            }
+        } catch (err) {
+            html = requestErrorHtml(err);
         }
         box.innerHTML = html;
         setTimeout(loadCfStatus, 1000);
