@@ -575,16 +575,11 @@ async def api_cloudflare_ip_trigger(
         client_to_stop = client
 
     try:
-        from tg_assistant.cloudflare_ip import should_update
         from tg_assistant.proxy import resolve_proxy
 
         record = store.require_account(name)
         proxy = resolve_proxy(record, settings)
         state = store.load_state(name)
-
-        # 先做一次决策预览
-        fetched_preview = None
-        decision = None
 
         summary = await fetch_and_update(cf_config, source, state, proxy)
         # 落盘（速度已在 fetch_and_update 内部写入 state）
@@ -696,7 +691,6 @@ async def api_cloudflare_ip_status(
     runtime=Depends(get_runtime),
 ) -> dict[str, Any]:
     """获取当前 Cloudflare IP 更新状态（上次更新结果、实时监听状态）。"""
-    from tg_assistant.config import CloudflareIPConfig
 
     _require_account(store, name)
     account_config = store.load_account_config(name, create=False)

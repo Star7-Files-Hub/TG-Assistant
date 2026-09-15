@@ -6,10 +6,9 @@ import pytest
 from pydantic import ValidationError
 
 from tg_assistant.cloudflare_ip import (
-    IPFetchResult,
     DNSUpdateResult,
+    IPFetchResult,
     UpdateSummary,
-    IPUpdateDecision,
     _is_valid_ipv4,
     parse_ips_from_text,
     should_update,
@@ -19,7 +18,6 @@ from tg_assistant.config import (
     CloudflareDNSRecord,
     CloudflareIPConfig,
 )
-
 
 SAMPLE_CHANNEL_MESSAGE = """✅ Cloudflare 优选IP更新 (电信)
 
