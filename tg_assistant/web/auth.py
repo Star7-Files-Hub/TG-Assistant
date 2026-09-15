@@ -39,7 +39,9 @@ _CLOCK_SKEW = 60
 #: 免鉴权路径：登录页自身、登出、图标。
 #: 登出必须放行 —— 否则 Cookie 已失效时用户点「退出」会被中间件拦回登录页，
 #: 看起来就像按钮坏了。
-_PUBLIC_EXACT = frozenset({"/auth", "/auth/logout", "/favicon.ico"})
+#: ``/auth/login`` 是旧版地址的兼容跳转（见 ``auth_login_compat``），同样要放行，
+#: 否则中间件会先把它 303 到 ``/auth``，多一跳且丢掉 ``next``。
+_PUBLIC_EXACT = frozenset({"/auth", "/auth/login", "/auth/logout", "/favicon.ico"})
 #: 免鉴权前缀：静态资源（否则登录页连样式都加载不出来）。
 _PUBLIC_PREFIXES = ("/static/",)
 
@@ -207,6 +209,18 @@ async def auth_page(request: Request, next: str = "/", error: str = "") -> Respo
         _PAGE.format(error=banner, next_url=_esc(_safe_next(next))),
         status_code=200,
     )
+
+
+@router.get("/auth/login")
+async def auth_login_compat(next: str = "/") -> Response:
+    """兼容旧版登录地址。
+
+    旧版把「密钥输入页」放在 ``/auth/login``，现在已合并到 ``/auth``。
+    这里只是让旧书签/旧链接继续可用：中间件虽然也会把它 303 到 ``/auth``
+    （不会死循环），但那样会**丢掉 ``next`` 参数**，登录后一律落到首页。
+    这条路由把 ``next`` 原样带过去，并且少一跳。
+    """
+    return RedirectResponse(url=f"/auth?next={quote(_safe_next(next))}", status_code=303)
 
 
 @router.post("/auth")

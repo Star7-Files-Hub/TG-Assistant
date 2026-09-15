@@ -153,6 +153,23 @@ def test_logout_clears_cookie(app, client):
     assert not resp.cookies.get(COOKIE_NAME)
 
 
+def test_legacy_auth_login_path_redirects_to_auth(app, client):
+    """旧版登录地址 ``/auth/login`` 要免鉴权，并带着 ``next`` 跳到 ``/auth``。
+
+    新版把「密钥输入页」合并到了 ``/auth``，``/auth/login`` 不再有路由。
+    不放行这条路径时中间件也会把它 303 到 ``/auth``（**不会死循环**），
+    但 ``next`` 会丢失、登录后一律落到首页 —— 所以这里钉住「带 next 且不多跳」。
+    """
+    app.state.web_settings.secret_key = SECRET
+    resp = client.get("/auth/login", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/auth?next=")
+    # 绝不能指回它自己，否则就是死循环
+    assert "/auth/login" not in resp.headers["location"]
+    # 跟随跳转后应拿到 200 的密钥输入页，而不是 404
+    assert client.get("/auth/login").status_code == 200
+
+
 def test_cookie_value_is_not_the_secret():
     assert cookie_value("plain") != "plain"
 
