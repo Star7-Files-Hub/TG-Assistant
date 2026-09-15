@@ -1,0 +1,295 @@
+{% extends "base.html" %}
+{% block title %}优选 IP · Cloudflare DNS · TG-Assistant{% endblock %}
+
+{% block content %}
+<div class="nt-page">
+    <div class="nt-header">
+        <div class="nt-header-left">
+            <h1>⚡ Cloudflare 优选 IP</h1>
+            <p class="text-muted">从 Telegram 频道抓取优选 IP，自动更新 Cloudflare DNS 记录</p>
+        </div>
+        <div class="nt-header-right">
+            <div class="nt-account-select">
+                <label>账号</label>
+                <select id="account-selector" onchange="switchAccount()">
+                    <option value="">选择账号...</option>
+                </select>
+            </div>
+            <label class="nt-master-toggle">
+                <input type="checkbox" id="cf-enabled" onchange="toggleCf()" />
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">启用</span>
+            </label>
+        </div>
+    </div>
+
+    <div class="nt-content" id="cf-content" style="display:none;">
+        <!-- 状态栏 -->
+        <div class="nt-card" id="cf-status-card">
+            <div class="nt-card-header"><h3>📊 当前状态</h3></div>
+            <div class="nt-card-body">
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>实时监听</label><span id="cf-status-listener" class="badge">-</span></div>
+                    <div class="nt-input-group"><label>当前 IP</label><span id="cf-status-ip" class="muted">-</span></div>
+                    <div class="nt-input-group"><label>当前速度</label><span id="cf-status-speed" class="muted">-</span></div>
+                    <div class="nt-input-group"><label>上次更新</label><span id="cf-status-last" class="muted">-</span></div>
+                </div>
+                <div id="cf-status-detail" class="muted" style="margin-top:8px;font-size:12px;"></div>
+            </div>
+        </div>
+
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>Cloudflare 配置</h3><p>需要 Zone:DNS 编辑权限的 API Token</p></div>
+            <div class="nt-card-body">
+                <div class="nt-input-group"><label>API Token</label><input id="cf-api-token" type="password" placeholder="从 Cloudflare 控制台获取" /></div>
+                <div class="nt-input-group">
+                    <label>源频道</label>
+                    <p class="nt-hint">发布优选 IP 的 Telegram 频道，如 @CFIP 或频道 chat_id</p>
+                    <input id="cf-source-channel" type="text" placeholder="@channel 或 -100..." />
+                </div>
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>抓取消息数</label><input id="cf-fetch-limit" type="number" value="5" min="1" max="100" /></div>
+                    <div class="nt-input-group"><label>定时间隔（小时，0=仅手动）</label><input id="cf-interval" type="number" value="0" min="0" max="168" step="0.5" /></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>⚙️ 更新策略</h3><p>控制何时更新 DNS 记录</p></div>
+            <div class="nt-card-body">
+                <div class="nt-grid">
+                    <div class="nt-input-group">
+                        <label>最低速度阈值（MB/s）</label>
+                        <p class="nt-hint">频道最快 IP 低于此值时不更新，0 = 不限制</p>
+                        <input id="cf-min-speed" type="number" value="0" min="0" step="0.1" />
+                    </div>
+                    <div class="nt-input-group">
+                        <label>定时检查间隔（小时）</label>
+                        <input id="cf-interval" type="number" value="0" min="0" max="168" step="0.5" style="display:none;" />
+                    </div>
+                </div>
+                <div class="nt-grid">
+                    <label class="tg-checkbox"><input id="cf-only-if-faster" type="checkbox" checked /><span class="tg-checkmark"></span><span>仅当新 IP 比当前更快时才更新</span></label>
+                    <label class="tg-checkbox"><input id="cf-real-time" type="checkbox" checked /><span class="tg-checkmark"></span><span>实时监听频道新消息（账号在线时自动生效）</span></label>
+                </div>
+            </div>
+        </div>
+
+        <div class="nt-card">
+            <div class="nt-card-header">
+                <h3>DNS 记录</h3>
+                <p>要更新的记录列表</p>
+            </div>
+            <div class="nt-card-body">
+                <div id="cf-records-list" class="cf-records-list"></div>
+                <button class="btn btn-secondary" onclick="addRecord()">+ 添加记录</button>
+            </div>
+        </div>
+
+        <div class="nt-card">
+            <div class="nt-card-header"><h3>操作</h3></div>
+            <div class="nt-card-body">
+                <div class="nt-grid">
+                    <button class="btn btn-primary" onclick="testFetch()">🔍 测试抓取 + 决策</button>
+                    <button class="btn btn-success" onclick="triggerUpdate()">🚀 立即更新</button>
+                </div>
+                <div id="cf-result" class="report-box" style="margin-top:12px;"></div>
+            </div>
+        </div>
+
+        <div class="nt-save-bar">
+            <button class="tg-btn tg-btn-primary" onclick="saveCfConfig()">💾 保存配置</button>
+        </div>
+    </div>
+    <div class="nt-empty" id="cf-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+        <h3>请先选择账号</h3>
+        <p>从上方下拉框选择一个账号</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentAccount = '', cfData = {};
+    let records = [];
+
+    function init() { loadAccounts(); }
+
+    function escapeHtml(s) {
+        if (s === null || s === undefined) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function formatTime(ts) {
+        if (!ts) return '-';
+        const d = new Date(ts * 1000);
+        return d.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const sel = document.getElementById('account-selector');
+        sel.innerHTML = '<option value="">选择账号...</option>';
+        data.accounts.forEach(a => {
+            sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + escapeHtml(a.user) + ')' : ''}</option>`;
+        });
+        if (data.accounts.length > 0) { sel.value = data.accounts[0].name; switchAccount(); }
+    }
+
+    async function switchAccount() {
+        const sel = document.getElementById('account-selector');
+        currentAccount = sel.value;
+        if (!currentAccount) {
+            document.getElementById('cf-content').style.display = 'none';
+            document.getElementById('cf-empty').style.display = 'flex';
+            return;
+        }
+        document.getElementById('cf-content').style.display = 'block';
+        document.getElementById('cf-empty').style.display = 'none';
+        await loadCfConfig();
+        await loadCfStatus();
+    }
+
+    async function loadCfConfig() {
+        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip`);
+        if (!res.ok) return;
+        cfData = await res.json();
+        document.getElementById('cf-enabled').checked = cfData.enabled;
+        document.getElementById('cf-api-token').value = (cfData.api_token || '').replace(/\w{3}$/, '') ? (cfData.api_token || '') : '';
+        document.getElementById('cf-source-channel').value = cfData.source_channel || '';
+        document.getElementById('cf-fetch-limit').value = cfData.fetch_limit || 5;
+        document.getElementById('cf-interval').value = cfData.interval_hours || 0;
+        document.getElementById('cf-min-speed').value = cfData.min_speed_threshold || 0;
+        document.getElementById('cf-only-if-faster').checked = cfData.only_update_if_faster !== false;
+        document.getElementById('cf-real-time').checked = cfData.real_time_listen !== false;
+        records = cfData.records || [];
+        renderRecords();
+    }
+
+    async function loadCfStatus() {
+        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/status`);
+        if (!res.ok) return;
+        const s = await res.json();
+        document.getElementById('cf-status-listener').textContent = s.listener_running ? '✅ 运行中' : '⏸ 未运行';
+        document.getElementById('cf-status-listener').className = 'badge ' + (s.listener_running ? 'badge-green' : 'badge-gray');
+        document.getElementById('cf-status-ip').textContent = s.current_ip || '-';
+        document.getElementById('cf-status-speed').textContent = s.current_speed ? s.current_speed.toFixed(2) + ' MB/s' : '-';
+        document.getElementById('cf-status-last').textContent = s.last_run ? formatTime(s.last_run) : '-';
+        const detail = [];
+        if (s.last_result && s.last_result.ip) {
+            detail.push(`上次结果: ${s.last_result.speed ? s.last_result.speed.toFixed(2) + ' MB/s' : '-'} (${s.last_result.ok ? '成功' : '失败'})`);
+            if (s.last_result.skipped) detail.push(`跳过: ${escapeHtml(s.last_result.skipped_reason || '-')}`);
+        }
+        document.getElementById('cf-status-detail').textContent = detail.join(' | ');
+    }
+
+    function renderRecords() {
+        const container = document.getElementById('cf-records-list');
+        if (records.length === 0) {
+            container.innerHTML = '<p class="muted">暂无记录，点击下方按钮添加</p>';
+            return;
+        }
+        container.innerHTML = records.map((r, i) => `
+            <div class="cf-record-item">
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>Zone ID</label><input value="${escapeHtml(r.zone_id)}" onchange="records[${i}].zone_id=this.value" placeholder="Cloudflare Zone ID" /></div>
+                    <div class="nt-input-group"><label>域名</label><input value="${escapeHtml(r.domain)}" onchange="records[${i}].domain=this.value" placeholder="example.com" /></div>
+                </div>
+                <div class="nt-grid">
+                    <div class="nt-input-group"><label>记录名</label><input value="${escapeHtml(r.name)}" onchange="records[${i}].name=this.value" placeholder="@ 或 www" /></div>
+                    <div class="nt-input-group"><label>类型</label><select onchange="records[${i}].record_type=this.value"><option value="A" ${r.record_type==='A'?'selected':''}>A</option><option value="AAAA" ${r.record_type==='AAAA'?'selected':''}>AAAA</option></select></div>
+                </div>
+                <div class="nt-grid">
+                    <label class="tg-checkbox"><input type="checkbox" ${r.proxied!==false?'checked':''} onchange="records[${i}].proxied=this.checked" /><span class="tg-checkmark"></span><span>代理（小黄云）</span></label>
+                    <div class="nt-input-group"><label>TTL</label><input type="number" value="${r.ttl||1}" min="1" onchange="records[${i}].ttl=parseInt(this.value)||1" /></div>
+                </div>
+                <button class="btn btn-danger btn-sm" onclick="records.splice(${i},1);renderRecords()">删除</button>
+            </div>
+        `).join('');
+    }
+
+    function addRecord() {
+        records.push({zone_id: '', domain: '', name: '@', record_type: 'A', proxied: true, ttl: 1});
+        renderRecords();
+    }
+
+    async function toggleCf() {
+        const enabled = document.getElementById('cf-enabled').checked;
+        await fetch(`/api/config/${currentAccount}/cloudflare_ip/enabled`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled})
+        });
+    }
+
+    async function saveCfConfig() {
+        const payload = {
+            enabled: document.getElementById('cf-enabled').checked,
+            api_token: document.getElementById('cf-api-token').value || null,
+            source_channel: document.getElementById('cf-source-channel').value || null,
+            fetch_limit: parseInt(document.getElementById('cf-fetch-limit').value) || 5,
+            interval_hours: parseFloat(document.getElementById('cf-interval').value) || 0,
+            min_speed_threshold: parseFloat(document.getElementById('cf-min-speed').value) || 0,
+            only_update_if_faster: document.getElementById('cf-only-if-faster').checked,
+            real_time_listen: document.getElementById('cf-real-time').checked,
+            records: records
+        };
+        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.ok) { toast('保存成功', true); loadCfConfig(); loadCfStatus(); }
+        else { toast('保存失败: ' + (data.detail || ''), false); }
+    }
+
+    async function testFetch() {
+        const box = document.getElementById('cf-result');
+        box.innerHTML = '<span class="muted">抓取中...</span>';
+        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/test`, {method: 'POST'});
+        const data = await res.json();
+        let html = '';
+        if (data.ok && data.decision) {
+            const d = data.decision;
+            const badge = d.should_update ? '<span class="badge badge-green">✓ 会更新</span>' : '<span class="badge badge-yellow">⊘ 跳过</span>';
+            html += `<div class="log-line ${d.should_update ? 'log-success' : ''}">${badge} ${escapeHtml(d.reason)}</div>`;
+            html += `<div class="log-line">最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
+            if (d.current_speed) html += `<div class="log-line">当前记录速度: ${d.current_speed.toFixed(2)} MB/s</div>`;
+            if (d.min_speed_threshold > 0) html += `<div class="log-line">阈值: ${d.min_speed_threshold} MB/s</div>`;
+            html += `<div class="log-line">候选 IP 数: ${data.all_ips ? data.all_ips.length : 0}</div>`;
+        } else {
+            html += `<div class="log-line log-error">✗ 未解析到 IP</div>`;
+            html += `<div class="log-line muted">${escapeHtml(data.raw_text_preview || data.detail || '')}</div>`;
+        }
+        box.innerHTML = html;
+    }
+
+    async function triggerUpdate() {
+        const box = document.getElementById('cf-result');
+        box.innerHTML = '<span class="muted">更新中...</span>';
+        const res = await fetch(`/api/config/${currentAccount}/cloudflare_ip/trigger`, {method: 'POST'});
+        const data = await res.json();
+        let html = '';
+        if (data.skipped) {
+            html += `<div class="log-line log-warning">⊘ 跳过: ${escapeHtml(data.skipped_reason || '-')}</div>`;
+            html += `<div class="log-line">最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s)</div>`;
+        } else if (data.ok && data.results) {
+            html += `<div class="log-line log-success">✓ 最快 IP: <b>${escapeHtml(data.fastest_ip)}</b> (${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s) — ${data.results.filter(r=>r.ok).length}/${data.results.length} 成功</div>`;
+            data.results.forEach(r => {
+                html += `<div class="log-line ${r.ok ? '' : 'log-error'}">${r.ok ? '✓' : '✗'} ${escapeHtml(r.name==='@' ? r.domain : r.name+'.'+r.domain)} → ${escapeHtml(r.ip)}${r.error ? ' ('+escapeHtml(r.error)+')' : ''}</div>`;
+            });
+        } else {
+            html += `<div class="log-line log-error">✗ ${escapeHtml(data.detail || data.skipped_reason || JSON.stringify(data))}</div>`;
+        }
+        if (data.current_speed) {
+            html += `<div class="log-line muted">记录速度: ${data.current_speed.toFixed(2)} MB/s → ${data.fastest_speed ? data.fastest_speed.toFixed(2) : '?'} MB/s</div>`;
+        }
+        box.innerHTML = html;
+        // 刷新状态
+        setTimeout(loadCfStatus, 1000);
+    }
+
+    init();
+</script>
+{% endblock %}

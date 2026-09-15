@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query
@@ -473,6 +474,258 @@ async def api_red_packet_enabled(
     config.red_packet.enabled = bool(payload.get("enabled", False))
     store.save_account_config(name, config)
     return {"ok": True, "enabled": config.red_packet.enabled}
+
+
+# --------------------------------------------------------------------------- #
+# Cloudflare 优选 IP 自动更新
+# --------------------------------------------------------------------------- #
+def _mask_api_token(data: dict[str, Any]) -> dict[str, Any]:
+    """api_token 只回显前缀，避免面板把它整串读回去。"""
+    token = data.get("api_token")
+    if token:
+        data["api_token"] = f"{token[:6]}***"
+    return data
+
+
+@router.get("/config/{name}/cloudflare_ip")
+async def api_cloudflare_ip_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    return _mask_api_token(config.cloudflare_ip.model_dump(mode="json"))
+
+
+@router.put("/config/{name}/cloudflare_ip")
+async def api_cloudflare_ip_put(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """保存 Cloudflare IP 配置。
+
+    ⚠️ 面板读回来的 ``api_token`` 是脱敏的（``A1b2C3***``）。
+    若原样提交回来，会把脱敏值当成新 token 存下去。
+    所以：脱敏形态的值一律忽略，保留原有 token。
+    """
+    from tg_assistant.config import CloudflareIPConfig
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+
+    submitted = dict(payload)
+    token = str(submitted.get("api_token") or "")
+    if token.endswith("***"):
+        submitted["api_token"] = config.cloudflare_ip.api_token
+
+    try:
+        config.cloudflare_ip = CloudflareIPConfig.model_validate(submitted)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
+
+    store.save_account_config(name, config)
+    return {"ok": True}
+
+
+@router.put("/config/{name}/cloudflare_ip/enabled")
+async def api_cloudflare_ip_enabled(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    config.cloudflare_ip.enabled = bool(payload.get("enabled", False))
+    store.save_account_config(name, config)
+    return {"ok": True, "enabled": config.cloudflare_ip.enabled}
+
+
+@router.post("/config/{name}/cloudflare_ip/trigger")
+async def api_cloudflare_ip_trigger(
+    name: str,
+    store=Depends(get_store),
+    settings=Depends(get_settings),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """手动触发一次优选 IP 抓取 + DNS 更新。"""
+    from tg_assistant.cloudflare_ip import (
+        fetch_and_update,
+        make_message_source,
+        make_message_source_from_account,
+    )
+
+    _require_account(store, name)
+    account_config = store.load_account_config(name, create=False)
+    cf_config = account_config.cloudflare_ip
+
+    if not cf_config.api_token or not cf_config.source_channel:
+        raise HTTPException(status_code=400, detail="缺少 api_token 或 source_channel")
+
+    # 1. 尝试复用已在运行的账号 client
+    source = None
+    client_to_stop = None
+    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
+    if name in running and runtime._runner is not None:
+        for runner in runtime._runner.runners.values():
+            if runner.name == name and runner.client is not None:
+                source = make_message_source(runner.client)
+                break
+
+    # 2. 没在跑就临时起一个 client
+    if source is None:
+        client, source = await make_message_source_from_account(name, store, settings)
+        client_to_stop = client
+
+    try:
+        from tg_assistant.cloudflare_ip import should_update
+        from tg_assistant.proxy import resolve_proxy
+
+        record = store.require_account(name)
+        proxy = resolve_proxy(record, settings)
+        state = store.load_state(name)
+
+        # 先做一次决策预览
+        fetched_preview = None
+        decision = None
+
+        summary = await fetch_and_update(cf_config, source, state, proxy)
+        # 落盘（速度已在 fetch_and_update 内部写入 state）
+        store.save_state(name, state)
+    finally:
+        if client_to_stop is not None:
+            with contextlib.suppress(Exception):
+                await client_to_stop.stop(block=True)
+
+    return {
+        "ok": summary.all_ok and not summary.skipped,
+        "skipped": summary.skipped,
+        "skipped_reason": summary.skipped_reason,
+        "fastest_ip": summary.fetched.fastest,
+        "fastest_speed": summary.fetched.fastest_speed,
+        "all_ips": summary.fetched.all_ips,
+        "all_speeds": summary.fetched.all_speeds,
+        "current_speed": state.get("cloudflare_ip_last_speed"),
+        "results": [
+            {
+                "domain": r.domain,
+                "name": r.name,
+                "type": r.record_type,
+                "ip": r.ip,
+                "ok": r.ok,
+                "error": r.error,
+            }
+            for r in summary.results
+        ],
+        "updated_at": summary.updated_at,
+    }
+
+
+@router.post("/config/{name}/cloudflare_ip/test")
+async def api_cloudflare_ip_test(
+    name: str,
+    store=Depends(get_store),
+    settings=Depends(get_settings),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """测试抓取频道消息并解析 IP，展示决策结果（不更新 DNS）。"""
+    from tg_assistant.cloudflare_ip import (
+        fetch_ips_from_channel,
+        make_message_source,
+        make_message_source_from_account,
+        should_update,
+    )
+
+    _require_account(store, name)
+    account_config = store.load_account_config(name, create=False)
+    cf_config = account_config.cloudflare_ip
+
+    if not cf_config.source_channel:
+        raise HTTPException(status_code=400, detail="缺少 source_channel")
+
+    source = None
+    client_to_stop = None
+    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
+    if name in running and runtime._runner is not None:
+        for runner in runtime._runner.runners.values():
+            if runner.name == name and runner.client is not None:
+                source = make_message_source(runner.client)
+                break
+
+    if source is None:
+        client, source = await make_message_source_from_account(name, store, settings)
+        client_to_stop = client
+
+    try:
+        fetched = await fetch_ips_from_channel(
+            cf_config.source_channel,
+            cf_config.fetch_limit,
+            source,
+        )
+    finally:
+        if client_to_stop is not None:
+            with contextlib.suppress(Exception):
+                await client_to_stop.stop(block=True)
+
+    # 决策预览
+    state = store.load_state(name)
+    decision = should_update(fetched, cf_config, state) if fetched.has_ip else None
+
+    return {
+        "ok": fetched.has_ip,
+        "fastest_ip": fetched.fastest,
+        "fastest_speed": fetched.fastest_speed,
+        "all_ips": fetched.all_ips,
+        "all_speeds": fetched.all_speeds,
+        "decision": {
+            "should_update": decision.should_update if decision else False,
+            "reason": decision.reason if decision else "未解析到 IP",
+            "current_speed": state.get("cloudflare_ip_last_speed"),
+            "min_speed_threshold": cf_config.min_speed_threshold,
+            "only_update_if_faster": cf_config.only_update_if_faster,
+        } if decision else None,
+        "raw_text_preview": (
+            (fetched.raw_text[:300] + "...")
+            if fetched.raw_text and len(fetched.raw_text) > 300
+            else fetched.raw_text
+        ),
+    }
+
+
+@router.get("/config/{name}/cloudflare_ip/status")
+async def api_cloudflare_ip_status(
+    name: str,
+    store=Depends(get_store),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """获取当前 Cloudflare IP 更新状态（上次更新结果、实时监听状态）。"""
+    from tg_assistant.config import CloudflareIPConfig
+
+    _require_account(store, name)
+    account_config = store.load_account_config(name, create=False)
+    cf_config = account_config.cloudflare_ip
+    state = store.load_state(name)
+
+    # 检查实时监听是否在线
+    listener_running = False
+    running = runtime._running_accounts() if hasattr(runtime, "_running_accounts") else set()
+    if name in running and runtime._runner is not None:
+        for runner in runtime._runner.runners.values():
+            if runner.name == name:
+                listener_running = runner.cf_ip_listener is not None and runner.cf_ip_listener.is_running
+                break
+
+    last_result = state.get("cloudflare_ip_last_result", {})
+    return {
+        "enabled": cf_config.enabled,
+        "real_time_listen": cf_config.real_time_listen,
+        "listener_running": listener_running,
+        "min_speed_threshold": cf_config.min_speed_threshold,
+        "only_update_if_faster": cf_config.only_update_if_faster,
+        "current_ip": state.get("cloudflare_ip_last_ip"),
+        "current_speed": state.get("cloudflare_ip_last_speed"),
+        "last_run": state.get("cloudflare_ip_last_run"),
+        "last_result": last_result,
+        "source_channel": cf_config.source_channel,
+        "records_count": len(cf_config.records),
+    }
 
 
 # --------------------------------------------------------------------------- #

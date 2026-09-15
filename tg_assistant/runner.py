@@ -525,16 +525,19 @@ class AccountRunner:
         config: AccountConfig,
         settings: Settings,
         paths: Paths,
+        store: Optional[Any] = None,
     ) -> None:
         self.record = record
         self.config = config
         self.settings = settings
         self.paths = paths
+        self.store = store
         self.alog = make_account_logger(record.name, "runner")
         self.client: Optional[Client] = None
         self.notifier: Optional[BotNotifier] = None
         self.forwarder: Optional[ForwardEngine] = None
         self.hunter: Optional[RedPacketHunter] = None
+        self.cf_ip_listener: Optional[Any] = None
         self.bundle: Optional[ClientBundle] = None
         self.started_at: Optional[float] = None
         self._stopped = asyncio.Event()
@@ -595,6 +598,21 @@ class AccountRunner:
         self.hunter = RedPacketHunter(self.client, self.config, self.alog, self.notifier)
         await self.hunter.register()
 
+        # Cloudflare 优选 IP 实时监听
+        if self.config.cloudflare_ip.enabled and self.config.cloudflare_ip.real_time_listen:
+            from tg_assistant.cf_ip_listener import CFIPListener
+
+            self.cf_ip_listener = CFIPListener(
+                account_name=self.name,
+                config=self.config.cloudflare_ip,
+                client=self.client,
+                alog=self.alog,
+                store=self.store,
+                settings=self.settings,
+                notifier=self.notifier,
+            )
+            self.cf_ip_listener.register()
+
         self.started_at = time.time()
         if not needs_updates:
             self.alog.warning(
@@ -604,6 +622,9 @@ class AccountRunner:
 
     async def stop(self) -> None:
         self.alog.info("正在停止账号")
+        if self.cf_ip_listener is not None:
+            await self.cf_ip_listener.unregister()
+            self.cf_ip_listener = None
         if self.forwarder is not None:
             await self.forwarder.close()
         if self.hunter is not None:
@@ -759,7 +780,7 @@ class MultiRunner:
                     alog.warning("账号已被禁用，跳过", hint="用 accounts enable 重新启用")
                     return
                 config = self.store.load_account_config(name)
-                runner = AccountRunner(record, config, self.settings, self.store.paths)
+                runner = AccountRunner(record, config, self.settings, self.store.paths, store=self.store)
                 self.runners[name] = runner
                 await runner.start()
                 await runner.run_forever(heartbeat=heartbeat)

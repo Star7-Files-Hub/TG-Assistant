@@ -49,15 +49,21 @@ class RuntimeManager:
 
     # ------------------------------------------------------------------ #
     async def startup(self) -> None:
-        """启动时挂接日志广播。"""
+        """启动时挂接日志广播与优选 IP 定时任务。"""
         self._log_handler = _BroadcastHandler(self._emit_log)
         self._log_handler.setLevel(logging.DEBUG)
         root = logging.getLogger("tg-assistant")
         root.addHandler(self._log_handler)
+        self._cf_ip_task = asyncio.create_task(self._cloudflare_ip_loop(), name="cf-ip-scheduler")
         get_logger().info("Web 运行管理器已就绪", extra={"account": "-", "extra_fields": {}})
 
     async def shutdown(self) -> None:
         """停止全部账号并卸载日志。"""
+        if hasattr(self, "_cf_ip_task") and self._cf_ip_task is not None:
+            self._cf_ip_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cf_ip_task
+            self._cf_ip_task = None
         await self.stop()
         if self._log_handler is not None:
             root = logging.getLogger("tg-assistant")
@@ -67,6 +73,109 @@ class RuntimeManager:
         for queue in list(self._subscribers):
             with contextlib.suppress(Exception):
                 queue.put_nowait({"type": "shutdown"})
+
+    # ------------------------------------------------------------------ #
+    # Cloudflare 优选 IP 定时更新
+    # ------------------------------------------------------------------ #
+    async def _cloudflare_ip_loop(self) -> None:
+        """后台循环：检查所有账号的 Cloudflare IP 定时配置，到期执行。"""
+        from tg_assistant.cloudflare_ip import (
+            fetch_and_update,
+            make_message_source,
+            make_message_source_from_account,
+        )
+        from tg_assistant.proxy import resolve_proxy
+
+        #: 每 60 秒检查一次哪些账号到期了
+        CHECK_INTERVAL = 60.0
+
+        while True:
+            try:
+                await asyncio.sleep(CHECK_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+            try:
+                registry = self.store.load_registry()
+                now = time.time()
+                for record in registry.accounts:  # noqa: BLE001 - 循环内单条失败不影响其它账号
+                    if not record.enabled:
+                        continue
+                    try:
+                        account_config = self.store.load_account_config(record.name, create=False)
+                    except Exception:
+                        continue
+                    cf_config = account_config.cloudflare_ip
+                    if not cf_config.enabled or cf_config.interval_hours <= 0:
+                        continue
+
+                    # 检查是否到期
+                    state = self.store.load_state(record.name)
+                    last_run = state.get("cloudflare_ip_last_run", 0)
+                    interval_sec = cf_config.interval_hours * 3600
+                    if now - last_run < interval_sec:
+                        continue
+
+                    log.info(
+                        "Cloudflare IP 定时更新触发",
+                        extra={"account": record.name, "extra_fields": {"interval_h": cf_config.interval_hours}},
+                    )
+
+                    # 获取消息源
+                    source = None
+                    client_to_stop = None
+                    running = self._running_accounts() if self._runner is not None else set()
+                    if record.name in running and self._runner is not None:
+                        for runner in self._runner.runners.values():
+                            if runner.name == record.name and runner.client is not None:
+                                source = make_message_source(runner.client)
+                                break
+
+                    if source is None:
+                        try:
+                            client, source = await make_message_source_from_account(
+                                record.name, self.store, self.settings
+                            )
+                            client_to_stop = client
+                        except Exception as exc:
+                            log.warning(
+                                "Cloudflare IP：无法创建 client",
+                                extra={"account": record.name, "extra_fields": {"error": str(exc)}},
+                            )
+                            continue
+
+                    try:
+                        proxy = resolve_proxy(record, self.settings)
+                        summary = await fetch_and_update(cf_config, source, state, proxy)
+                        # 记录执行时间（速度已在 fetch_and_update 内部写入 state）
+                        state["cloudflare_ip_last_run"] = now
+                        state["cloudflare_ip_last_result"] = {
+                            "ok": summary.all_ok and not summary.skipped,
+                            "skipped": summary.skipped,
+                            "skipped_reason": summary.skipped_reason,
+                            "ip": summary.fetched.fastest,
+                            "speed": summary.fetched.fastest_speed,
+                            "updated_at": summary.updated_at,
+                            "records_count": len(summary.results),
+                        }
+                        self.store.save_state(record.name, state)
+                    except Exception as exc:
+                        log.exception(
+                            "Cloudflare IP 定时更新失败",
+                            extra={"account": record.name, "extra_fields": {"error": str(exc)}},
+                        )
+                    finally:
+                        if client_to_stop is not None:
+                            with contextlib.suppress(Exception):
+                                await client_to_stop.stop(block=True)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log.exception(
+                    "Cloudflare IP 定时循环异常",
+                    extra={"account": "-", "extra_fields": {"error": str(exc)}},
+                )
 
     # ------------------------------------------------------------------ #
     @property

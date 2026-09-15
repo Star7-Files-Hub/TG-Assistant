@@ -1803,3 +1803,9 @@ tr:hover td { background: var(--bg-hover); }
 .nt-content {
     display: block;
 }
+
+/* Cloudflare 优选 IP */
+.cf-records-list { display: flex; flex-direction: column; gap: 12px; }
+.cf-record-item { padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); }
+.cf-record-item .nt-grid { margin-bottom: 8px; }
+.cf-record-item .btn-danger { margin-top: 4px; }

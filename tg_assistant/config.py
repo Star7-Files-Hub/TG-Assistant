@@ -630,6 +630,104 @@ class RedPacketConfig(StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# Cloudflare 优选 IP 自动更新
+# --------------------------------------------------------------------------- #
+class CloudflareDNSRecord(StrictModel):
+    """一条要更新的 DNS 记录。"""
+
+    #: Cloudflare Zone ID
+    zone_id: str
+    #: 域名（如 example.com）
+    domain: str
+    #: 记录名（如 ``@`` 表示根域、``www`` 表示 ``www.example.com``）
+    name: str = "@"
+    #: 记录类型：A 或 AAAA
+    record_type: Literal["A", "AAAA"] = "A"
+    #: 是否启用 Cloudflare 代理（小黄云），默认开启
+    proxied: bool = True
+    #: TTL（秒），1 = 自动
+    ttl: int = Field(default=1, ge=1, le=86400)
+
+
+class CloudflareIPConfig(StrictModel):
+    """从 Telegram 频道抓取优选 IP 并自动更新 Cloudflare DNS 记录。
+
+    两种触发模式：
+
+    - **实时监听**：账号在线时，源频道一有新消息就立刻解析、决策、更新。
+      需要在 ``source_channel`` 所在会话有读消息权限（频道公开或已加入）。
+    - **定时轮询**：通过 ``interval_hours`` 周期性拉取频道最近消息，
+      适用于不需要「秒级跟进」、或者账号不长期在线的场景。
+
+    决策逻辑（:func:`cloudflare_ip.should_update`）：
+
+    1. 解析出频道消息里「最快」IP 及其速度；
+    2. 速度低于 ``min_speed_threshold`` → 跳过；
+    3. ``only_update_if_faster`` 开启时，对比上次更新记录的速度，
+       新 IP 不比现在快 → 跳过；
+    4. 通过所有检查 → 执行 DNS 更新。
+    """
+
+    enabled: bool = False
+    #: Cloudflare API Token（Zone:DNS 编辑权限）
+    api_token: Optional[str] = None
+    #: 源 Telegram 频道：抓取该频道最近消息中的优选 IP
+    source_channel: Optional[ChatRef] = None
+    #: 抓取最近多少条消息（默认 5 条，一般最快 IP 在最新消息里）
+    fetch_limit: int = Field(default=5, ge=1, le=100)
+    #: 要更新的 DNS 记录列表
+    records: list[CloudflareDNSRecord] = Field(default_factory=list)
+    #: 定时检查间隔（小时），0 = 仅手动触发 / 实时监听
+    interval_hours: float = Field(default=0.0, ge=0.0, le=168.0)
+    #: 最低速度阈值（MB/s）。频道解析出来的最快 IP 低于此值时不更新。
+    #: 0 = 不限制。
+    min_speed_threshold: float = Field(default=0.0, ge=0.0)
+    #: 开启后，更新前会对比当前 DNS 记录对应 IP 的「上次更新速度」，
+    #: 只有新 IP 速度 > 当前速度才更新；否则保留现有记录。
+    only_update_if_faster: bool = True
+    #: 实时监听：账号在线时是否监听源频道的新消息。
+    #: 关闭后只走定时轮询 / 手动触发。
+    real_time_listen: bool = True
+
+    @field_validator("api_token", mode="before")
+    @classmethod
+    def _expand_token(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            expanded = expand_env(value).strip()
+            return expanded or None
+        return value
+
+    @field_validator("source_channel", mode="before")
+    @classmethod
+    def _normalize_channel(cls, value: Any) -> Any:
+        return parse_chat_ref(value)
+
+    @model_validator(mode="after")
+    def _check(self) -> "CloudflareIPConfig":
+        if self.enabled:
+            if not self.api_token:
+                raise ValueError(
+                    "cloudflare_ip.enabled=true 时必须提供 api_token"
+                    "（可用 ${TGA_CF_API_TOKEN}）"
+                )
+            if _looks_unexpanded(self.api_token):
+                raise ValueError(
+                    f"cloudflare_ip.api_token 里的环境变量没有被替换：{self.api_token}。"
+                    "请在 .env 或环境里设置该变量，或直接写 token。"
+                )
+            if self.source_channel is None:
+                raise ValueError(
+                    "cloudflare_ip.enabled=true 时必须提供 source_channel"
+                    "（Telegram 频道 @username 或 chat_id）"
+                )
+            if not self.records:
+                raise ValueError(
+                    "cloudflare_ip.enabled=true 时必须配置至少一条 records"
+                )
+        return self
+
+
+# --------------------------------------------------------------------------- #
 # 账号业务配置
 # --------------------------------------------------------------------------- #
 class AccountConfig(StrictModel):
@@ -639,6 +737,7 @@ class AccountConfig(StrictModel):
     forward: ForwardConfig = Field(default_factory=ForwardConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     red_packet: RedPacketConfig = Field(default_factory=RedPacketConfig)
+    cloudflare_ip: CloudflareIPConfig = Field(default_factory=CloudflareIPConfig)
 
     @classmethod
     def default(cls) -> "AccountConfig":
@@ -647,7 +746,11 @@ class AccountConfig(StrictModel):
     @property
     def needs_updates(self) -> bool:
         """是否需要实时更新流（决定 Client 的 no_updates 取值）。"""
-        return bool(self.forward.active_rules) or self.red_packet.enabled
+        return (
+            bool(self.forward.active_rules)
+            or self.red_packet.enabled
+            or self.cloudflare_ip.enabled
+        )
 
     def watched_chats(self) -> list[ChatRef]:
         """所有需要监听的会话；含空列表规则时返回 ``[]`` 表示"监听全部"。"""
@@ -844,6 +947,8 @@ __all__ = [
     "AccountConfig",
     "AccountRecord",
     "AccountRegistry",
+    "CloudflareDNSRecord",
+    "CloudflareIPConfig",
     "CONFIG_VERSION",
     "ChatRef",
     "ForwardConfig",
