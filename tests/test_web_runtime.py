@@ -15,13 +15,15 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import time
 import types
 from typing import Any
 
 import pytest
 
 from tg_assistant.config import AccountRecord
-from tg_assistant.web.runtime import RuntimeManager
+from tg_assistant.web.runtime import RuntimeManager, cf_backoff_delay
 
 #: 单个用例里允许的最长等待；死锁会以超时形式暴露。
 DEADLOCK_GUARD = 5.0
@@ -461,3 +463,216 @@ def test_broken_config_does_not_break_the_account_list(
         "notify": False,
         "red_packet": False,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 优选 IP 定时任务的「失败退避」
+#
+# 背景：失败**不写** ``cloudflare_ip_last_run``（那是「跑过」的语义，写它会让
+# 面板的「上次更新」说谎）。代价是失败账号会一直处于「已到期」状态 —— 没有退避
+# 就是一个持续失败的账号每 60 秒重试一次，而每次重试都可能另建 client 去抢
+# 同一个 ``.session``，正是当初 189 条 ``database is locked`` 的放大器。
+# --------------------------------------------------------------------------- #
+
+
+class _VirtualTime:
+    """假时钟：``sleep(s)`` 把时间推进 ``s`` 秒，而不是真的睡。"""
+
+    def __init__(self) -> None:
+        self.now = 1_700_000_000.0
+        self.ticks = 0
+        self.limit: int | None = None
+
+    async def sleep(self, seconds: float) -> None:
+        self.ticks += 1
+        if self.limit is not None and self.ticks > self.limit:
+            # 循环只在 ``await asyncio.sleep`` 上捕获 CancelledError，用它收尾最干净。
+            raise asyncio.CancelledError
+        self.now += seconds
+
+
+def _patch_loop_clock(monkeypatch: pytest.MonkeyPatch, clock: _VirtualTime) -> None:
+    """把调度循环里的 ``asyncio.sleep`` / ``time.time`` 换成假时钟。
+
+    用 ``__getattr__`` 代理其余属性，避免把整个 asyncio 模块换掉（循环里只用到
+    ``sleep`` 和 ``CancelledError``，但换掉整个模块太容易踩到别的东西）。
+    """
+    runtime_mod = sys.modules["tg_assistant.web.runtime"]
+
+    class _TimeShim:
+        def __getattr__(self, item: str) -> Any:
+            return getattr(time, item)
+
+        @staticmethod
+        def time() -> float:
+            return clock.now
+
+    class _AsyncioShim:
+        def __getattr__(self, item: str) -> Any:
+            return getattr(asyncio, item)
+
+        @staticmethod
+        async def sleep(seconds: float) -> None:
+            await clock.sleep(seconds)
+
+    monkeypatch.setattr(runtime_mod, "time", _TimeShim())
+    monkeypatch.setattr(runtime_mod, "asyncio", _AsyncioShim())
+
+
+class _LoopStore:
+    """只提供调度循环用到的那几个方法。"""
+
+    def __init__(self, cf_config: Any) -> None:
+        self.cf_config = cf_config
+        self.state: dict[str, Any] = {}
+        self.saved = 0
+
+    def load_registry(self) -> Any:
+        return types.SimpleNamespace(
+            accounts=[types.SimpleNamespace(name="acct", enabled=True)]
+        )
+
+    def load_account_config(self, name: str, create: bool = False) -> Any:
+        return types.SimpleNamespace(cloudflare_ip=self.cf_config)
+
+    def load_state(self, name: str) -> dict[str, Any]:
+        return dict(self.state)
+
+    def save_state(self, name: str, state: dict[str, Any]) -> None:
+        self.state = dict(state)
+        self.saved += 1
+
+
+def _loop_manager(monkeypatch: pytest.MonkeyPatch, store: _LoopStore) -> RuntimeManager:
+    state = types.SimpleNamespace(
+        settings=types.SimpleNamespace(),
+        paths=types.SimpleNamespace(),
+        store=store,
+        web_settings=types.SimpleNamespace(heartbeat_interval=1.0, log_history_size=50),
+    )
+    return RuntimeManager(state)
+
+
+def _cf_config(*, enabled: bool = True, interval_hours: float = 1.0) -> Any:
+    return types.SimpleNamespace(
+        enabled=enabled, interval_hours=interval_hours, split_by_isp=False
+    )
+
+
+def test_cf_backoff_delay_doubles_then_caps() -> None:
+    """60s → 120s → 240s 翻倍，封顶一个调度周期。"""
+    assert cf_backoff_delay(0, 3600.0) == 0.0, "没失败过就不该退避"
+    assert cf_backoff_delay(1, 3600.0) == 60.0
+    assert cf_backoff_delay(2, 3600.0) == 120.0
+    assert cf_backoff_delay(3, 3600.0) == 240.0
+    assert cf_backoff_delay(4, 3600.0) == 480.0
+    # 封顶：退避超过一个正常调度周期就没意义了（到点本来也该再跑）。
+    assert cf_backoff_delay(20, 3600.0) == 3600.0
+    # 周期比基数还短时，至少退避一个基数，否则「退避」等于没退。
+    assert cf_backoff_delay(5, 600.0) == 600.0
+
+
+def test_cf_backoff_gate_and_reset(manager: RuntimeManager) -> None:
+    """退避闸本身：到期后仍要放行过，失败次数累积，成功清零。"""
+    assert manager._cf_backoff_allows("a", 1000.0) is True
+
+    assert manager._cf_note_failure("a", 1000.0, 3600.0) == 60.0
+    assert manager._cf_backoff_allows("a", 1030.0) is False, "还没到点就不该再跑"
+    assert manager._cf_backoff_allows("a", 1060.0) is True
+
+    assert manager._cf_note_failure("a", 1060.0, 3600.0) == 120.0, "第二次失败应翻倍"
+
+    manager._cf_note_success("a")
+    assert manager._cf_backoff_allows("a", 1061.0) is True, "成功后必须立刻恢复"
+    assert "a" not in manager._cf_backoff
+
+
+async def test_cf_loop_backs_off_after_repeated_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归：持续失败时不能每 60 秒重试一次。
+
+    6 次检查（每次间隔 60 秒）本该跑 6 次；有退避后只在第 1、2、4 次跑
+    （第 3、5、6 次被 120s / 240s 的退避挡住）。
+    """
+    clock = _VirtualTime()
+    _patch_loop_clock(monkeypatch, clock)
+    store = _LoopStore(_cf_config(interval_hours=1.0))
+    manager = _loop_manager(monkeypatch, store)
+
+    attempts: list[float] = []
+
+    async def _boom(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(clock.now)
+        raise RuntimeError("session 被占用")
+
+    monkeypatch.setattr(
+        "tg_assistant.cloudflare_ip.make_message_source_from_account", _boom
+    )
+
+    clock.limit = 6
+    await asyncio.wait_for(manager._cloudflare_ip_loop(), DEADLOCK_GUARD)
+
+    assert len(attempts) == 3, f"退避没生效，重试了 {len(attempts)} 次（期望 3 次）"
+    # 失败不落盘：「上次更新」必须保持原样，否则面板会显示成「刚跑过」。
+    assert store.saved == 0
+    assert "cloudflare_ip_last_run" not in store.state
+    assert manager._cf_backoff["acct"][0] == 3
+
+
+async def test_cf_loop_backs_off_when_update_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第二条失败路径（``fetch_and_update`` 抛异常）同样要退避。
+
+    这条分支上 client 是建成功了的 —— 如果只给「建 client 失败」加退避，
+    一个抓不到 IP / 写 DNS 被拒的账号仍会每 60 秒新建一个 client 抢 .session。
+    """
+    clock = _VirtualTime()
+    _patch_loop_clock(monkeypatch, clock)
+    store = _LoopStore(_cf_config(interval_hours=1.0))
+    manager = _loop_manager(monkeypatch, store)
+
+    stopped: list[bool] = []
+
+    class _FakeClient:
+        async def stop(self, block: bool = False) -> None:
+            stopped.append(True)
+
+    async def _fake_source(*args: Any, **kwargs: Any) -> Any:
+        return _FakeClient(), object()
+
+    attempts: list[float] = []
+
+    async def _boom(*args: Any, **kwargs: Any) -> Any:
+        attempts.append(clock.now)
+        raise RuntimeError("Cloudflare 拒绝了写入")
+
+    monkeypatch.setattr(
+        "tg_assistant.cloudflare_ip.make_message_source_from_account", _fake_source
+    )
+    monkeypatch.setattr("tg_assistant.cloudflare_ip.fetch_and_update", _boom)
+    monkeypatch.setattr("tg_assistant.proxy.resolve_proxy", lambda *a, **k: None)
+
+    clock.limit = 6
+    await asyncio.wait_for(manager._cloudflare_ip_loop(), DEADLOCK_GUARD)
+
+    assert len(attempts) == 3, f"退避没生效，重试了 {len(attempts)} 次（期望 3 次）"
+    assert len(stopped) == 3, "临时 client 每次都必须停掉，不能泄漏"
+    assert store.saved == 0
+
+
+async def test_cf_loop_drops_backoff_when_feature_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """功能被关掉就把退避丢掉，别让它留着影响下次重新开启。"""
+    clock = _VirtualTime()
+    _patch_loop_clock(monkeypatch, clock)
+    store = _LoopStore(_cf_config(enabled=False))
+    manager = _loop_manager(monkeypatch, store)
+    manager._cf_backoff["acct"] = (5, clock.now + 99999)
+
+    clock.limit = 1
+    await asyncio.wait_for(manager._cloudflare_ip_loop(), DEADLOCK_GUARD)
+
+    assert "acct" not in manager._cf_backoff

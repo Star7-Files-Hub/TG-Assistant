@@ -18,6 +18,24 @@ log = get_logger("web.runtime")
 #: 停止账号时的优雅退出等待上限（秒），超过才强杀。
 STOP_TIMEOUT = 30.0
 
+#: 优选 IP 定时任务**失败后**的重试退避基数（秒），每次连续失败翻倍。
+CF_RETRY_BACKOFF_BASE = 60.0
+
+
+def cf_backoff_delay(failures: int, interval_sec: float) -> float:
+    """连续失败 ``failures`` 次后，下次允许重试要再等多少秒。
+
+    60s → 120s → 240s … 翻倍，上限 ``max(CF_RETRY_BACKOFF_BASE, interval_sec)``。
+
+    为什么要封顶：失败**不写** ``cloudflare_ip_last_run``（那是「跑过」的语义，
+    写它会让面板的「上次更新」说谎），所以失败账号会一直处于「已到期」状态。
+    退避超过一个正常调度周期就没意义了 —— 到那个点本来也该再跑一次。
+    """
+    if failures <= 0:
+        return 0.0
+    cap = max(CF_RETRY_BACKOFF_BASE, interval_sec)
+    return min(CF_RETRY_BACKOFF_BASE * (2 ** (failures - 1)), cap)
+
 
 @dataclass
 class AccountRuntime:
@@ -69,6 +87,10 @@ class RuntimeManager:
         #: 才把真正的 WebSettings 换进 ``app.state`` 的，此刻读会拿到默认值。
         #: 兜底在 :meth:`_supervise` 里延迟处理。
         self._run_options: dict[str, Any] = dict(run_options or {})
+        #: 优选 IP 定时任务的**失败退避**：账号名 → (连续失败次数, 下次允许执行的时间戳)。
+        #: 只活在内存里，重启即清空 —— 它不是状态，是「别把日志刷爆」的节流器。
+        #: 见 :func:`cf_backoff_delay`。
+        self._cf_backoff: dict[str, tuple[int, float]] = {}
 
     # ------------------------------------------------------------------ #
     async def startup(self) -> None:
@@ -140,6 +162,22 @@ class RuntimeManager:
     # ------------------------------------------------------------------ #
     # Cloudflare 优选 IP 定时更新
     # ------------------------------------------------------------------ #
+    def _cf_backoff_allows(self, name: str, now: float) -> bool:
+        """到期之后再过一道退避闸：``False`` 表示这次先别跑。"""
+        failures, next_allowed = self._cf_backoff.get(name, (0, 0.0))
+        return failures == 0 or now >= next_allowed
+
+    def _cf_note_failure(self, name: str, now: float, interval_sec: float) -> float:
+        """记一次失败，返回本次算出的退避秒数（供日志用）。"""
+        failures = self._cf_backoff.get(name, (0, 0.0))[0] + 1
+        delay = cf_backoff_delay(failures, interval_sec)
+        self._cf_backoff[name] = (failures, now + delay)
+        return delay
+
+    def _cf_note_success(self, name: str) -> None:
+        """跑成功就把退避清零，下次照常按 ``interval_hours`` 调度。"""
+        self._cf_backoff.pop(name, None)
+
     async def _cloudflare_ip_loop(self) -> None:
         """后台循环：检查所有账号的 Cloudflare IP 定时配置，到期执行。"""
         from tg_assistant.cloudflare_ip import (
@@ -171,6 +209,8 @@ class RuntimeManager:
                         continue
                     cf_config = account_config.cloudflare_ip
                     if not cf_config.enabled or cf_config.interval_hours <= 0:
+                        # 关掉功能就把退避丢掉，别让它留着影响下次重新开启。
+                        self._cf_backoff.pop(record.name, None)
                         continue
 
                     # 检查是否到期
@@ -178,6 +218,13 @@ class RuntimeManager:
                     last_run = state.get("cloudflare_ip_last_run", 0)
                     interval_sec = cf_config.interval_hours * 3600
                     if now - last_run < interval_sec:
+                        continue
+
+                    # 失败退避闸。失败**不写** last_run，所以账号会一直「已到期」；
+                    # 没有这道闸就是一个持续失败的账号每 60 秒重试一次，而每次重试
+                    # 都可能另建 client 去抢同一个 .session —— 正是当初 189 条
+                    # ``database is locked`` 的放大器。
+                    if not self._cf_backoff_allows(record.name, now):
                         continue
 
                     log.info(
@@ -207,9 +254,16 @@ class RuntimeManager:
                             )
                             client_to_stop = client
                         except Exception as exc:
+                            delay = self._cf_note_failure(record.name, now, interval_sec)
                             log.warning(
                                 "Cloudflare IP：无法创建 client",
-                                extra={"account": record.name, "extra_fields": {"error": str(exc)}},
+                                extra={
+                                    "account": record.name,
+                                    "extra_fields": {
+                                        "error": str(exc),
+                                        "retry_in_s": round(delay, 1),
+                                    },
+                                },
                             )
                             continue
 
@@ -221,10 +275,18 @@ class RuntimeManager:
                         persist_run(
                             self.store, record.name, state, summary, cf_config, now=now
                         )
+                        self._cf_note_success(record.name)
                     except Exception as exc:
+                        delay = self._cf_note_failure(record.name, now, interval_sec)
                         log.exception(
                             "Cloudflare IP 定时更新失败",
-                            extra={"account": record.name, "extra_fields": {"error": str(exc)}},
+                            extra={
+                                "account": record.name,
+                                "extra_fields": {
+                                    "error": str(exc),
+                                    "retry_in_s": round(delay, 1),
+                                },
+                            },
                         )
                     finally:
                         if client_to_stop is not None:
