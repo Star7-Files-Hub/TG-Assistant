@@ -146,7 +146,7 @@ class RuntimeManager:
             fetch_and_update,
             make_message_source,
             make_message_source_from_account,
-            summary_to_last_result,
+            persist_run,
         )
         from tg_assistant.proxy import resolve_proxy
 
@@ -216,14 +216,11 @@ class RuntimeManager:
                     try:
                         proxy = resolve_proxy(record, self.settings)
                         summary = await fetch_and_update(cf_config, source, state, proxy)
-                        # 记录执行时间（速度已在 fetch_and_update 内部写入 state）
-                        state["cloudflare_ip_last_run"] = now
-                        # ⚠️ 必须和手动「立即触发」共用这一个函数，
-                        # 否则两条路径写出来的「上次结果」会不一致。
-                        state["cloudflare_ip_last_result"] = summary_to_last_result(
-                            summary, cf_config
+                        # 「上次结果」和「上次更新」都由 persist_run 统一写 ——
+                        # 手动触发 / 实时监听走的是同一个函数，三条路径不会各写各的。
+                        persist_run(
+                            self.store, record.name, state, summary, cf_config, now=now
                         )
-                        self.store.save_state(record.name, state)
                     except Exception as exc:
                         log.exception(
                             "Cloudflare IP 定时更新失败",

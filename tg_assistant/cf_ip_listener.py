@@ -25,6 +25,7 @@ from .cloudflare_ip import (
     fetch_and_update,
     make_message_source,
     parse_ips_from_text,
+    persist_run,
     should_update,
 )
 from .config import CloudflareIPConfig
@@ -149,8 +150,11 @@ class CFIPListener:
 
         summary = await fetch_and_update(self.config, source, state, proxy)
 
-        # 落盘
-        self.store.save_state(self.account_name, state)
+        # 落盘：三条路径（调度 / 手动触发 / 这里）统一走 persist_run，
+        # 否则频道一发新消息就更新了 DNS，面板却还显示上一次的结果和时间。
+        # ⚠️ 上面「单条预检不过就 return」的分支**故意不落盘** ——
+        # 频道每条消息都写一次 state.json 没必要，那次跳过交给定时调度记录。
+        persist_run(self.store, self.account_name, state, summary, self.config)
 
         # 通知
         if summary.skipped:

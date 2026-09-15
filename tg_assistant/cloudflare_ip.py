@@ -8,13 +8,17 @@
    ≤ 现在 → 放弃；
 4. 通过全部检查 → 执行 DNS 更新，并把新速度写入 ``state.json`` 供下次对比。
 
-调用方只需把 ``state`` 字典传来、决策通过后自己落盘即可，本模块不直接碰
-``store``，保持轻量、可单独测试。
+调用方只需把 ``state`` 字典传来、决策通过后自己落盘即可。
+
+唯一的例外是 :func:`persist_run` —— 它负责把「本次执行」写进 ``state`` 并落盘。
+**定时调度 / 手动触发 / 实时监听三条路径都必须调它**（见该函数的 docstring），
+字段名因此只存在于一处，不会各写各的。
 """
 
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -213,6 +217,36 @@ def summary_to_last_result(
             for isp, d in summary.decisions.items()
         ],
     }
+
+
+def persist_run(
+    store: Any,
+    account_name: str,
+    state: dict[str, Any],
+    summary: "UpdateSummary",
+    config: "CloudflareIPConfig",
+    *,
+    now: Optional[float] = None,
+) -> None:
+    """把「本次执行」写进 ``state`` 并落盘。
+
+    ⚠️ **三条会执行 ``fetch_and_update`` 的路径都必须调这个函数**：
+
+    1. 定时调度 —— ``web/runtime.py:_cloudflare_ip_loop``
+    2. 手动触发 —— ``web/routers/api.py`` 的 ``trigger``
+    3. 实时监听 —— ``cf_ip_listener.py`` 收到频道新消息时
+
+    少写任何一处，面板上的「上次结果 / 上次更新」就会挂着**别的路径**留下的陈旧值
+    （线上就出现过：手动触发三条记录全写成功，面板还显示上一次调度留下的
+    「97.96 MB/s（失败）」，用户据此以为功能坏了）。
+
+    ``cloudflare_ip_last_run`` 还有第二重身份：调度器的到期判据
+    （``now - last_run >= interval_hours * 3600``）。所以刚跑过就顺延一个 interval
+    —— 这是想要的：既然刚刚真跑了，就没必要马上再跑一遍。
+    """
+    state["cloudflare_ip_last_run"] = time.time() if now is None else now
+    state["cloudflare_ip_last_result"] = summary_to_last_result(summary, config)
+    store.save_state(account_name, state)
 
 
 def _is_valid_ipv4(ip: str) -> bool:

@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -31,6 +34,7 @@ from tg_assistant.cloudflare_ip import (
     _resolve_record,
     aggregate_messages,
     parse_isp,
+    persist_run,
     should_update_isp,
     summary_to_last_result,
     threshold_for,
@@ -1046,3 +1050,174 @@ class TestTriggerPersistsLastResult:
         status = client.get("/api/config/acct/cloudflare_ip/status").json()
         assert status["last_result"]["ok_count"] == 3
         assert status["last_result"]["split_by_isp"] is True
+
+
+class TestPersistRun:
+    """三条执行路径（定时调度 / 手动触发 / 实时监听）共用的落盘函数。
+
+    ⚠️ 这个函数存在的唯一理由就是**防漂移**：字段名只在一处，
+    谁再加一条执行路径都只能调它，不会各写各的。
+    """
+
+    class _Store:
+        def __init__(self):
+            self.saved: list[tuple[str, dict]] = []
+
+        def save_state(self, name, state):
+            self.saved.append((name, dict(state)))
+
+    def test_writes_both_keys_and_saves(self):
+        store = self._Store()
+        state = {}
+        config = CloudflareIPConfig(split_by_isp=True)
+
+        persist_run(store, "acct", state, _split_summary(), config, now=1234.5)
+
+        assert state["cloudflare_ip_last_run"] == 1234.5
+        assert state["cloudflare_ip_last_result"]["ok_count"] == 3
+        assert state["cloudflare_ip_last_result"]["split_by_isp"] is True
+        assert len(store.saved) == 1
+        assert store.saved[0][0] == "acct"
+
+    def test_now_defaults_to_wall_clock(self):
+        store = self._Store()
+        state = {}
+        before = time.time()
+
+        persist_run(store, "acct", state, _split_summary(), CloudflareIPConfig())
+
+        assert before <= state["cloudflare_ip_last_run"] <= time.time()
+
+    def test_existing_state_keys_are_kept(self):
+        """只更新这两个字段，别把 fetch_and_update 写的速度覆盖掉。"""
+        store = self._Store()
+        state = {"cloudflare_ip_last_speed_by_isp": {"mobile": 30.0}}
+
+        persist_run(store, "acct", state, _split_summary(), CloudflareIPConfig())
+
+        assert state["cloudflare_ip_last_speed_by_isp"] == {"mobile": 30.0}
+
+
+class TestListenerPersistsRun:
+    """🔴 回归：实时监听（频道来新消息）原来也不写 last_result / last_run。
+
+    后果和手动触发那条一样：频道一发新消息就更新了 DNS，
+    面板却还显示上一次调度留下的结果和时间。
+    """
+
+    @staticmethod
+    def _listener(store, alog, *, split_by_isp: bool):
+        from tg_assistant.cf_ip_listener import CFIPListener
+        from tg_assistant.config import AccountRecord, utc_now_iso
+
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        config = store.load_account_config("acct", create=True)
+        config.cloudflare_ip.api_token = "tok"
+        config.cloudflare_ip.source_channel = "-1003372470551"
+        config.cloudflare_ip.records = [
+            CloudflareDNSRecord(
+                zone_id="zone", domain="example.cc", name="yx", record_type="A"
+            )
+        ]
+        config.cloudflare_ip.split_by_isp = split_by_isp
+        config.cloudflare_ip.enabled = True
+        store.save_account_config("acct", config)
+
+        return CFIPListener(
+            "acct",
+            config.cloudflare_ip,
+            client=object(),
+            alog=alog,
+            store=store,
+            settings=object(),
+        )
+
+    @staticmethod
+    def _message():
+        import types
+
+        return types.SimpleNamespace(text=MOBILE_TEXT, id=42)
+
+    async def test_listener_writes_last_result(self, store, alog, monkeypatch):
+        import types
+
+        import tg_assistant.cf_ip_listener as listener_mod
+        import tg_assistant.proxy as proxy_mod
+
+        listener = self._listener(store, alog, split_by_isp=True)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            return _split_summary()
+
+        monkeypatch.setattr(listener_mod, "fetch_and_update", fake_fetch)
+        monkeypatch.setattr(listener_mod, "make_message_source", lambda c: object())
+        monkeypatch.setattr(proxy_mod, "resolve_proxy", lambda *a, **k: None)
+
+        await listener._on_message(types.SimpleNamespace(), self._message())
+
+        state = store.load_state("acct")
+        last = state.get("cloudflare_ip_last_result")
+        assert last is not None, "实时监听必须落盘「上次结果」"
+        assert last["ok_count"] == 3
+        assert state.get("cloudflare_ip_last_run"), "实时监听必须刷新「上次更新」"
+
+    async def test_single_precheck_skip_does_not_churn_state(
+        self, store, alog, monkeypatch
+    ):
+        """不分流时「单条预检不过」**故意不落盘** ——
+
+        频道每条消息都写一次 state.json 没必要，那次跳过交给定时调度去记。
+        """
+        import types
+
+        import tg_assistant.cf_ip_listener as listener_mod
+        import tg_assistant.proxy as proxy_mod
+
+        listener = self._listener(store, alog, split_by_isp=False)
+        # 阈值拉到 1000，27.96 MB/s 必然过不了
+        listener.config.min_speed_threshold = 1000.0
+
+        called = {"fetch": False}
+
+        async def fake_fetch(config, source, state, proxy=None):
+            called["fetch"] = True
+            return _split_summary()
+
+        monkeypatch.setattr(listener_mod, "fetch_and_update", fake_fetch)
+        monkeypatch.setattr(listener_mod, "make_message_source", lambda c: object())
+        monkeypatch.setattr(proxy_mod, "resolve_proxy", lambda *a, **k: None)
+
+        await listener._on_message(types.SimpleNamespace(), self._message())
+
+        assert called["fetch"] is False, "预检不过就不该发起抓取"
+        assert store.load_state("acct").get("cloudflare_ip_last_result") is None
+
+
+class TestAllPathsUsePersistRun:
+    """契约：三条执行路径都必须调 ``persist_run``。
+
+    「某条路径忘了落盘」这个 bug 已经犯过两次（手动触发、实时监听），
+    所以钉一条静态契约 —— 谁再把 `persist_run(...)` 换成裸 `save_state`，
+    或者又在调用方手写 `state["cloudflare_ip_last_*"]`，这里立刻红。
+    """
+
+    #: 会执行 fetch_and_update 的三条路径
+    PATHS = ("web/runtime.py", "web/routers/api.py", "cf_ip_listener.py")
+
+    def test_every_path_calls_persist_run(self):
+        root = Path(__file__).resolve().parents[1] / "tg_assistant"
+        for rel in self.PATHS:
+            src = (root / rel).read_text(encoding="utf-8")
+            assert "persist_run(" in src, f"{rel} 没有调用 persist_run，面板会显示陈旧结果"
+
+    def test_no_path_hand_writes_the_state_keys(self):
+        """字段名只许出现在 cloudflare_ip.py 里（persist_run 内部）。"""
+        root = Path(__file__).resolve().parents[1] / "tg_assistant"
+        for rel in self.PATHS:
+            src = (root / rel).read_text(encoding="utf-8")
+            assert 'state["cloudflare_ip_last_result"]' not in src, (
+                f"{rel} 还在手写 last_result，应该改用 persist_run"
+            )
+            assert 'state["cloudflare_ip_last_run"]' not in src, (
+                f"{rel} 还在手写 last_run，应该改用 persist_run"
+            )
