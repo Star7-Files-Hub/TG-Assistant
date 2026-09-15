@@ -3,41 +3,27 @@
 
 {% block content %}
 <div class="rules-page">
-    <!-- 页面头部 -->
+    <!-- 页面头部。
+         这里原来有一个「先选账号」的下拉框：没选账号就不能建规则，整个列表也是空的。
+         规则本来就是按账号存的，但「建规则之前必须先挑账号」纯属多余 —— 现在改成
+         在弹窗里勾账号，一个都不勾就是全部账号。页面一次性列出所有账号的规则。 -->
     <div class="rules-header">
         <div class="rules-header-left">
             <h1>转发规则</h1>
-            <p class="text-muted">管理正则表达式转发规则，可视化配置消息转发</p>
+            <p class="text-muted">
+                规则按账号独立保存；新建时不勾账号 = 写入全部账号。
+                改完规则要重启账号才生效。
+            </p>
         </div>
         <div class="rules-header-right">
-            <div class="rules-account-select">
-                <label>账号</label>
-                <select id="account-selector" onchange="switchAccount()">
-                    <option value="">选择账号...</option>
-                </select>
-            </div>
-            <div id="account-status" class="rules-account-status" style="display:none;">
-                <span class="status-dot" id="status-dot"></span>
-                <span id="status-text" class="text-muted">未运行</span>
-            </div>
-            <!-- 转发总开关。CSS（.rules-master-toggle）与 JS（loadRules / toggleForward）
-                 都早就写好了，只有这段 HTML 丢了 —— 结果是 loadRules() 在
-                 getElementById('forward-enabled') 上抛 TypeError，后面的
-                 renderRules() 根本不执行，整个规则列表永远渲染不出来。 -->
-            <label class="rules-master-toggle" id="master-toggle" style="display:none;">
-                <input type="checkbox" id="forward-enabled" onchange="toggleForward()" />
-                <span class="toggle-slider"></span>
-                <span class="toggle-label">转发总开关</span>
-            </label>
-            <button class="tg-btn tg-btn-sm" id="btn-start-account" onclick="startAccount()" style="display:none;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                启动
+            <button class="tg-btn tg-btn-ghost" onclick="loadAll()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                    <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+                </svg>
+                刷新
             </button>
-            <button class="tg-btn tg-btn-sm tg-btn-danger" id="btn-stop-account" onclick="stopAccount()" style="display:none;">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-                停止
-            </button>
-            <button class="tg-btn tg-btn-primary" onclick="openAddRule()" id="btn-add-rule" style="display:none;">
+            <button class="tg-btn tg-btn-primary" id="btn-add-rule" onclick="openAddRule()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
                 </svg>
@@ -46,14 +32,14 @@
         </div>
     </div>
 
-    <!-- 规则列表 -->
+    <!-- 规则列表：按账号分组渲染，每组的标题栏带该账号的转发总开关与启停 -->
     <div class="rules-list" id="rules-list">
         <div class="rules-empty" id="rules-empty">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+                <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
             </svg>
-            <h3>请先选择账号</h3>
-            <p>从上方下拉框选择一个账号来管理其转发规则</p>
+            <h3>正在加载…</h3>
+            <p>稍等一下</p>
         </div>
     </div>
 </div>
@@ -90,6 +76,15 @@
                         <span class="tg-checkmark"></span>
                         <span>启用规则</span>
                     </label>
+                </div>
+
+                <!-- 应用账号：不勾 = 全部账号。放在这里而不是页面顶部，
+                     这样「建规则」和「选账号」是同一个动作，不用先切换页面上下文。 -->
+                <div class="form-section">
+                    <h3>应用账号</h3>
+                    <p class="form-hint" id="rule-accounts-hint">不勾选任何账号 = 写入全部账号</p>
+                    <div class="form-grid" id="rule-accounts"></div>
+                    <p class="form-hint" id="rule-accounts-summary"></p>
                 </div>
 
                 <!-- 来源 -->
@@ -254,11 +249,12 @@
 
 {% block scripts %}
 <script>
-    // 全局数据
-    let ruleData = { rules: [], enabled: false };
+    // accounts 里每个元素都带着自己的 rules / forward_enabled / running ——
+    // 一次 GET /api/rules 就够渲染整页，不用再单独拉 /api/status。
     let accounts = [];
-    let currentAccount = '';
     let editingRuleId = null;
+    // 编辑时这条规则当前落在哪些账号（用来锁定弹窗里的账号选择器）
+    let editingOwners = [];
 
     // Tag input 数据
     const tagInputs = {
@@ -268,7 +264,6 @@
 
     // 初始化
     async function init() {
-        await loadAccounts();
         initTagInputs();
         // 模式切换
         document.getElementById('match-mode').addEventListener('change', function() {
@@ -280,127 +275,153 @@
         // 自动测试
         document.getElementById('test-text').addEventListener('input', debounce(testRegex, 500));
         document.getElementById('patterns-field').addEventListener('change', debounce(testRegex, 300));
+        // 弹窗里的账号勾选 → 更新「将写入：…」摘要
+        document.getElementById('rule-accounts').addEventListener('change', updateAccountSummary);
+        // 规则列表里的按钮与开关一律走事件委托。原因是 rule.id 由用户随便填，
+        // 把它拼进内联 handler 的字符串参数里，只要带一个单引号就会把属性截断
+        // （甚至注入 JS）—— HTML 转义救不了内联 handler，因为浏览器会先把
+        // &amp;#39; 解码回单引号再交给 JS 解析。data-* 属性 + 委托没有这个问题。
+        const list = document.getElementById('rules-list');
+        list.addEventListener('click', onRuleListClick);
+        list.addEventListener('change', onRuleListChange);
+        // 标签上的删除按钮同理（虽然 field 来自固定列表、index 是数字，
+        // 但让「内联 handler 不带数据」这条约束没有例外更省心）
+        document.getElementById('rule-modal').addEventListener('click', onModalClick);
+        await loadAll();
     }
 
-    async function loadAccounts() {
-        const res = await fetch('/api/accounts');
-        const data = await res.json();
-        accounts = data.accounts;
-        const sel = document.getElementById('account-selector');
-        sel.innerHTML = '<option value="">选择账号...</option>';
-        accounts.forEach(a => {
-            sel.innerHTML += `<option value="${a.name}">${a.name} ${a.user ? '(' + a.user + ')' : ''}</option>`;
-        });
-        if (accounts.length > 0) {
-            sel.value = accounts[0].name;
-            switchAccount();
-        }
-    }
-
-    async function switchAccount() {
-        const sel = document.getElementById('account-selector');
-        currentAccount = sel.value;
-        document.getElementById('btn-add-rule').style.display = currentAccount ? 'inline-flex' : 'none';
-        document.getElementById('account-status').style.display = currentAccount ? 'flex' : 'none';
-        document.getElementById('master-toggle').style.display = currentAccount ? 'flex' : 'none';
-        document.getElementById('btn-start-account').style.display = currentAccount ? 'inline-flex' : 'none';
-        document.getElementById('btn-stop-account').style.display = currentAccount ? 'inline-flex' : 'none';
-        if (!currentAccount) {
-            document.getElementById('rules-list').innerHTML = `
-                <div class="rules-empty" id="rules-empty">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-                    <h3>请先选择账号</h3>
-                    <p>从上方下拉框选择一个账号来管理其转发规则</p>
-                </div>`;
+    // ==================== 数据 ====================
+    async function loadAll() {
+        let data;
+        try {
+            const res = await fetch('/api/rules');
+            if (!res.ok) { toast('规则加载失败', false); return; }
+            data = await res.json();
+        } catch (err) {
+            toast('规则加载失败：' + err, false);
             return;
         }
-        await loadRules();
-        await refreshAccountStatus();
-    }
-
-    async function refreshAccountStatus() {
-        if (!currentAccount) return;
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        const account = data.accounts.find(a => a.name === currentAccount);
-        if (account) {
-            const dot = document.getElementById('status-dot');
-            const text = document.getElementById('status-text');
-            if (account.running) {
-                dot.className = 'status-dot status-running';
-                text.textContent = '运行中';
-            } else if (account.session_exists) {
-                dot.className = 'status-dot status-stopped';
-                text.textContent = '已登录';
-            } else {
-                dot.className = 'status-dot status-offline';
-                text.textContent = '未登录';
-            }
-        }
-    }
-
-    async function startAccount() {
-        if (!currentAccount) { toast('请先选择账号', false); return; }
-        const res = await fetch(`/api/run/start/${currentAccount}`, {method: 'POST'});
-        const data = await res.json();
-        if (data.ok) {
-            toast('启动成功', true);
-        } else {
-            toast(data.message || '启动失败', false);
-        }
-        setTimeout(refreshAccountStatus, 2000);
-    }
-
-    async function stopAccount() {
-        if (!currentAccount) { toast('请先选择账号', false); return; }
-        const res = await fetch(`/api/run/stop/${currentAccount}`, {method: 'POST'});
-        const data = await res.json();
-        if (data.ok) {
-            toast('已停止', true);
-        } else {
-            toast(data.message || '停止失败', false);
-        }
-        setTimeout(refreshAccountStatus, 2000);
-    }
-
-    async function loadRules() {
-        const res = await fetch(`/api/config/${currentAccount}/rules`);
-        if (!res.ok) return;
-        ruleData = await res.json();
-        document.getElementById('forward-enabled').checked = ruleData.enabled;
+        accounts = data.accounts || [];
+        const btn = document.getElementById('btn-add-rule');
+        btn.disabled = accounts.length === 0;
+        btn.title = accounts.length === 0 ? '还没有账号，先去「账号」页添加' : '';
         renderRules();
     }
 
+    function accountByName(name) {
+        return accounts.find(a => a.name === name);
+    }
+
+    // 找出某个 rule id 落在哪些账号里（规则级操作都是「所有拥有者一起改」）
+    function findRule(ruleId) {
+        const owners = [];
+        let rule = null;
+        accounts.forEach(acc => {
+            const hit = acc.rules.find(r => r.id === ruleId);
+            if (hit) {
+                owners.push(acc.name);
+                if (!rule) rule = hit;
+            }
+        });
+        return rule ? {rule: rule, owners: owners} : null;
+    }
+
+    function statusOf(acc) {
+        if (acc.running) return {cls: 'status-running', text: '运行中'};
+        if (acc.session_exists) return {cls: 'status-stopped', text: '已登录'};
+        return {cls: 'status-offline', text: '未登录'};
+    }
+
+    // ==================== 渲染 ====================
     function renderRules() {
         const list = document.getElementById('rules-list');
-        const rules = ruleData.rules;
-        if (rules.length === 0) {
-            list.innerHTML = `
-                <div class="rules-empty" id="rules-empty">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
-                    <h3>还没有转发规则</h3>
-                    <p>点击右上角「新建规则」开始创建</p>
-                </div>`;
+        if (accounts.length === 0) {
+            list.innerHTML = emptyBlock('还没有账号', '先去「账号」页添加一个 Telegram 账号，再回来配转发规则');
             return;
         }
-        list.innerHTML = rules.map(rule => `
-            <div class="rule-card ${rule.enabled ? '' : 'rule-disabled'}" data-id="${rule.id}">
+        if (accounts.every(acc => acc.rules.length === 0)) {
+            list.innerHTML = emptyBlock(
+                '还没有转发规则',
+                '点击右上角「新建规则」开始创建；弹窗里一个账号都不勾就是写入全部账号'
+            );
+            return;
+        }
+        list.innerHTML = accounts.map(renderAccountGroup).join('');
+    }
+
+    function emptyBlock(title, desc) {
+        return `
+            <div class="rules-empty" id="rules-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                <h3>${title}</h3>
+                <p>${desc}</p>
+            </div>`;
+    }
+
+    function renderAccountGroup(acc) {
+        const st = statusOf(acc);
+        const rules = acc.rules || [];
+        return `
+            <div class="rules-account-group" data-account="${escapeHtml(acc.name)}">
+                <div class="rules-account-group-header">
+                    <div class="rules-account-group-title">
+                        <span class="status-dot ${st.cls}"></span>
+                        <span class="rules-account-name">${escapeHtml(acc.name)}</span>
+                        ${acc.username ? `<span class="rules-account-user">@${escapeHtml(acc.username)}</span>` : ''}
+                        <span class="rules-account-count">${st.text} · ${rules.length} 条规则</span>
+                    </div>
+                    <div class="rules-account-group-actions">
+                        <label class="rules-master-toggle" title="该账号的转发总开关（改完规则要重启账号才生效）">
+                            <input type="checkbox" data-role="forward-enabled" ${acc.forward_enabled ? 'checked' : ''} />
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">转发总开关</span>
+                        </label>
+                        <button class="tg-btn tg-btn-sm" data-action="start" title="启动该账号">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                            启动
+                        </button>
+                        <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="stop" title="停止该账号">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                            停止
+                        </button>
+                    </div>
+                </div>
+                <div class="rules-account-group-body">
+                    ${rules.length
+                        ? rules.map(rule => renderRuleCard(acc, rule)).join('')
+                        : '<p class="rules-account-empty">该账号还没有规则</p>'}
+                </div>
+            </div>`;
+    }
+
+    function renderRuleCard(acc, rule) {
+        const match = rule.match || {};
+        const patterns = match.patterns || [];
+        const sources = rule.sources || [];
+        const targets = rule.targets || [];
+        // 同一条规则通常会被扇出到多个账号，各存一份。标出「别处也有」，
+        // 否则用户会以为删了这里就删干净了（其实每份都是独立的）。
+        const shared = accounts
+            .filter(other => other.name !== acc.name && (other.rules || []).some(r => r.id === rule.id))
+            .map(other => other.name);
+        return `
+            <div class="rule-card ${rule.enabled ? '' : 'rule-disabled'}" data-rule-id="${escapeHtml(rule.id)}">
                 <div class="rule-card-header">
                     <div class="rule-card-title">
                         <label class="tg-checkbox rule-toggle">
-                            <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="toggleRule('${rule.id}', this.checked)" onclick="event.stopPropagation()" />
+                            <input type="checkbox" data-role="rule-enabled" ${rule.enabled ? 'checked' : ''} />
                             <span class="tg-checkmark"></span>
                         </label>
                         <div>
-                            <div class="rule-name">${rule.name || rule.id}</div>
-                            <div class="rule-id">${rule.id}</div>
+                            <div class="rule-name">${escapeHtml(rule.name || rule.id)}</div>
+                            <div class="rule-id">${escapeHtml(rule.id)}</div>
                         </div>
                     </div>
                     <div class="rule-card-actions">
-                        <button class="tg-btn tg-btn-sm tg-btn-ghost" onclick="editRule('${rule.id}')" title="编辑">
+                        <button class="tg-btn tg-btn-sm tg-btn-ghost" data-action="edit" title="编辑">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                         </button>
-                        <button class="tg-btn tg-btn-sm tg-btn-danger" onclick="deleteRule('${rule.id}')" title="删除">
+                        <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="delete" title="删除">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
                         </button>
                     </div>
@@ -409,32 +430,142 @@
                     <div class="rule-flow">
                         <div class="rule-flow-item">
                             <div class="rule-flow-label">来源</div>
-                            <div class="rule-flow-value">${rule.sources && rule.sources.length > 0 ? rule.sources.map(s => `<span class="rule-tag">${s}</span>`).join('') : '<span class="rule-tag rule-tag-all">全部频道</span>'}</div>
+                            <div class="rule-flow-value">${sources.length > 0 ? sources.map(s => `<span class="rule-tag">${escapeHtml(s)}</span>`).join('') : '<span class="rule-tag rule-tag-all">全部频道</span>'}</div>
                         </div>
                         <div class="rule-flow-arrow">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
                         </div>
                         <div class="rule-flow-item">
                             <div class="rule-flow-label">目标</div>
-                            <div class="rule-flow-value">${rule.targets.map(t => `<span class="rule-tag rule-tag-target">${t}</span>`).join('')}</div>
+                            <div class="rule-flow-value">${targets.map(t => `<span class="rule-tag rule-tag-target">${escapeHtml(t)}</span>`).join('')}</div>
                         </div>
                     </div>
-                    ${rule.match && rule.match.patterns && rule.match.patterns.length > 0 ? `
+                    ${patterns.length > 0 ? `
                     <div class="rule-match">
                         <div class="rule-match-label">
-                            <span class="badge-mode badge-${rule.match.mode}">${({regex:'正则',contains:'包含',exact:'精确',all:'全部'})[rule.match.mode] || rule.match.mode}</span>
+                            <span class="badge-mode badge-${match.mode}">${({regex:'正则',contains:'包含',exact:'精确',all:'全部'})[match.mode] || match.mode}</span>
                         </div>
                         <div class="rule-patterns">
-                            ${rule.match.patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('')}
+                            ${patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('')}
                         </div>
                     </div>` : ''}
+                    ${shared.length > 0 ? `<p class="rule-shared">这条规则也存在于 ${shared.map(escapeHtml).join('、')} —— 编辑 / 删除 / 启停会对所有账号一起生效</p>` : ''}
                 </div>
-            </div>
-        `).join('');
+            </div>`;
     }
 
+    // 转义到「能安全放进双引号属性」的程度（多了引号两兄弟：
+    // data-* 属性里带引号同样会把属性截断）。
     function escapeHtml(s) {
-        return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        return String(s === null || s === undefined ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // ==================== 列表事件（委托） ====================
+    function onRuleListClick(event) {
+        const btn = event.target.closest('[data-action]');
+        if (!btn) return;
+        const group = btn.closest('[data-account]');
+        const card = btn.closest('[data-rule-id]');
+        const account = group ? group.dataset.account : '';
+        const ruleId = card ? card.dataset.ruleId : '';
+        const action = btn.dataset.action;
+        if (action === 'start') startAccount(account);
+        else if (action === 'stop') stopAccount(account);
+        else if (action === 'edit') editRule(account, ruleId);
+        else if (action === 'delete') deleteRule(account, ruleId);
+    }
+
+    function onRuleListChange(event) {
+        const input = event.target;
+        if (!input.dataset || !input.dataset.role) return;
+        const group = input.closest('[data-account]');
+        const card = input.closest('[data-rule-id]');
+        if (input.dataset.role === 'forward-enabled' && group) {
+            setForwardEnabled(group.dataset.account, input.checked);
+        } else if (input.dataset.role === 'rule-enabled' && card) {
+            setRuleEnabled(card.dataset.ruleId, input.checked);
+        }
+    }
+
+    // ==================== 账号级操作 ====================
+    async function startAccount(name) {
+        if (!name) return;
+        const res = await fetch(`/api/run/start/${encodeURIComponent(name)}`, {method: 'POST'});
+        const data = await res.json().catch(() => ({}));
+        toast(data.ok ? `已启动「${name}」` : (detailText(data) || '启动失败'), !!data.ok);
+        setTimeout(loadAll, 1500);
+    }
+
+    async function stopAccount(name) {
+        if (!name) return;
+        const res = await fetch(`/api/run/stop/${encodeURIComponent(name)}`, {method: 'POST'});
+        const data = await res.json().catch(() => ({}));
+        toast(data.ok ? `已停止「${name}」` : (detailText(data) || '停止失败'), !!data.ok);
+        setTimeout(loadAll, 1500);
+    }
+
+    async function setForwardEnabled(name, enabled) {
+        const res = await fetch(`/api/config/${encodeURIComponent(name)}/forward-enabled`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: enabled})
+        });
+        if (res.ok) {
+            toast(enabled ? `已开启「${name}」的转发` : `已关闭「${name}」的转发`, true);
+            return;
+        }
+        // 保存失败就把开关拨回去：否则界面显示"已开启"而后端其实没变，
+        // 用户会以为转发在跑，实际一条都发不出去。
+        const data = await res.json().catch(() => ({}));
+        toast(detailText(data) || '保存失败', false);
+        await loadAll();
+    }
+
+    // ==================== 规则级操作（作用于所有拥有该规则的账号） ====================
+    async function setRuleEnabled(ruleId, enabled) {
+        const found = findRule(ruleId);
+        if (!found) return;
+        const res = await fetch(`/api/rules/${encodeURIComponent(ruleId)}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({rule: {...found.rule, enabled: enabled}})
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            const n = (data.updated || []).length;
+            toast(`${enabled ? '已启用' : '已停用'}规则（${n} 个账号）`, true);
+        } else {
+            toast(detailText(data) || '保存失败', false);
+        }
+        await loadAll();  // 失败时也重拉，把开关拨回真实状态
+    }
+
+    async function deleteRule(accountName, ruleId) {
+        const found = findRule(ruleId);
+        const owners = found ? found.owners : [accountName];
+        const scope = owners.length > 1
+            ? `\n\n规则「${ruleId}」同时存在于 ${owners.length} 个账号，会一起删掉：\n${owners.join('、')}`
+            : `\n\n只从账号「${owners[0]}」删除。`;
+        if (!confirm(`确定删除规则「${ruleId}」吗？${scope}`)) return;
+
+        const res = await fetch(`/api/rules/${encodeURIComponent(ruleId)}`, {method: 'DELETE'});
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+            toast(`已从 ${(data.removed || []).length} 个账号删除`, true);
+            await loadAll();
+        } else {
+            toast(detailText(data) || '删除失败', false);
+        }
+    }
+
+    function detailText(data) {
+        // FastAPI 的 422 会把 detail 给成一个数组，直接丢给 toast 会渲染成 [object Object]
+        return typeof data.detail === 'string' ? data.detail : '';
     }
 
     // ==================== Tag Input ====================
@@ -472,20 +603,64 @@
         const list = document.getElementById(`${field}-list`);
         if (!list) return;
         list.innerHTML = tagInputs[field].map((tag, i) =>
-            `<span class="tag">${escapeHtml(tag)}<button onclick="removeTag('${field}', ${i})">&times;</button></span>`
+            `<span class="tag">${escapeHtml(tag)}<button data-remove-tag="${field}" data-index="${i}">&times;</button></span>`
         ).join('');
+    }
+
+    function onModalClick(event) {
+        const btn = event.target.closest('[data-remove-tag]');
+        if (!btn) return;
+        removeTag(btn.dataset.removeTag, Number(btn.dataset.index));
     }
 
     function clearAllTags() {
         Object.keys(tagInputs).forEach(k => { tagInputs[k] = []; renderTags(k); });
     }
 
-    // ==================== Modal ====================
+    // ==================== 弹窗 ====================
+    function renderAccountPicker(checked, locked) {
+        const box = document.getElementById('rule-accounts');
+        if (accounts.length === 0) {
+            box.innerHTML = '<p class="form-hint">还没有账号，先去「账号」页添加</p>';
+            updateAccountSummary();
+            return;
+        }
+        box.innerHTML = accounts.map(acc => `
+            <label class="tg-checkbox">
+                <input type="checkbox" value="${escapeHtml(acc.name)}"
+                       ${checked.includes(acc.name) ? 'checked' : ''}
+                       ${locked ? 'disabled' : ''} />
+                <span class="tg-checkmark"></span>
+                <span>${escapeHtml(acc.name)}${acc.username ? ` (@${escapeHtml(acc.username)})` : ''}</span>
+            </label>`).join('');
+        updateAccountSummary();
+    }
+
+    function selectedRuleAccounts() {
+        return Array.from(document.querySelectorAll('#rule-accounts input:checked')).map(i => i.value);
+    }
+
+    function updateAccountSummary() {
+        const el = document.getElementById('rule-accounts-summary');
+        if (!el) return;
+        const picked = selectedRuleAccounts();
+        if (picked.length > 0) {
+            el.textContent = `将写入：${picked.join('、')}`;
+        } else if (accounts.length > 0) {
+            el.textContent = `将写入：全部账号（${accounts.map(a => a.name).join('、')}）`;
+        } else {
+            el.textContent = '';
+        }
+    }
+
     function openAddRule() {
+        if (accounts.length === 0) { toast('还没有账号，先去「账号」页添加', false); return; }
         editingRuleId = null;
+        editingOwners = [];
         document.getElementById('modal-title').textContent = '新建规则';
         // 清空表单
         document.getElementById('rule-id').value = '';
+        document.getElementById('rule-id').disabled = false;
         document.getElementById('rule-name').value = '';
         document.getElementById('rule-enabled').checked = true;
         document.getElementById('match-mode').value = 'regex';
@@ -503,6 +678,9 @@
         clearAllTags();
         document.getElementById('patterns-group').style.display = 'flex';
         document.getElementById('template-group').style.display = 'none';
+        document.getElementById('rule-accounts-hint').textContent =
+            `不勾选任何账号 = 写入全部账号（共 ${accounts.length} 个）`;
+        renderAccountPicker([], false);
         document.getElementById('rule-modal').classList.add('active');
     }
 
@@ -510,12 +688,18 @@
         document.getElementById('rule-modal').classList.remove('active');
     }
 
-    function editRule(ruleId) {
-        const rule = ruleData.rules.find(r => r.id === ruleId);
+    function editRule(accountName, ruleId) {
+        const acc = accountByName(accountName);
+        const rule = acc ? acc.rules.find(r => r.id === ruleId) : null;
         if (!rule) return;
+        const found = findRule(ruleId);
         editingRuleId = ruleId;
+        editingOwners = found ? found.owners : [accountName];
+
         document.getElementById('modal-title').textContent = '编辑规则';
         document.getElementById('rule-id').value = rule.id;
+        // ID 是规则的身份证，改名会让「同一规则的多份副本」对不上号，所以锁住。
+        document.getElementById('rule-id').disabled = true;
         document.getElementById('rule-name').value = rule.name || '';
         document.getElementById('rule-enabled').checked = rule.enabled;
         document.getElementById('match-mode').value = rule.match?.mode || 'regex';
@@ -545,11 +729,15 @@
         tagInputs.patterns = [...(rule.match?.patterns || [])];
         tagInputs.exclude_patterns = [...(rule.match?.exclude_patterns || [])];
         Object.keys(tagInputs).forEach(renderTags);
+
+        document.getElementById('rule-accounts-hint').textContent =
+            `规则会同步到所有包含它的账号（${editingOwners.join('、')}），改一次全部生效`;
+        renderAccountPicker(editingOwners, true);
         document.getElementById('rule-modal').classList.add('active');
     }
 
     async function saveRule() {
-        if (!currentAccount) { toast('请先选择账号', false); return; }
+        if (accounts.length === 0) { toast('还没有账号', false); return; }
         const id = document.getElementById('rule-id').value.trim();
         if (!id) { toast('请输入规则 ID', false); return; }
         if (tagInputs.targets.length === 0) { toast('请至少添加一个转发目标', false); return; }
@@ -563,7 +751,7 @@
             'text-caption-buttons': ['text', 'caption', 'buttons']
         };
 
-        const payload = {
+        const rule = {
             id: id,
             name: document.getElementById('rule-name').value.trim() || null,
             enabled: document.getElementById('rule-enabled').checked,
@@ -587,61 +775,27 @@
             include_source_link: document.getElementById('rule-include-link').checked
         };
 
-        let url = `/api/config/${currentAccount}/rules`;
-        let method = 'POST';
-        if (editingRuleId) {
-            url = `/api/config/${currentAccount}/rules/${editingRuleId}`;
-            method = 'PUT';
-        }
+        // 新建：accounts 为空数组 → 后端扇出写入全部账号。
+        // 编辑：不带 accounts → 后端更新所有拥有该规则的账号。
+        const body = editingRuleId ? {rule: rule} : {rule: rule, accounts: selectedRuleAccounts()};
+        const url = editingRuleId ? `/api/rules/${encodeURIComponent(editingRuleId)}` : '/api/rules';
         const res = await fetch(url, {
-            method: method,
+            method: editingRuleId ? 'PUT' : 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload)
+            body: JSON.stringify(body)
         });
-        const data = await res.json();
-        if (data.ok) {
-            toast('保存成功', true);
-            closeRuleModal();
-            await loadRules();
-        } else {
-            toast(data.detail || '保存失败', false);
-        }
-    }
-
-    async function toggleRule(ruleId, enabled) {
-        const rule = ruleData.rules.find(r => r.id === ruleId);
-        if (!rule) return;
-        const res = await fetch(`/api/config/${currentAccount}/rules/${ruleId}`, {
-            method: 'PUT',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({...rule, enabled: enabled})
-        });
-        if (res.ok) loadRules();
-    }
-
-    async function deleteRule(ruleId) {
-        if (!confirm('确定要删除这条规则吗？')) return;
-        const res = await fetch(`/api/config/${currentAccount}/rules/${ruleId}`, {method: 'DELETE'});
-        if (res.ok) { toast('已删除', true); loadRules(); }
-    }
-
-    async function toggleForward() {
-        const box = document.getElementById('forward-enabled');
-        const enabled = box.checked;
-        const res = await fetch(`/api/config/${currentAccount}/forward-enabled`, {
-            method: 'PUT',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({enabled: enabled})
-        });
-        if (res.ok) {
-            toast(enabled ? '已开启转发' : '已关闭转发', true);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            toast(detailText(data) || '保存失败', false);
             return;
         }
-        // 保存失败就把开关拨回去：否则界面显示"已开启"而后端其实没变，
-        // 用户会以为转发在跑，实际一条都发不出去。
-        box.checked = !enabled;
-        const data = await res.json().catch(() => ({}));
-        toast(data.detail || '保存失败', false);
+        const done = editingRuleId ? (data.updated || []) : (data.saved || []);
+        const conflicts = data.conflicts || [];
+        let msg = editingRuleId ? `已更新 ${done.length} 个账号的规则` : `已保存到 ${done.length} 个账号`;
+        if (conflicts.length > 0) msg += `；${conflicts.join('、')} 已有同名规则，已跳过`;
+        toast(msg, true);
+        closeRuleModal();
+        await loadAll();
     }
 
     // ==================== 正则测试器 ====================
@@ -657,14 +811,15 @@
             return;
         }
 
-        const res = await fetch(`/api/config/${currentAccount}/rules/test`, {
+        // 走全局入口：匹配跟账号没关系，页面已经没有「当前账号」这个概念了
+        const res = await fetch('/api/rules/test', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({pattern, text, mode, ignore_case: ignoreCase})
         });
         const data = await res.json();
         if (data.error) {
-            resultEl.innerHTML = `<div class="test-result-error">${data.error}</div>`;
+            resultEl.innerHTML = `<div class="test-result-error">${escapeHtml(data.error)}</div>`;
         } else if (data.match) {
             let html = `<div class="test-result-success">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>

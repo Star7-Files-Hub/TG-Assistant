@@ -237,7 +237,7 @@ def test_every_get_element_by_id_target_exists() -> None:
     这是页面模板里最容易出、也最难发现的一类 bug：元素缺失时模板照样渲染
     （测试全绿），只有 JS 跑起来才抛 ``Cannot read properties of null``。
 
-    ``rules.html`` 就踩过：``loadRules()`` 第一句读 ``#forward-enabled``，
+    ``rules.html`` 就踩过：当时的 ``loadRules()`` 第一句读 ``#forward-enabled``，
     而那段 HTML 根本没写 —— 于是 ``loadRules()`` 直接抛异常，
     **后面的 ``renderRules() 一次都没执行过，规则列表永远是空的**。
     CSS 里 ``.rules-master-toggle`` 和 JS 里的 ``toggleForward()`` 都早就写好了，
@@ -295,3 +295,52 @@ def test_every_inline_handler_is_defined() -> None:
             missing[tpl.name] = gap
 
     assert not missing, f"这些模板绑定了未定义的处理函数（按钮会没反应）: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# 转发规则页：不再要求「先选账号」
+# --------------------------------------------------------------------------- #
+def test_rules_page_does_not_require_picking_an_account_first() -> None:
+    """规则页不能退回「先在顶部选账号才能建规则」的旧交互。
+
+    需求原话是「去掉转发规则选择账号创建，可以在添加转发任务的时候在弹窗内选择，
+    如不选择就默认全部账号」。回归的表现有好几种：顶部又多一个账号下拉框、新建按钮
+    初始被隐藏、或者保存又走回「某一个账号」的旧接口 —— 这里把这几条一起钉住。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    assert 'id="account-selector"' not in html, "页面顶部的账号下拉框又回来了"
+    assert 'id="rule-accounts"' in html, "弹窗里缺少账号选择器"
+    assert "不勾选任何账号" in html, "缺少「不勾选 = 全部账号」的提示"
+    assert "'/api/rules'" in html, "保存没有走全局扇出接口"
+    assert "data-account=" in html, "规则列表没有按账号分组渲染"
+    assert re.search(r'id="btn-add-rule"[^>]*display:\s*none', html) is None, (
+        "新建按钮又被默认藏起来了（旧版要选完账号才显示）"
+    )
+
+
+def test_rules_page_only_binds_static_inline_handlers() -> None:
+    """规则页的内联 handler 只允许是零参数的静态调用。
+
+    ``rule.id`` 是用户在弹窗里自由输入的字符串（``ForwardRule.id`` 没有任何字符
+    校验）。把它拼进内联 handler 的字符串参数里，只要 id 含一个单引号就会把属性
+    截断，甚至能注入 JS —— HTML 转义救不了内联 handler，因为浏览器会先把 ``&#39;``
+    解码回单引号再交给 JS 解析。
+
+    所以动态卡片上的编辑 / 删除 / 启停、以及标签上的删除按钮，一律走 ``data-*``
+    + 事件委托。这里故意**不要求**括号里是空的：真正危险的就是「带参数」的那种，
+    只匹配 ``foo()`` 会把它们全漏掉（这个漏洞第一次写这个用例时就踩到了）。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    pattern = r"""on(?:click|change|input|submit|keydown|keypress)\s*=\s*['"]([A-Za-z_$][\w$]*)\s*\("""
+    handlers = set(re.findall(pattern, html))
+
+    assert handlers == {"loadAll", "openAddRule", "closeRuleModal", "saveRule", "testRegex"}, (
+        f"规则页的内联 handler 白名单变了（可能又把数据拼进了 handler）：{sorted(handlers)}"
+    )
+    # 动态内容靠这两个属性找目标
+    assert "data-action" in html and "data-rule-id" in html
+    assert "data-remove-tag" in html

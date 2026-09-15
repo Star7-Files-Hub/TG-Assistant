@@ -377,11 +377,12 @@ async def api_rules_delete(
     return {"ok": True}
 
 
-@router.post("/config/{name}/rules/test")
-async def api_rules_test(name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """在服务端试跑匹配逻辑，供规则编辑页做实时预览。
+def _run_match_test(payload: dict[str, Any]) -> dict[str, Any]:
+    """试跑一次匹配：纯计算，不落盘、不依赖账号是否已登录。
 
-    纯计算，不落盘、不依赖账号是否已登录。
+    抽成独立函数是因为有两个入口 —— 带账号路径的旧地址，以及页面去掉
+    「先选账号」之后新增的全局地址（见 :func:`api_rules_test_global`）。
+    匹配逻辑本身跟账号毫无关系，两边必须给出完全一样的结果。
     """
     import re
 
@@ -422,6 +423,16 @@ async def api_rules_test(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"match": True, "message": "all 模式始终匹配"}
 
 
+@router.post("/config/{name}/rules/test")
+async def api_rules_test(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """在服务端试跑匹配逻辑，供规则编辑页做实时预览。
+
+    ``name`` 只是为了和其余 ``/config/{name}/...`` 端点保持同一种路径形状，
+    并不参与计算 —— 所以新页面用不着它（见 :func:`api_rules_test_global`）。
+    """
+    return _run_match_test(payload)
+
+
 @router.put("/config/{name}/forward-enabled")
 async def api_forward_set_enabled(
     name: str,
@@ -434,6 +445,257 @@ async def api_forward_set_enabled(
     config.forward.enabled = bool(payload.get("enabled", True))
     store.save_account_config(name, config)
     return {"ok": True, "enabled": config.forward.enabled}
+
+
+# --------------------------------------------------------------------------- #
+# 全局转发规则（跨账号）
+#
+# 规则本身是**按账号存**的（``data/accounts/<name>/config.json`` 的
+# ``forward.rules``），从来就没有全局规则表。这一组端点存在的意义是让页面
+# 不必「先选账号才能建规则」：新建时不指定账号就**扇出写入每个账号**，
+# 改 / 删则自动找到拥有这条规则的所有账号。
+#
+# 写入语义（页面上的行为都从这里推导）：
+#   * 不传 accounts（或传空） → 作用于**全部账号**（新建）/ **所有拥有者**（改删）
+#   * 显式传 accounts          → 只作用于这些账号，名字不存在直接 404
+# --------------------------------------------------------------------------- #
+def _rule_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """从全局请求体里取出规则本身。
+
+    推荐写法 ``{"rule": {...}, "accounts": [...]}``；也接受把规则字段平铺在顶层
+    （少一层嵌套）。``accounts`` 永远不算规则字段 —— 否则 ``ForwardRule`` 是
+    ``StrictModel``，多一个未知字段会把整个请求判成 400。
+    """
+    body = payload.get("rule")
+    if isinstance(body, dict):
+        return body
+    return {key: value for key, value in payload.items() if key != "accounts"}
+
+
+def _validate_rule(body: dict[str, Any]) -> Any:
+    from tg_assistant.config import ForwardRule
+
+    try:
+        return ForwardRule.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
+
+
+def _resolve_rule_accounts(store: Any, raw: Any) -> list[str]:
+    """把请求里的 ``accounts`` 解析成账号名列表。
+
+    ``None`` / 空列表 / 空字符串 / 全是空白的字符串都表示**全部账号** —— 这就是
+    页面上的默认行为（弹窗里一个账号都不勾 = 写给全部账号）。
+
+    显式给了名字就必须都存在：静默忽略一个拼错的账号名，用户会以为规则写进去了。
+    """
+    if raw is None:
+        names: list[str] = []
+    elif isinstance(raw, str):
+        names = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        names = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        raise HTTPException(status_code=400, detail="accounts 必须是账号名数组")
+
+    registry = store.load_registry()
+    if not names:
+        return [record.name for record in registry.accounts]
+
+    known = {record.name for record in registry.accounts}
+    for name in names:
+        validate_account_name(name)  # 非法名由应用级异常处理器翻成 400
+        if name not in known:
+            raise HTTPException(status_code=404, detail=f"账号 {name} 不存在")
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique.append(name)
+    return unique
+
+
+def _rule_owners(store: Any, rule_id: str) -> list[str]:
+    """找出配置里含有这条规则 id 的所有账号。"""
+    owners: list[str] = []
+    for record in store.load_registry().accounts:
+        config = store.load_account_config(record.name, create=False)
+        if any(rule.id == rule_id for rule in config.forward.rules):
+            owners.append(record.name)
+    return owners
+
+
+@router.get("/rules")
+async def api_rules_overview(
+    store=Depends(get_store),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """所有账号的规则总览，供「转发规则」页一次渲染完。
+
+    顺带带上 ``running`` / ``session_exists``：分组标题要画状态点，放在同一个
+    响应里就不会出现「两个接口的数据对不上」的瞬间。
+    """
+    status = {item["name"]: item for item in runtime.account_status()}
+    accounts: list[dict[str, Any]] = []
+    for record in store.load_registry().accounts:
+        config = store.load_account_config(record.name, create=False)
+        info = status.get(record.name, {})
+        accounts.append(
+            {
+                "name": record.name,
+                "username": record.username,
+                "display_name": record.display_name,
+                "enabled": record.enabled,
+                "running": bool(info.get("running")),
+                "session_exists": bool(info.get("session_exists")),
+                "forward_enabled": config.forward.enabled,
+                "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
+            }
+        )
+    return {"accounts": accounts}
+
+
+@router.post("/rules")
+async def api_rules_create_global(
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """新增规则；``accounts`` 为空表示写入**全部账号**（扇出）。
+
+    同名 id 已存在的账号会被**跳过**而不是整单失败 —— 否则「把新规则发给全部
+    账号」在某个账号里已经手工加过时就完全用不了了。全都冲突才返回 409。
+    """
+    targets = _resolve_rule_accounts(store, payload.get("accounts"))
+    if not targets:
+        raise HTTPException(status_code=400, detail="还没有任何账号，无法保存转发规则")
+    rule = _validate_rule(_rule_body(payload))
+
+    saved: list[str] = []
+    conflicts: list[str] = []
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        if any(existing.id == rule.id for existing in config.forward.rules):
+            conflicts.append(name)
+            continue
+        config.forward.rules.append(rule)
+        store.save_account_config(name, config)
+        saved.append(name)
+
+    if not saved:
+        raise HTTPException(
+            status_code=409,
+            detail=f"规则 id {rule.id!r} 在这些账号里都已存在：{'、'.join(conflicts)}",
+        )
+    return {
+        "ok": True,
+        "saved": saved,
+        "conflicts": conflicts,
+        "rule": rule.model_dump(mode="json"),
+    }
+
+
+@router.put("/rules/{rule_id}")
+async def api_rules_update_global(
+    rule_id: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """覆盖一条规则；``accounts`` 为空表示**所有拥有它的账号**一起改。
+
+    规则当初是扇出写出去的，改一次就该同步到所有副本 —— 只改一半会让各个账号
+    的行为悄悄不一致，而页面上看起来「我明明改了」。
+    """
+    raw_accounts = payload.get("accounts")
+    if raw_accounts:
+        targets = _resolve_rule_accounts(store, raw_accounts)
+    else:
+        targets = _rule_owners(store, rule_id)
+        if not targets:
+            raise HTTPException(status_code=404, detail=f"规则 {rule_id!r} 不存在")
+    rule = _validate_rule(_rule_body(payload))
+
+    # 先整体校验、再统一落盘：边检查边写的话，第 3 个账号撞车时前 2 个已经写完了，
+    # 留下一个「只改了一半」的配置 —— 用户看到报错，却有一半账号已经变了。
+    plans: list[tuple[str, Any, int]] = []
+    missing: list[str] = []
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        index = next(
+            (i for i, existing in enumerate(config.forward.rules) if existing.id == rule_id),
+            None,
+        )
+        if index is None:
+            missing.append(name)
+            continue
+        # 改 id 等于改名：新 id 在该账号里被占用时直接拒绝。写出重复 id 的后果
+        # 不是「多一条规则」而是**同一条消息被转发两次** —— runner 是逐条跑的。
+        if rule.id != rule_id and any(
+            existing.id == rule.id for existing in config.forward.rules
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"账号 {name} 里已存在 id {rule.id!r} 的规则，无法改名",
+            )
+        plans.append((name, config, index))
+
+    for name, config, index in plans:
+        config.forward.rules[index] = rule
+        store.save_account_config(name, config)
+
+    if not plans:
+        raise HTTPException(
+            status_code=404,
+            detail=f"这些账号里都没有规则 {rule_id!r}：{'、'.join(missing)}",
+        )
+    return {
+        "ok": True,
+        "updated": [name for name, _, _ in plans],
+        "missing": missing,
+        "rule": rule.model_dump(mode="json"),
+    }
+
+
+@router.delete("/rules/{rule_id}")
+async def api_rules_delete_global(
+    rule_id: str,
+    accounts: str | None = Query(
+        None, description="只从这些账号删除（逗号分隔）；缺省 = 所有拥有它的账号"
+    ),
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """删除规则；``accounts`` 缺省表示从**所有拥有它的账号**里删掉。"""
+    if accounts:
+        targets = _resolve_rule_accounts(store, accounts)
+    else:
+        targets = _rule_owners(store, rule_id)
+
+    removed: list[str] = []
+    missing: list[str] = []
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        before = len(config.forward.rules)
+        config.forward.rules = [rule for rule in config.forward.rules if rule.id != rule_id]
+        if len(config.forward.rules) == before:
+            missing.append(name)
+            continue
+        store.save_account_config(name, config)
+        removed.append(name)
+
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"规则 {rule_id!r} 不存在")
+    return {"ok": True, "removed": removed, "missing": missing}
+
+
+@router.post("/rules/test")
+async def api_rules_test_global(payload: dict[str, Any]) -> dict[str, Any]:
+    """试跑匹配逻辑，不需要账号上下文。
+
+    页面去掉「先选账号」之后就凑不出 ``/config/{name}/rules/test`` 里的 ``name``
+    了，而匹配本身跟账号毫无关系，所以补一个不带动路径的入口。
+    """
+    return _run_match_test(payload)
 
 
 # --------------------------------------------------------------------------- #

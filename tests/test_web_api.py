@@ -46,6 +46,20 @@ def account(app):
     return store
 
 
+#: 第二个账号的名字。扇出语义至少要两个账号才测得出来。
+NAME2 = "second"
+
+
+@pytest.fixture
+def two_accounts(app):
+    """两个账号，用来验证「不选账号 = 全部账号」的扇出行为。"""
+    store = app.state.store
+    for name in (NAME, NAME2):
+        store.upsert_account(AccountRecord(name=name, created_at=utc_now_iso()))
+        store.load_account_config(name, create=True)
+    return store
+
+
 # --------------------------------------------------------------------------- #
 # 清除会话
 # --------------------------------------------------------------------------- #
@@ -197,6 +211,168 @@ def test_rules_test_requires_pattern_and_text(client, app, account) -> None:
         client.post(f"/api/config/{NAME}/rules/test", json={"pattern": "x", "text": ""}).json()["match"]
         is False
     )
+
+
+# --------------------------------------------------------------------------- #
+# 全局转发规则（跨账号扇出）
+#
+# 页面原来要求「先在顶部选一个账号」才能建规则，现在改成在弹窗里勾账号、
+# 一个都不勾就是全部账号。这一组用例钉住后端那半边语义。
+# --------------------------------------------------------------------------- #
+def test_global_rules_overview_lists_every_account(client, app, two_accounts) -> None:
+    body = client.get("/api/rules").json()
+    assert [a["name"] for a in body["accounts"]] == [NAME, NAME2]
+    assert all(a["rules"] == [] for a in body["accounts"])
+    assert all(a["forward_enabled"] is True for a in body["accounts"])
+    # 状态点要用的字段必须一起给，否则分组标题画不出来
+    assert all("running" in a and "session_exists" in a for a in body["accounts"])
+
+
+def test_global_rules_create_fans_out_to_all_accounts(client, app, two_accounts) -> None:
+    """不传 accounts = 全部账号，这是页面上的默认行为。"""
+    resp = client.post("/api/rules", json={"rule": _rule_payload()})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME, NAME2]
+    for name in (NAME, NAME2):
+        ids = [r["id"] for r in client.get(f"/api/config/{name}/rules").json()["rules"]]
+        assert ids == ["r1"], f"{name} 没拿到规则"
+
+
+def test_global_rules_create_with_explicit_accounts(client, app, two_accounts) -> None:
+    resp = client.post("/api/rules", json={"rule": _rule_payload(), "accounts": [NAME2]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME2]
+    assert client.get(f"/api/config/{NAME}/rules").json()["rules"] == []
+
+
+def test_global_rules_create_accepts_flat_payload(client, app, two_accounts) -> None:
+    """也接受把规则字段平铺在顶层；accounts 不能被当成规则字段（StrictModel 会 400）。"""
+    resp = client.post("/api/rules", json={**_rule_payload(), "accounts": [NAME]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME]
+
+
+def test_global_rules_create_unknown_account_is_404(client, app, two_accounts) -> None:
+    resp = client.post("/api/rules", json={"rule": _rule_payload(), "accounts": ["ghost"]})
+    assert resp.status_code == 404
+
+
+def test_global_rules_create_without_any_account_is_400(client, app) -> None:
+    """一个账号都没有时别写进一个空注册表，直接说清楚。"""
+    resp = client.post("/api/rules", json={"rule": _rule_payload()})
+    assert resp.status_code == 400
+
+
+def test_global_rules_create_rejects_invalid_payload(client, app, two_accounts) -> None:
+    assert client.post("/api/rules", json={"rule": {"id": "x"}}).status_code == 400
+
+
+def test_global_rules_create_skips_accounts_that_already_have_the_id(
+    client, app, two_accounts
+) -> None:
+    """某个账号里已有同名 id 时跳过它，别让整单失败。"""
+    assert client.post(f"/api/config/{NAME}/rules", json=_rule_payload()).status_code == 200
+    resp = client.post("/api/rules", json={"rule": _rule_payload()})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME2]
+    assert resp.json()["conflicts"] == [NAME]
+
+
+def test_global_rules_create_all_conflicts_is_409(client, app, two_accounts) -> None:
+    assert client.post("/api/rules", json={"rule": _rule_payload()}).status_code == 200
+    dup = client.post("/api/rules", json={"rule": _rule_payload()})
+    assert dup.status_code == 409
+    assert "已存在" in dup.json()["detail"]
+
+
+def test_global_rules_update_touches_every_owner(client, app, two_accounts) -> None:
+    """规则当初是扇出写出去的，改一次要同步到所有副本，不能只改一半。"""
+    client.post("/api/rules", json={"rule": _rule_payload()})
+    resp = client.put("/api/rules/r1", json={"rule": {**_rule_payload(), "name": "改名了"}})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == [NAME, NAME2]
+    for name in (NAME, NAME2):
+        assert client.get(f"/api/config/{name}/rules").json()["rules"][0]["name"] == "改名了"
+
+
+def test_global_rules_update_can_be_scoped_to_one_account(client, app, two_accounts) -> None:
+    client.post("/api/rules", json={"rule": _rule_payload()})
+    resp = client.put(
+        "/api/rules/r1",
+        json={"rule": {**_rule_payload(), "name": "只改这个"}, "accounts": [NAME]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == [NAME]
+    assert client.get(f"/api/config/{NAME2}/rules").json()["rules"][0]["name"] == "测试规则"
+
+
+def test_global_rules_update_missing_is_404(client, app, two_accounts) -> None:
+    assert client.put("/api/rules/nope", json={"rule": _rule_payload("nope")}).status_code == 404
+
+
+def test_global_rules_rename_into_taken_id_is_409_and_writes_nothing(
+    client, app, two_accounts
+) -> None:
+    """改名撞上同账号里已有的 id 要拒绝：重复 id 会让同一条消息被转发两次。
+
+    顺带钉住「先整体校验、再统一落盘」：冲突发生在**后面**那个账号时，前面已经
+    检查通过的账号也不能被改掉 —— 否则用户看到报错，却有一半配置已经变了。
+    """
+    client.post("/api/rules", json={"rule": _rule_payload("r2"), "accounts": [NAME]})
+    client.post("/api/rules", json={"rule": _rule_payload("r2"), "accounts": [NAME2]})
+    client.post("/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME2]})
+
+    resp = client.put("/api/rules/r2", json={"rule": _rule_payload("r1")})
+
+    assert resp.status_code == 409
+    assert [r["id"] for r in client.get(f"/api/config/{NAME}/rules").json()["rules"]] == ["r2"], (
+        "冲突出在第二个账号上，第一个账号却已经被改掉了 —— 只改了一半"
+    )
+    assert sorted(r["id"] for r in client.get(f"/api/config/{NAME2}/rules").json()["rules"]) == [
+        "r1",
+        "r2",
+    ]
+
+
+def test_global_rules_delete_removes_from_every_owner(client, app, two_accounts) -> None:
+    client.post("/api/rules", json={"rule": _rule_payload()})
+    resp = client.delete("/api/rules/r1")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed"] == [NAME, NAME2]
+    for name in (NAME, NAME2):
+        assert client.get(f"/api/config/{name}/rules").json()["rules"] == []
+
+
+def test_global_rules_delete_can_be_scoped_to_one_account(client, app, two_accounts) -> None:
+    client.post("/api/rules", json={"rule": _rule_payload()})
+    resp = client.delete(f"/api/rules/r1?accounts={NAME}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed"] == [NAME]
+    assert [r["id"] for r in client.get(f"/api/config/{NAME2}/rules").json()["rules"]] == ["r1"]
+
+
+def test_global_rules_delete_missing_is_404(client, app, two_accounts) -> None:
+    assert client.delete("/api/rules/nope").status_code == 404
+
+
+def test_global_rules_test_needs_no_account(client, app) -> None:
+    """页面去掉「先选账号」后凑不出账号名了，而匹配本身跟账号无关。"""
+    resp = client.post(
+        "/api/rules/test",
+        json={"pattern": r"金额[:：]\s*(\d+)", "text": "今天金额：128 元", "mode": "regex"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["match"] is True
+    assert resp.json()["groups"] == ["128"]
+
+
+def test_global_rules_test_matches_the_per_account_endpoint(client, app, account) -> None:
+    """两个入口必须给出完全一样的结果（同一个 _run_match_test）。"""
+    payload = {"pattern": "([", "text": "abc", "mode": "regex"}
+    global_body = client.post("/api/rules/test", json=payload).json()
+    scoped_body = client.post(f"/api/config/{NAME}/rules/test", json=payload).json()
+    assert global_body == scoped_body
+    assert "无效" in global_body["error"]
 
 
 # --------------------------------------------------------------------------- #

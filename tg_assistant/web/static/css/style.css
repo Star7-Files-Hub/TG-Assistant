@@ -628,6 +628,11 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 .tg-btn svg {
     width: 18px; height: 18px;
 }
+/* 规则页在「一个账号都还没有」时会把「新建规则」置灰 */
+.tg-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 .tg-btn-primary {
     background: linear-gradient(135deg, #2f81f7, #1f6feb);
     color: white;
@@ -880,39 +885,68 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     gap: 16px;
     flex-wrap: wrap;
 }
-.rules-account-select {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
+/* 账号分组：规则按账号存，页面上就按账号分组展示。
+   原来的 .rules-account-select / .rules-account-status 是「页面顶部先选一个账号」
+   那套交互留下的，改成弹窗内选账号后就没有引用了。 */
+.rules-account-group {
+    border: 1px solid rgba(48, 54, 61, 0.6);
+    border-radius: 14px;
+    overflow: hidden;
+    background: rgba(13, 17, 23, 0.35);
 }
-.rules-account-select label {
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-.rules-account-select select {
-    padding: 8px 12px;
-    background: rgba(13, 17, 23, 0.6);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text);
-    font-size: 13px;
-    min-width: 180px;
-    cursor: pointer;
-}
-.rules-account-select select:focus {
-    outline: none;
-    border-color: var(--primary);
-}
-
-/* 账号状态 */
-.rules-account-status {
+.rules-account-group-header {
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    background: rgba(13, 17, 23, 0.5);
+    border-bottom: 1px solid var(--border);
 }
+.rules-account-group-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+.rules-account-name {
+    font-size: 15px;
+    font-weight: 600;
+}
+.rules-account-user {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+.rules-account-count {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rules-account-group-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.rules-account-group-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px 16px 16px;
+}
+.rules-account-empty {
+    font-size: 13px;
+    color: var(--text-muted);
+    padding: 8px 0;
+}
+.rule-shared {
+    margin-top: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* 账号状态点 */
 .status-dot {
     width: 8px;
     height: 8px;
