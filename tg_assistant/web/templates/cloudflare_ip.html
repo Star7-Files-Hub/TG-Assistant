@@ -261,16 +261,24 @@
                 const parts = [];
                 if (lr.ok_count) parts.push(`${lr.ok_count} 条写入成功`);
                 if (lr.failed_count) parts.push(`${lr.failed_count} 条失败`);
-                // ⚠️ 「全部因为没更快而跳过」是**正常**结果，不能报成故障 ——
-                // 那会让用户以为出错了（实测三家一起被跳过时就是这个场景）。
+                // 「跳过」也要报出来，否则「写 1 条、跳 2 家」看着像只处理了一家。
+                // 三家全跳过时不重复说（下面有专门的「跳过: 原因」行）。
+                if (lr.skipped_count && (lr.ok_count || lr.failed_count)) {
+                    parts.push(`${lr.skipped_count} 条跳过`);
+                }
+                // ⚠️ 「全部因为没更快而跳过」是**正常**结果（only_update_if_faster 生效），
+                // 不能报成故障 —— 那会让用户以为出错了（实测三家一起被跳过时就是这个场景）。
+                // ⚠️ 判「已跳过」要看 skipped_count，不能只看 lr.skipped：
+                // 后者来自 skipped_reason，只有「一家都没通过」那条路径才会写。
+                const skipped = lr.skipped || lr.skipped_count;
                 const verdict = lr.ok
                     ? '成功'
-                    : (lr.failed_count ? '有失败' : (lr.skipped ? '已跳过' : '未写入'));
+                    : (lr.failed_count ? '有失败' : (skipped ? '已跳过' : '未写入'));
                 detail.push(`上次结果: ${verdict}（${parts.join('、') || '未写任何记录'}）`);
             } else {
                 detail.push(`上次结果: ${lr.speed ? lr.speed.toFixed(2) + ' MB/s' : '-'} (${lr.ok ? '成功' : (lr.skipped ? '已跳过' : '失败')})`);
             }
-            if (lr.skipped) detail.push(`跳过: ${lr.skipped_reason || '-'}`);
+            if (lr.skipped_reason) detail.push(`跳过: ${lr.skipped_reason}`);
         }
         if (s.enabled && !s.listener_running) {
             // 「启用」开关只代表配置生效；真正监听要靠账号在线 —— 不写清楚的话，

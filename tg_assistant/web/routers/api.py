@@ -853,11 +853,11 @@ async def api_cloudflare_ip_trigger(
 ) -> dict[str, Any]:
     """手动触发一次优选 IP 抓取 + DNS 更新。"""
     from tg_assistant.cloudflare_ip import (
-        ISP_LABELS,
         fetch_and_update,
         make_message_source,
         make_message_source_from_account,
         persist_run,
+        summary_to_last_result,
     )
 
     _require_account(store, name)
@@ -899,27 +899,26 @@ async def api_cloudflare_ip_trigger(
             with contextlib.suppress(Exception):
                 await client_to_stop.stop(block=True)
 
+    # ⚠️ ``ok`` / ``skipped`` / 各种计数都**从这里取**，别在这再拼一份 ——
+    # 面板读的是 ``persist_run`` 落盘的同一份数据，两处各算各的迟早会打架
+    # （原来这里自己写了一遍 ``summary.all_ok and not summary.skipped``，
+    # 于是「写了 1 条、跳过 2 家」时接口说失败、面板说未写入，而实际写成功了）。
+    shared = summary_to_last_result(summary, cf_config)
     return {
-        "ok": summary.all_ok and not summary.skipped,
-        "skipped": summary.skipped,
-        "skipped_reason": summary.skipped_reason,
+        "ok": shared["ok"],
+        "skipped": shared["skipped"],
+        "skipped_reason": shared["skipped_reason"],
+        "ok_count": shared["ok_count"],
+        "failed_count": shared["failed_count"],
+        "skipped_count": shared["skipped_count"],
+        "records_count": shared["records_count"],
         "split_by_isp": cf_config.split_by_isp,
         "fastest_ip": summary.fetched.fastest,
         "fastest_speed": summary.fetched.fastest_speed,
         "all_ips": summary.fetched.all_ips,
         "all_speeds": summary.fetched.all_speeds,
         "current_speed": state.get("cloudflare_ip_last_speed"),
-        "decisions": [
-            {
-                "isp": isp,
-                "label": ISP_LABELS.get(isp, isp),
-                "should_update": d.should_update,
-                "ip": d.ip,
-                "speed": d.speed,
-                "reason": d.reason,
-            }
-            for isp, d in summary.decisions.items()
-        ],
+        "decisions": shared["decisions"],
         "results": [
             {
                 "domain": r.domain,

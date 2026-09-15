@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -33,6 +35,7 @@ from tg_assistant.cloudflare_ip import (
     _plan_targets,
     _resolve_record,
     aggregate_messages,
+    fetch_and_update,
     parse_isp,
     persist_run,
     should_update_isp,
@@ -956,6 +959,46 @@ class TestSummaryToLastResult:
         assert data["ok"] is False
         assert data["skipped_reason"] == "未能从频道解析到任何 IP"
 
+    def test_partial_skip_is_still_ok(self):
+        """「跳过」是正常结果，不能算失败。
+
+        ⚠️ 原来 ``ok`` 用的是 ``summary.all_ok``，它要求**每一条**结果都 ``ok``，
+        而被跳过的条目 ``ok=False`` —— 于是「写了 1 条、跳过 2 家」被判成失败，
+        面板渲染出「上次结果: 未写入（1 条写入成功）」这种自相矛盾的文案。
+        """
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(
+            _split_summary(ok_isps=("telecom",), skipped_isps=("mobile", "unicom")),
+            config,
+        )
+
+        assert data["ok_count"] == 1
+        assert data["failed_count"] == 0
+        assert data["skipped_count"] == 2
+        assert data["ok"] is True, "写成功 1 条、跳过 2 家 → 本次执行是成功的"
+        assert data["skipped"] is False, "只有「一家都没通过」才算整体跳过"
+
+    def test_all_skipped_is_not_ok(self):
+        """三家全跳过 → 没写任何东西，不能报成功。"""
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(
+            _split_summary(ok_isps=(), skipped_isps=ISP_KEYS), config
+        )
+
+        assert data["ok_count"] == 0
+        assert data["ok"] is False
+
+    def test_real_failure_is_not_ok_even_with_writes(self):
+        """有一条真失败就不能报成功 —— 否则用户以为三家都写好了。"""
+        config = CloudflareIPConfig(split_by_isp=True)
+        data = summary_to_last_result(
+            _split_summary(failed_isps=("unicom",)), config
+        )
+
+        assert data["ok_count"] == 2
+        assert data["failed_count"] == 1
+        assert data["ok"] is False
+
 
 class TestTriggerPersistsLastResult:
     """🔴 回归：手动「立即触发」原来**不写** ``cloudflare_ip_last_result``。
@@ -1050,6 +1093,44 @@ class TestTriggerPersistsLastResult:
         status = client.get("/api/config/acct/cloudflare_ip/status").json()
         assert status["last_result"]["ok_count"] == 3
         assert status["last_result"]["split_by_isp"] is True
+
+    def test_trigger_ok_agrees_with_panel_on_partial_skip(self, tmp_path, monkeypatch):
+        """接口说的 ``ok`` 必须和面板读到的 ``last_result.ok`` 是同一个结论。
+
+        ⚠️ 回归：端点原来自己算 ``summary.all_ok and not summary.skipped``，
+        于是「写了 1 条、跳过 2 家」时接口返回 ``ok=false``（前端据此**不渲染**
+        抓取结果），而 DNS 其实写成功了。
+        """
+        from fastapi.testclient import TestClient
+
+        import tg_assistant.cloudflare_ip as cf
+
+        app, store = self._app_with_account(tmp_path)
+
+        async def fake_source_from_account(*args, **kwargs):
+            return object(), (lambda *a, **k: None)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            return _split_summary(
+                ok_isps=("telecom",), skipped_isps=("mobile", "unicom")
+            )
+
+        monkeypatch.setattr(cf, "make_message_source_from_account", fake_source_from_account)
+        monkeypatch.setattr(cf, "fetch_and_update", fake_fetch)
+
+        client = TestClient(app)
+        res = client.post("/api/config/acct/cloudflare_ip/trigger")
+
+        assert res.status_code == 200, res.text
+        body = res.json()
+        last = store.load_state("acct")["cloudflare_ip_last_result"]
+
+        assert body["ok_count"] == 1
+        assert body["skipped_count"] == 2
+        assert body["failed_count"] == 0
+        assert body["ok"] is True, "写成功 1 条就该算成功"
+        assert body["ok"] == last["ok"], "接口和面板必须是同一个结论"
+        assert body["skipped_count"] == last["skipped_count"]
 
 
 class TestPersistRun:
@@ -1192,6 +1273,66 @@ class TestListenerPersistsRun:
         assert called["fetch"] is False, "预检不过就不该发起抓取"
         assert store.load_state("acct").get("cloudflare_ip_last_result") is None
 
+    async def test_partial_skip_notifies_success_not_failure(
+        self, store, alog, monkeypatch
+    ):
+        """「写了 1 条、跳过 2 家」要发**成功**通知。
+
+        ⚠️ 回归：原来这里判的是 ``summary.all_ok`` —— 它要求每条结果都 ok，
+        而被跳过的条目 ok=False，于是这种**正常**情况会给用户推一条失败通知。
+        """
+        import types
+
+        import tg_assistant.cf_ip_listener as listener_mod
+        import tg_assistant.proxy as proxy_mod
+
+        listener = self._listener(store, alog, split_by_isp=True)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            return _split_summary(
+                ok_isps=("telecom",), skipped_isps=("mobile", "unicom")
+            )
+
+        monkeypatch.setattr(listener_mod, "fetch_and_update", fake_fetch)
+        monkeypatch.setattr(listener_mod, "make_message_source", lambda c: object())
+        monkeypatch.setattr(proxy_mod, "resolve_proxy", lambda *a, **k: None)
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            type(listener), "_notify_success", lambda self, s: calls.append("success")
+        )
+        monkeypatch.setattr(
+            type(listener), "_notify_failure", lambda self, s: calls.append("failure")
+        )
+
+        await listener._on_message(types.SimpleNamespace(), self._message())
+
+        assert calls == ["success"], f"正常的部分跳过被当成失败了: {calls}"
+
+
+def _code_only(path: Path) -> str:
+    """读源码并**去掉注释**。
+
+    ⚠️ 静态契约测试必须只看代码。注释里为了说明「以前是这么写的」而引用旧写法
+    是很正常的（本项目到处都这么写），拿原始文本去断言会被自己的注释绊倒 ——
+    第一次跑这两条契约就踩了。
+    用 ``tokenize`` 精确找出注释的起止列，按列截断，**不重排空白** ——
+    否则 ``state["k"]`` 会被拆成 ``state [ "k" ]``，那类断言就永远匹配不上了。
+    """
+    import io
+    import tokenize
+
+    text = path.read_text(encoding="utf-8")
+    cuts: dict[int, int] = {}
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if tok.type == tokenize.COMMENT:
+            row, col = tok.start
+            cuts[row] = min(cuts.get(row, col), col)
+    lines = text.splitlines()
+    return "\n".join(
+        line[: cuts[i]] if i in cuts else line for i, line in enumerate(lines, start=1)
+    )
+
 
 class TestAllPathsUsePersistRun:
     """契约：三条执行路径都必须调 ``persist_run``。
@@ -1207,17 +1348,159 @@ class TestAllPathsUsePersistRun:
     def test_every_path_calls_persist_run(self):
         root = Path(__file__).resolve().parents[1] / "tg_assistant"
         for rel in self.PATHS:
-            src = (root / rel).read_text(encoding="utf-8")
+            src = _code_only(root / rel)
             assert "persist_run(" in src, f"{rel} 没有调用 persist_run，面板会显示陈旧结果"
 
     def test_no_path_hand_writes_the_state_keys(self):
         """字段名只许出现在 cloudflare_ip.py 里（persist_run 内部）。"""
         root = Path(__file__).resolve().parents[1] / "tg_assistant"
         for rel in self.PATHS:
-            src = (root / rel).read_text(encoding="utf-8")
+            src = _code_only(root / rel)
             assert 'state["cloudflare_ip_last_result"]' not in src, (
                 f"{rel} 还在手写 last_result，应该改用 persist_run"
             )
             assert 'state["cloudflare_ip_last_run"]' not in src, (
                 f"{rel} 还在手写 last_run，应该改用 persist_run"
             )
+
+
+class TestSingleSourceOfOk:
+    """🔴 静态契约：``ok`` / 计数只许在 ``summary_to_last_result`` 里算一次。
+
+    原来手动触发端点自己又拼了一份 ``summary.all_ok and not summary.skipped``，
+    于是同一件事两处各算各的 —— 「写了 1 条、跳过 2 家」时接口说失败、
+    面板说未写入，而 DNS 其实写成功了。这类「同一判断抄两份」在本项目
+    已经犯过（落盘那三条路径），所以直接钉死。
+    """
+
+    def test_trigger_endpoint_derives_ok_from_shared_helper(self):
+        root = Path(__file__).resolve().parents[1] / "tg_assistant"
+        src = _code_only(root / "web" / "routers" / "api.py")
+
+        assert "summary_to_last_result" in src, "触发端点要从共用函数取 ok / 计数"
+        assert "summary.all_ok" not in src, (
+            "触发端点又自己算了一遍 ok —— 两处判断迟早打架"
+        )
+
+    def test_all_ok_only_used_where_it_belongs(self):
+        """``all_ok`` 只该出现在 cloudflare_ip.py 内部（日志用），别拿来当「成功」。"""
+        root = Path(__file__).resolve().parents[1] / "tg_assistant"
+        for rel in ("web/routers/api.py", "web/runtime.py", "cf_ip_listener.py"):
+            src = _code_only(root / rel)
+            assert "all_ok" not in src, f"{rel} 不该用 all_ok 判成败"
+
+
+class TestSplitCountsMatchReality:
+    """分流模式下「上次结果」的计数，必须用**真实的** ``fetch_and_update`` 跑一遍。
+
+    ⚠️ 上面 ``TestSummaryToLastResult`` 用的是手搓的 ``_split_summary()``，形状
+    跟真实的对不上 —— 两种情况的真实形状**不一样**：
+
+    * **部分跳过**（至少一家通过）：``_update_split_by_isp`` 会拿 ``approved``
+      去调 ``update_dns_records``，而它返回的是**每个运营商一条**结果 ——
+      没通过的带 ``skipped=True``。所以 ``results`` 里三家都在。
+    * **一家都没通过**：会在调 ``update_dns_records`` **之前**提前返回，
+      ``results`` 是**空数组**，该跳过几家只剩 ``decisions`` 知道。
+
+    线上就踩了第二种：``skipped_reason`` 写着「[移动] 未超过当前…；[电信]…；
+    [联通]…」，同一份 ``last_result`` 里 ``records_count`` / ``skipped_count``
+    却都是 0 —— 自相矛盾，面板和排查都会被它带偏。
+    """
+
+    def _config(self, **over: object) -> CloudflareIPConfig:
+        base: dict[str, object] = {
+            "enabled": True,
+            "api_token": "tok",
+            "source_channel": "@cfyxip",
+            "split_by_isp": True,
+            "records": [
+                CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="cf")
+            ],
+            "only_update_if_faster": True,
+        }
+        base.update(over)
+        return CloudflareIPConfig(**base)  # type: ignore[arg-type]
+
+    @staticmethod
+    async def _source(channel: object, limit: int) -> list[str]:
+        return [MOBILE_TEXT, TELECOM_TEXT, UNICOM_TEXT]
+
+    @staticmethod
+    def _patch_cf_http(monkeypatch: pytest.MonkeyPatch) -> None:
+        """把 Cloudflare 的 HTTP 换成 MockTransport。
+
+        ``update_dns_records`` 自己 new 了一个 ``httpx.AsyncClient``，没有注入点，
+        所以只能从模块的 ``httpx`` 上换 —— 但不能直接把真模块的 ``AsyncClient``
+        改掉（那是全局共享的），于是套一层只覆盖 ``AsyncClient`` 的代理。
+        """
+        cf_mod = sys.modules["tg_assistant.cloudflare_ip"]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                # 查不到已有记录 → 走 POST 新建 → 写成功。
+                return httpx.Response(200, json={"result": [], "success": True})
+            return httpx.Response(
+                200, json={"result": {"id": "rec-1"}, "success": True, "errors": []}
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        class _HttpxShim:
+            def __getattr__(self, item: str) -> Any:
+                return getattr(httpx, item)
+
+            @staticmethod
+            def AsyncClient(**kwargs: Any) -> httpx.AsyncClient:
+                kwargs.pop("proxy", None)  # MockTransport 不接受 proxy
+                return httpx.AsyncClient(transport=transport, **kwargs)
+
+        monkeypatch.setattr(cf_mod, "httpx", _HttpxShim())
+
+    async def test_all_slower_than_current_reports_three_skips(self):
+        """三家都比当前慢 → 一家都不写，但计数必须还是三家。"""
+        config = self._config()
+        state = {
+            LAST_SPEED_BY_ISP_KEY: {"mobile": 999.0, "telecom": 999.0, "unicom": 999.0}
+        }
+
+        summary = await fetch_and_update(config, self._source, state, None)
+        data = summary_to_last_result(summary, config)
+
+        assert summary.results == [], "一家都没通过就不该去调 update_dns_records"
+        assert data["skipped"] is True
+        assert data["ok"] is False
+        assert data["ok_count"] == 0
+        assert data["failed_count"] == 0
+        assert data["skipped_count"] == 3, "三家都跳过了，计数不能是 0"
+        assert data["records_count"] == 3
+        assert len(data["decisions"]) == 3
+        assert "未超过当前" in data["skipped_reason"]
+
+    async def test_one_approved_counts_the_two_skips_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """只有电信够快 → 写 1 条、跳过 2 家。
+
+        ⚠️ 这条同时钉住「**不能**把跳过数算两遍」：部分跳过时 ``results`` 里
+        本来就带了那两条 ``skipped=True``，若再拿 ``decisions`` 数一遍就成 4 了。
+        """
+        self._patch_cf_http(monkeypatch)
+        config = self._config()
+        # 移动/联通设成永远追不上的速度，电信不设（0 = 不限制）。
+        state = {
+            LAST_SPEED_BY_ISP_KEY: {"mobile": 999.0, "unicom": 999.0, "telecom": 0.0}
+        }
+
+        summary = await fetch_and_update(config, self._source, state, None)
+        data = summary_to_last_result(summary, config)
+
+        assert sorted(r.isp for r in summary.results) == [
+            "mobile",
+            "telecom",
+            "unicom",
+        ], "部分跳过时 results 里三家都在（被跳过的带 skipped=True）"
+        assert data["ok_count"] == 1, "只有电信该写成功"
+        assert data["failed_count"] == 0
+        assert data["skipped_count"] == 2, "被跳过的移动/联通各算一次，不能翻倍"
+        assert data["records_count"] == 3
+        assert data["ok"] is True, "有一家写成功就不算整体跳过"

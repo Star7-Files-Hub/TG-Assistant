@@ -193,17 +193,47 @@ def summary_to_last_result(
     ``ok_count`` / ``skipped_count`` / ``failed_count``，让面板能说清
     「3 条写成功」还是「1 条失败」，而不是拿单个运营商的速度冒充整体结果。
     """
+    results = list(summary.results)
+    if results:
+        records_count = len(results)
+        ok_count = sum(1 for r in results if r.ok and not r.skipped)
+        failed_count = sum(1 for r in results if not r.ok and not r.skipped)
+        skipped_count = sum(1 for r in results if r.skipped)
+    elif summary.decisions:
+        # ⚠️ 只有**一家都没通过**时才会走到这里。此时
+        # :func:`_update_split_by_isp` 是在 ``update_dns_records`` **之前**提前返回的
+        # （见那里的 ``if not approved``），``results`` 因此是空数组 ——
+        # 该跳过几家只有 ``decisions`` 知道。
+        # 不补这一步，state 就会自相矛盾：``skipped_reason`` 写着三家都跳过、
+        # ``skipped_count`` 却是 0（线上真实出现过，面板和排查都会被它带偏）。
+        #
+        # ⚠️ 反过来，**部分跳过**时 ``results`` 里三家都在（被跳过的带
+        # ``skipped=True``），所以这里**不能**无条件地拿 decisions 再数一遍 ——
+        # 那会把跳过数翻倍。判据与 ``_update_split_by_isp`` 的 ``approved`` 一致。
+        records_count = len(summary.decisions)
+        ok_count = 0
+        failed_count = 0
+        skipped_count = sum(
+            1 for d in summary.decisions.values() if not (d.should_update and d.ip)
+        )
+    else:
+        records_count = ok_count = failed_count = skipped_count = 0
+
     return {
-        "ok": summary.all_ok and not summary.skipped,
+        # ⚠️ 别用 ``summary.all_ok`` —— 它要求**每一条**结果都 ``ok``，而被跳过的
+        # 条目 ``ok=False``。于是「写了 1 条、跳过 2 家」会被判成失败，
+        # 面板渲染出「上次结果: 未写入（1 条写入成功）」这种自相矛盾的文案。
+        # 「跳过」是正常结果（``only_update_if_faster`` 生效），不该算失败。
+        "ok": ok_count > 0 and failed_count == 0,
         "skipped": summary.skipped,
         "skipped_reason": summary.skipped_reason,
         "ip": summary.fetched.fastest,
         "speed": summary.fetched.fastest_speed,
         "updated_at": summary.updated_at,
-        "records_count": len(summary.results),
-        "ok_count": sum(1 for r in summary.results if r.ok and not r.skipped),
-        "failed_count": sum(1 for r in summary.results if not r.ok and not r.skipped),
-        "skipped_count": sum(1 for r in summary.results if r.skipped),
+        "records_count": records_count,
+        "ok_count": ok_count,
+        "failed_count": failed_count,
+        "skipped_count": skipped_count,
         "split_by_isp": bool(config.split_by_isp),
         "decisions": [
             {

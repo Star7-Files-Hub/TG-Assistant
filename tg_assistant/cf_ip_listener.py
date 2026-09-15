@@ -27,6 +27,7 @@ from .cloudflare_ip import (
     parse_ips_from_text,
     persist_run,
     should_update,
+    summary_to_last_result,
 )
 from .config import CloudflareIPConfig
 from .logging_setup import AccountLogger
@@ -156,10 +157,13 @@ class CFIPListener:
         # 频道每条消息都写一次 state.json 没必要，那次跳过交给定时调度记录。
         persist_run(self.store, self.account_name, state, summary, self.config)
 
-        # 通知
+        # 通知。⚠️ 成败用**和面板同一个判据**（``summary_to_last_result`` 的 ``ok``），
+        # 别用 ``summary.all_ok`` —— 它要求每条结果都 ok，而被跳过的条目 ok=False，
+        # 于是「写了 1 条、跳过 2 家」会给用户发一条**失败**通知。
+        shared = summary_to_last_result(summary, self.config)
         if summary.skipped:
             self.alog.info("更新跳过: %s", summary.skipped_reason)
-        elif summary.all_ok:
+        elif shared["ok"]:
             self._notify_success(summary)
         else:
             self._notify_failure(summary)

@@ -412,3 +412,15 @@ def test_cloudflare_status_card_is_split_aware() -> None:
     # 实测三家一起被跳过时面板会显示成故障，用户据此以为功能坏了。
     assert "'已跳过'" in html, "全跳过时要显示「已跳过」，不能报成异常/失败"
     assert "有异常" not in html
+    # 「写 1 条、跳 2 家」时也要把跳过数说出来，否则看着像只处理了一家。
+    # ⚠️ 断言要**具体到那一行**：`lr.skipped_count` 在模板里出现两处，
+    # 只断言名字存在的话，把其中一处删掉测试照样过（注入验证时真漏网过）。
+    assert "${lr.skipped_count} 条跳过" in html, "部分跳过时要把跳过条数一并报出来"
+    assert "if (lr.skipped_count" in html, "跳过条数要真的参与条件判断，不能是死代码"
+    # ⚠️ 判「已跳过」不能只看 lr.skipped —— 那个来自 skipped_reason，
+    # 只有「一家都没通过」那条路径才会写；部分跳过时它是 None。
+    assert "lr.skipped || lr.skipped_count" in html, (
+        "部分跳过（skipped_count>0 但没有 skipped_reason）也要判成「已跳过」"
+    )
+    # 跳过原因行原来只在 lr.skipped 时显示，部分跳过时会漏掉原因。
+    assert "if (lr.skipped_reason)" in html
