@@ -462,6 +462,42 @@ async def api_forward_set_enabled(
     return {"ok": True, "enabled": config.forward.enabled}
 
 
+@router.put("/config/{name}/forward-exclude-chats")
+async def api_forward_set_exclude_chats(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """账号级「排除频道」列表：这些会话**所有规则**都不监听。
+
+    与每条规则自己的 ``exclude_sources`` 互补：这里是写一次管全部的全局名单。
+
+    转发目标**不需要**填在这里 —— ``PreparedRule.chat_allowed`` 会自动把目标会话
+    排除掉（否则 ``sources=[]`` 全监听时，转发出去的新消息会被自己重新捕获，
+    形成无限转发循环）。这个列表是留给"目标之外、同样不想监听"的会话的。
+    """
+    from tg_assistant.config import ForwardConfig
+
+    _require_account(store, name)
+    raw = payload.get("exclude_chats")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="exclude_chats 必须是数组")
+
+    config = store.load_account_config(name, create=False)
+    # 交给模型校验（自动去 @ / 去空白 / 拒绝非法引用），避免在这里手写一遍归一化 ——
+    # 「同一个判断抄两份」是这个项目踩过的坑。
+    try:
+        config.forward = ForwardConfig.model_validate(
+            {**config.forward.model_dump(), "exclude_chats": raw}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"排除频道校验失败：{exc}") from exc
+    store.save_account_config(name, config)
+    return {"ok": True, "exclude_chats": list(config.forward.exclude_chats)}
+
+
 # --------------------------------------------------------------------------- #
 # 全局转发规则（跨账号）
 #
@@ -566,6 +602,7 @@ async def api_rules_overview(
                 "running": bool(info.get("running")),
                 "session_exists": bool(info.get("session_exists")),
                 "forward_enabled": config.forward.enabled,
+                "exclude_chats": list(config.forward.exclude_chats),
                 "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
             }
         )

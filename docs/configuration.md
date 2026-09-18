@@ -69,6 +69,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
   "forward": {
     "enabled": true,
     "dedupe_window": 300,
+    "exclude_chats": [],
     "rules": [
       {
         "id": "rule-1",
@@ -112,8 +113,10 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | --- | --- | --- |
 | `enabled` | bool | 总开关 |
 | `dedupe_window` | number | 去重窗口（秒），同一消息在此时间内不重复转发 |
+| `exclude_chats` | array | **账号级**排除的会话，写一次全部规则都不监听；格式同 sources |
 | `rules[].id` | string | 唯一标识 |
 | `rules[].sources` | array | 来源会话：`@username`、`chat_id`、`t.me/...` 链接。**空数组 = 监听全部** |
+| `rules[].exclude_sources` | array | 只对**这一条规则**生效的排除来源 |
 | `rules[].targets` | array | 目标会话，格式同 sources |
 | `rules[].mode` | string | `forward`（带转发抬头）/ `copy`（无抬头）/ `text`（按模板重发） |
 | `rules[].match.mode` | string | `regex` / `contains` / `exact` / `all` |
@@ -125,6 +128,18 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].delay` | number | 命中后延迟多少秒再发 |
 | `rules[].min_interval` | number | 同一规则两次触发的最小间隔 |
 | `rules[].notify` | bool | 转发后是否推 bot 通知 |
+
+> ⚠️ **转发目标不能同时是监听来源。**
+> `sources` 为空数组时表示"监听全部群组/频道"，此时如果目标频道也在账号可见范围内，
+> 转发出去的新消息会被本账号重新监听到（新消息 = 新 id，去重窗口拦不住），
+> 再次命中同一条规则 —— 每转发一次就多产生一次命中，几秒内就能刷爆目标频道。
+>
+> 代码里已经**自动把每条规则自己的 `targets` 排除在来源之外**（`PreparedRule.chat_allowed`），
+> 所以正常情况下不需要额外配置。但**反向也要注意**：想让 A 转发到 B 时，
+> 必须把 A 显式写进 `sources`，不要用 `[]` 全监听。
+>
+> 想额外排除一些"目标之外、但同样不想监听"的会话，用账号级的 `exclude_chats`
+> （面板：转发规则页 → 每个账号分组标题下的「排除频道」）。
 
 ### 模板变量
 

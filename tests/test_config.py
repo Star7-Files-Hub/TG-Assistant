@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from tg_assistant.config import (
     AccountConfig,
+    ForwardConfig,
     ForwardRule,
     MatchConfig,
     NotifyConfig,
@@ -176,6 +177,34 @@ class TestForwardRule:
     def test_text_mode_requires_template_or_default(self):
         rule = ForwardRule(id="r", targets=["me"], mode="text", match={"mode": "all"})
         assert rule.mode == "text"
+
+
+class TestForwardConfig:
+    """账号级排除频道：写一次，所有规则都不监听。"""
+
+    def test_exclude_chats_defaults_to_empty(self):
+        assert ForwardConfig().exclude_chats == []
+
+    def test_exclude_chats_normalizes_refs(self):
+        config = ForwardConfig(exclude_chats=["@Noisy_Channel", "-1001234567890", None])
+        # None 会被丢弃，@ 与大小写被归一化，数字字符串转 int
+        assert config.exclude_chats == ["noisy_channel", -1001234567890]
+
+    def test_exclude_chats_accepts_bare_string(self):
+        assert ForwardConfig(exclude_chats="@only_one").exclude_chats == ["only_one"]
+
+    def test_exclude_chats_round_trips(self):
+        config = ForwardConfig(exclude_chats=[-100999, "@a_b"])
+        again = ForwardConfig.model_validate(config.model_dump(mode="json"))
+        assert again.exclude_chats == config.exclude_chats
+
+    def test_exclude_chats_does_not_affect_rules(self):
+        """排除列表是账号级的，不该和规则校验互相干扰。"""
+        config = ForwardConfig(
+            exclude_chats=[-100999],
+            rules=[ForwardRule(id="r", targets=["me"], match={"mode": "all"})],
+        )
+        assert [r.id for r in config.active_rules] == ["r"]
 
 
 class TestNotifyConfig:

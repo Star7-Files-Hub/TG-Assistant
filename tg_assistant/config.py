@@ -348,6 +348,22 @@ class ForwardConfig(StrictModel):
     rules: list[ForwardRule] = Field(default_factory=list)
     #: 消息去重窗口（秒）。同一 (chat_id, message_id) 在窗口内只处理一次。
     dedupe_window: float = Field(default=300.0, ge=0.0)
+    #: 全局排除的会话：**所有规则**都不监听这些会话，写一次管全部。
+    #:
+    #: 与每条规则自己的 ``exclude_sources`` 的区别：这里是账号级的，
+    #: 适合放"永远不该被转发"的会话 —— 尤其是**转发目标频道本身**。
+    #: 注意转发目标已经由代码自动排除（见 ``PreparedRule.chat_allowed``），
+    #: 不需要在这里重复填；这个列表是给"目标之外、但同样不想监听"的会话用的。
+    exclude_chats: list[ChatRef] = Field(default_factory=list)
+
+    @field_validator("exclude_chats", mode="before")
+    @classmethod
+    def _normalize_exclude_chats(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, (str, int)):
+            value = [value]
+        return _normalize_refs(value)
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "ForwardConfig":

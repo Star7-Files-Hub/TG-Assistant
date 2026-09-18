@@ -101,6 +101,8 @@ class PreparedRule:
     exclude_sources: RefSet
     from_users: RefSet
     exclude_users: RefSet
+    #: 转发目标集合。**只用于"目标不能当来源"的防循环判断**，不参与其它筛选。
+    targets: RefSet
     last_fired: float = 0.0
     stats: dict[str, int] = field(default_factory=lambda: {"matched": 0, "sent": 0, "failed": 0, "skipped": 0})
 
@@ -113,6 +115,7 @@ class PreparedRule:
             exclude_sources=RefSet(rule.exclude_sources),
             from_users=RefSet(rule.from_users),
             exclude_users=RefSet(rule.exclude_users),
+            targets=RefSet(rule.targets),
         )
 
     @property
@@ -139,7 +142,15 @@ class PreparedRule:
         这里走 :func:`~tg_assistant.matching.normalize_chat_kind` 而不是直接比较
         字符串：``private`` / ``bot`` / ``direct`` 都是 1:1 会话，
         逐个枚举容易漏（``direct`` 就漏过一次）。
+
+        **本规则的目标会话永远不能当来源**，即使它被显式写进 ``sources``。
+        原因：``sources=[]``（监听全部）时，转发到目标的那些新消息会被本账号
+        重新监听到（新消息 = 新 id，去重缓存拦不住），再次命中同一条规则，
+        于是每转发一次就多产生一次命中 —— 正反馈死循环，几秒内就能刷爆目标频道。
+        详见 ``tests/test_forwarder.py::TestPreparedRule::test_target_never_acts_as_source``。
         """
+        if self.targets and self.targets.matches(chat_id, chat_username):
+            return False, "该会话是本规则的目标，不能作为来源（防转发循环）"
         if self.exclude_sources and self.exclude_sources.matches(chat_id, chat_username):
             return False, "来源在 exclude_sources 中"
         if self.sources:
@@ -210,12 +221,21 @@ class ForwardEngine:
         self.rules: list[PreparedRule] = [
             PreparedRule.build(rule) for rule in config.forward.active_rules
         ]
+        #: 账号级全局排除：这些会话任何规则都不监听（与每条规则的 exclude_sources 互补）。
+        self._exclude_chats = RefSet(config.forward.exclude_chats)
         self.dedupe = DedupeCache(config.forward.dedupe_window)
         self._handlers: list[tuple[Any, int]] = []
         self._tasks: set[asyncio.Task[None]] = set()
         self._media_groups: dict[tuple[int, str], MediaGroupBuffer] = {}
         self._lock = asyncio.Lock()
-        self.stats = {"received": 0, "matched": 0, "forwarded": 0, "failed": 0, "deduped": 0}
+        self.stats = {
+            "received": 0,
+            "excluded": 0,
+            "matched": 0,
+            "forwarded": 0,
+            "failed": 0,
+            "deduped": 0,
+        }
 
     # ------------------------------------------------------------------ #
     @property
@@ -258,6 +278,7 @@ class ForwardEngine:
             "转发引擎已注册",
             rules=len(self.rules),
             watched_chats=len(chats) or "全部群组/频道",
+            exclude_chats=len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
             dedupe_window_s=self.config.forward.dedupe_window,
             rule_ids=",".join(prepared.id for prepared in self.rules),
         )
@@ -313,6 +334,19 @@ class ForwardEngine:
         kind = chat_kind(message)
         sender_id, sender_username, is_self, _is_bot = sender_of(message)
         now = time.monotonic()
+
+        # 账号级全局排除：命中就直接丢弃，连规则都不看。
+        # 放在规则循环**外面**是刻意的 —— 它是"所有规则都不监听"的语义，
+        # 每条规则各判一次既浪费又容易漏（漏一条就等于没排除）。
+        if self._exclude_chats and self._exclude_chats.matches(chat_id, chat_username):
+            self.stats["excluded"] += 1
+            self.alog.debug(
+                "跳过消息",
+                reason="会话在 forward.exclude_chats 中",
+                chat=chat_title or chat_id,
+                message_id=message_id,
+            )
+            return
 
         for prepared in self.rules:
             rule = prepared.rule

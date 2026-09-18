@@ -17,7 +17,7 @@ SRC = -1001111111111
 DST = -1002222222222
 
 
-def build_config(**rule_overrides) -> AccountConfig:
+def build_config(*, exclude_chats=None, **rule_overrides) -> AccountConfig:
     rule = {
         "id": "r1",
         "name": "测试规则",
@@ -26,7 +26,10 @@ def build_config(**rule_overrides) -> AccountConfig:
         "match": {"mode": "regex", "patterns": [r"关键词(\d+)"]},
     }
     rule.update(rule_overrides)
-    return AccountConfig.model_validate({"forward": {"enabled": True, "rules": [rule]}})
+    forward = {"enabled": True, "rules": [rule]}
+    if exclude_chats is not None:
+        forward["exclude_chats"] = exclude_chats
+    return AccountConfig.model_validate({"forward": forward})
 
 
 def src_message(text: str, **kwargs):
@@ -119,6 +122,44 @@ class TestPreparedRule:
         prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
         assert prepared.chat_allowed(-1001, None, kind)[0]
 
+    # ---------------------------------------------------------------- #
+    # 🔴 防转发死循环（2026-09-18 线上事故的回归防线）
+    # ---------------------------------------------------------------- #
+    def test_target_never_acts_as_source(self):
+        """目标会话不能当来源，否则会无限转发。
+
+        线上事故：``sources=[]``（监听全部）+ ``targets`` 指向账号可见的频道
+        ⇒ 转发出去的新消息被自己重新监听到（新消息 = 新 id，去重缓存拦不住）
+        ⇒ 再次命中同一条规则 ⇒ 正反馈，100 秒刷了 183 条。
+        """
+        prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
+        allowed, reason = prepared.chat_allowed(DST, None, "channel")
+        assert not allowed
+        assert "目标" in reason
+
+    def test_target_rejected_even_if_listed_in_sources(self):
+        """即使有人手滑把目标写进 sources，也必须拒绝 —— 这是硬红线，不靠配置自觉。"""
+        prepared = PreparedRule.build(
+            build_config(sources=[SRC, DST], targets=[DST]).forward.rules[0]
+        )
+        assert not prepared.chat_allowed(DST, None)[0]
+        assert prepared.chat_allowed(SRC, None)[0]
+
+    def test_target_username_also_rejected(self):
+        """targets 写 username 时同样生效，且大小写不敏感。"""
+        prepared = PreparedRule.build(
+            build_config(sources=[], targets=["@Notify_Channel"]).forward.rules[0]
+        )
+        assert not prepared.chat_allowed(-1002626018568, "notify_channel", "channel")[0]
+        assert prepared.chat_allowed(-100999, "other_channel", "channel")[0]
+
+    def test_target_guard_is_narrow(self):
+        """这道闸只拦目标本身，别的会话照常放行 —— 不能把 sources=[] 的"全监听"打瘸。"""
+        prepared = PreparedRule.build(build_config(sources=[]).forward.rules[0])
+        assert prepared.chat_allowed(SRC, None)[0]
+        assert prepared.chat_allowed(-100999, "whatever", "group")[0]
+        assert prepared.chat_allowed(-100888, None, "channel")[0]
+
     def test_from_users_whitelist(self):
         prepared = PreparedRule.build(build_config(from_users=[777]).forward.rules[0])
         assert prepared.sender_allowed(777, None, False)[0]
@@ -182,6 +223,72 @@ class TestForwardEngine:
         )
         await drain(engine)
         assert len(client.forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_loop_when_target_is_visible(self, client, alog):
+        """🔴 端到端防循环：目标频道里新出现的消息不能再被转发。
+
+        还原真实死循环的第二步 —— 源消息转发到 DST 后，DST 里出现一条**新 id**
+        的消息（去重缓存对此无能为力），引擎必须在 ``chat_allowed`` 就拒掉它。
+        """
+        engine = ForwardEngine(client, build_config(sources=[]), alog)
+        engine.register()
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1
+
+        # 转发产生的新消息 id 出现在目标频道里，连续喂三轮模拟放大过程
+        first_new_id = client.next_message_id
+        for offset in range(3):
+            engine._handle(
+                make_message(
+                    "关键词123",
+                    message_id=first_new_id + offset,
+                    chat=FakeChat(DST, title="目标频道"),
+                ),
+                edited=False,
+            )
+            await drain(engine)
+
+        assert len(client.forwarded) == 1, "目标频道里的消息又被转发了 —— 死循环没被拦住"
+        assert engine.stats["matched"] == 1
+
+    @pytest.mark.asyncio
+    async def test_global_exclude_chats_blocks_every_rule(self, client, alog):
+        """账号级 exclude_chats：写一次，所有规则都不监听。"""
+        engine = ForwardEngine(client, build_config(sources=[], exclude_chats=[SRC]), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert client.forwarded == []
+        assert engine.stats["excluded"] == 1
+        assert engine.stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_global_exclude_chats_accepts_username(self, client, alog):
+        """排除列表支持 @username，且大小写不敏感。"""
+        engine = ForwardEngine(
+            client, build_config(sources=[], exclude_chats=["@Noisy_Channel"]), alog
+        )
+        engine.register()
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(-100777, username="noisy_channel")),
+            edited=False,
+        )
+        await drain(engine)
+        assert client.forwarded == []
+        assert engine.stats["excluded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_global_exclude_leaves_other_chats_alone(self, client, alog):
+        """排除列表只拦名单里的会话，别的照常转发。"""
+        engine = ForwardEngine(client, build_config(sources=[], exclude_chats=[-100999]), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1
+        assert engine.stats["excluded"] == 0
 
     @pytest.mark.asyncio
     async def test_unrestricted_registers_group_channel_filter(self, client, alog):

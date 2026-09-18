@@ -158,6 +158,56 @@ def test_forward_enabled_toggle(client, app, account) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 账号级「排除频道」
+# --------------------------------------------------------------------------- #
+def test_forward_exclude_chats_round_trip(client, app, account) -> None:
+    """写进去能读回来，且 @ 前缀 / 大小写会被归一化。"""
+    resp = client.put(
+        f"/api/config/{NAME}/forward-exclude-chats",
+        json={"exclude_chats": [-1002626018568, "@Noisy_Channel"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["exclude_chats"] == [-1002626018568, "noisy_channel"]
+
+    # 总览接口也要带上，否则面板刷新后列表就"消失"了
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["exclude_chats"] == [-1002626018568, "noisy_channel"]
+
+
+def test_forward_exclude_chats_can_be_cleared(client, app, account) -> None:
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": [1]}).status_code
+        == 200
+    )
+    for body in ({"exclude_chats": []}, {}, {"exclude_chats": None}):
+        resp = client.put(f"/api/config/{NAME}/forward-exclude-chats", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["exclude_chats"] == []
+
+
+def test_forward_exclude_chats_rejects_non_list(client, app, account) -> None:
+    resp = client.put(f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": "nope"})
+    assert resp.status_code == 400
+
+
+def test_forward_exclude_chats_unknown_account_is_404(client, app) -> None:
+    resp = client.put("/api/config/ghost/forward-exclude-chats", json={"exclude_chats": []})
+    assert resp.status_code == 404
+
+
+def test_forward_exclude_chats_does_not_clobber_rules(client, app, account) -> None:
+    """改排除列表不能把已有规则顺手弄丢（整个 forward 对象是重建的）。"""
+    assert client.post(f"/api/config/{NAME}/rules", json=_rule_payload()).status_code == 200
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+    body = client.get(f"/api/config/{NAME}/rules").json()
+    assert [r["id"] for r in body["rules"]] == ["r1"]
+    assert body["rules"][0]["targets"] == [-1001234567890]
+
+
+# --------------------------------------------------------------------------- #
 # 规则试跑
 # --------------------------------------------------------------------------- #
 def test_rules_test_regex_match_and_groups(client, app, account) -> None:
