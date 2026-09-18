@@ -376,9 +376,12 @@
                             <span class="toggle-slider"></span>
                             <span class="toggle-label">转发总开关</span>
                         </label>
-                        <button class="tg-btn tg-btn-sm" data-action="start" title="启动该账号">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                            启动
+                        <button class="tg-btn tg-btn-sm" data-action="start"
+                                title="${acc.running ? '重启该账号（改完规则要重启才生效）' : '启动该账号'}">
+                            ${acc.running
+                                ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>'
+                                : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>'}
+                            ${acc.running ? '重启' : '启动'}
                         </button>
                         <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="stop" title="停止该账号">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
@@ -495,20 +498,21 @@
     // ==================== 账号级操作 ====================
     async function startAccount(name) {
         if (!name) return;
-        // 这里**不再**弹确认框。
+        // 这个按钮在账号已运行时叫「重启」——因为**转发规则只在启动时读一次**，
+        // 「改完规则 → 点它」必须真的把新规则加载进去。后端 `start_account()`
+        // 遇到已运行会优雅重启，不再返回 ok=false。
         //
-        // 以前弹是因为一个架构缺陷：服务用 `tg-assistant run --web` 启动时，
-        // 真正在跑的 MultiRunner 属于 CLI，而面板里的 WebRuntime 是另一个对象
-        // （`_runner` 恒为 None）→ `/api/status` 永远报 running=false，面板也控制不了
-        // 那个 runner，点「启动」会再拉起一套、同一条消息转发两次。
+        // 这里**不再**弹确认框。以前弹是因为一个架构缺陷：服务用
+        // `tg-assistant run --web` 启动时，真正在跑的 MultiRunner 属于 CLI，
+        // 而面板里的 WebRuntime 是另一个对象（`_runner` 恒为 None）→
+        // `/api/status` 永远报 running=false，面板也控制不了那个 runner，
+        // 点「启动」会再拉起一套、同一条消息转发两次。
         //
         // 现在 `create_app(runner=...)` 会把 CLI 建好的 runner 交给 RuntimeManager
-        // **接管**（见 `runtime.py:_adopt_external_runner`），面板就是唯一的控制方：
-        // 状态真实、启停都生效。重复点「启动」会被 `RuntimeManager.start()` 直接
-        // 拒掉（「已经在运行中，请先停止」），不需要前端再拦一道。
+        // **接管**（见 `runtime.py:_adopt_external_runner`），面板就是唯一的控制方。
         const res = await fetch(`/api/run/start/${encodeURIComponent(name)}`, {method: 'POST'});
         const data = await res.json().catch(() => ({}));
-        toast(data.ok ? `已启动「${name}」` : (detailText(data) || '启动失败'), !!data.ok);
+        toast(data.ok ? (data.message || `已启动「${name}」`) : (detailText(data) || '启动失败'), !!data.ok);
         setTimeout(loadAll, 1500);
     }
 
@@ -576,7 +580,13 @@
 
     function detailText(data) {
         // FastAPI 的 422 会把 detail 给成一个数组，直接丢给 toast 会渲染成 [object Object]
-        return typeof data.detail === 'string' ? data.detail : '';
+        if (typeof data.detail === 'string') return data.detail;
+        // ⚠️ `/api/run/*` 这几个端点返回的是 `{"ok": false, "message": "..."}`，
+        // 原因在 **message** 里、没有 detail —— 只读 detail 的话前端一律退化成
+        // 兜底文案「启动失败」，用户看不到「已经在运行中，请先停止」这种真正的理由。
+        // 2026-09-17 线上就是这样：用户只看到「启动失败」四个字。
+        if (typeof data.message === 'string') return data.message;
+        return '';
     }
 
     // ==================== Tag Input ====================

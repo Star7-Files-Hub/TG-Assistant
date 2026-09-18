@@ -520,3 +520,61 @@ def test_frontend_timeout_outlasts_the_backend_one() -> None:
         f"前端 {frontend:.0f}s 撑不到后端最坏情况 {backend_worst:.0f}s"
         f"（建 client {client_timeout.group(1)}s + 抓取 {fetch_timeout.group(1)}s）"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 规则页的「启动」按钮：账号已在运行时必须能重启（不是报错）
+# --------------------------------------------------------------------------- #
+def _rules_html() -> str:
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    return (web_dir / "templates" / "rules.html").read_text(encoding="utf-8")
+
+
+def test_rules_start_button_becomes_restart_when_running() -> None:
+    """🔴 回归：账号在运行时点「启动」必然失败（线上就是这么踩的）。
+
+    转发规则只在账号**启动时**读一次，所以「改完规则 → 点启动」是用户表达
+    「让新规则生效」的唯一动作。而账号正在跑时后端原来直接返回
+    ``ok=False / "账号 X 已在运行"``，于是这条最自然的操作路径必然失败。
+
+    修法分两半，这里钉前端那一半：按钮在运行中必须显示成「重启」，
+    否则用户根本不知道该点哪儿（页面上只有「启动」和「停止」两个键）。
+    """
+    html = _rules_html()
+
+    assert "acc.running ? '重启' : '启动'" in html, (
+        "运行中的账号，按钮文案必须变成「重启」——否则用户只会反复点「启动」然后失败"
+    )
+    assert "重启该账号（改完规则要重启才生效）" in html, "按钮 title 没说明重启的目的"
+
+    # 图标也要跟着换：播放三角 ≠ 重启。
+    # ⚠️ 断言必须**限定在按钮那一块**里 —— 页面顶部的「刷新」按钮用的是同一个
+    # polyline，全文搜的话这条断言等于没写。
+    start_at = html.index('data-action="start"')
+    button = html[start_at : html.index("</button>", start_at)]
+    assert "acc.running" in button, "按钮没有按运行状态分支"
+    assert 'polyline points="23 4 23 10 17 10"' in button, "运行中应该显示「重启」图标"
+    assert 'polygon points="5 3 19 12 5 21 5 3"' in button, "未运行时应该显示「启动」图标"
+
+
+def test_rules_start_account_shows_backend_message() -> None:
+    """成功时要把后端的 ``message``（「已重启「X」，新规则已生效」）显示出来。"""
+    body = _js_function_body(_rules_html(), "startAccount")
+
+    assert "data.message" in body, "成功分支没用后端的 message，用户看不到「已重启」"
+
+
+def test_detail_text_falls_back_to_message() -> None:
+    """🔴 回归：``/api/run/*`` 的原因在 ``message`` 里，前端却只读 ``detail``。
+
+    线上症状就是用户的原话 ——「转发规则启动失败了」：他看到的四个字
+    **就是** ``detailText()`` 返回空串之后的兜底文案 ``'启动失败'``，
+    真正的理由（「已经在运行中，请先停止」）被前端丢掉了。
+    """
+    body = _js_function_body(_rules_html(), "detailText")
+
+    assert "data.detail" in body, "FastAPI 的 HTTPException 走的是 detail"
+    assert "data.message" in body, (
+        "/api/run/* 返回 {ok, message}，只读 detail 会让所有这类错误退化成"
+        "兜底文案「启动失败」，用户看不到原因"
+    )

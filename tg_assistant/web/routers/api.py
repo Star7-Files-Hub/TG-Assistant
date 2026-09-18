@@ -1237,10 +1237,14 @@ async def api_run_stop(runtime=Depends(get_runtime)) -> dict[str, Any]:
 
 @router.post("/run/start/{name}")
 async def api_run_start_one(name: str, runtime=Depends(get_runtime)) -> dict[str, Any]:
-    """单独启动一个账号。
+    """启动一个账号；**已经在跑的会被重启**（让改过的转发规则生效）。
 
     走 :meth:`RuntimeManager.start_account`，而不是 ``start([name])`` ——
     后者在已有账号运行时只会返回「已经在运行中」，等于这个端点没法用。
+
+    ⚠️ 账号的转发规则只在启动时读一次，所以「改完规则 → 点启动」必须能真的
+    把规则重新加载进去。这条路径以前返回 ``ok=False``，线上真的让用户以为
+    「功能坏了」。
     """
     record = runtime.store.get_account(name)
     if record is None:

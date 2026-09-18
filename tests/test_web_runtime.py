@@ -146,14 +146,58 @@ async def test_start_account_joins_running_batch(manager: RuntimeManager) -> Non
     await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
 
 
-async def test_start_account_rejects_already_running(manager: RuntimeManager) -> None:
+async def test_start_account_restarts_when_already_running(manager: RuntimeManager) -> None:
+    """🔴 回归：账号已在运行时，`start_account()` 必须**优雅重启**它，而不是报错。
+
+    线上（2026-09-17）：用户的转发规则只在启动时读一次，改完规则点那个按钮
+    （当时叫「启动」）想让规则生效 —— 而账号正在跑，于是这里返回
+    ``ok=False, message="账号 a 已在运行"``，前端又只读 ``detail``、
+    退化成兜底文案「启动失败」。用户看到的就是「转发规则启动失败了」。
+
+    修法：语义改成「启动 = 让当前配置生效」，已在运行就重启。
+    """
     await _started(manager, ["a"])
 
     result = await asyncio.wait_for(manager.start_account("a"), DEADLOCK_GUARD)
 
-    assert not result["ok"]
-    assert "已在运行" in result["message"]
-    assert len(_FakeMultiRunner.instances) == 1, "重复启动不该把账号重启一遍"
+    assert result["ok"], f"已经在运行时点「启动」必须成功重启，而不是报错: {result}"
+    assert result.get("restarted") is True
+    assert "已重启" in result["message"]
+    assert result["accounts"] == ["a"], "重启后账号集合不能变，更不能重复"
+    restarted = _FakeMultiRunner.instances[-1]
+    await asyncio.wait_for(restarted.started.wait(), DEADLOCK_GUARD)
+    assert restarted.names == ["a"], "重启后新 runner 里的账号不对（重复或丢了）"
+    assert len(_FakeMultiRunner.instances) == 2, "应该恰好重建一个 runner"
+
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+
+async def test_start_account_restart_is_graceful(manager: RuntimeManager) -> None:
+    """重启必须走优雅路径：先 ``request_shutdown()``，再建新的。
+
+    直接 cancel 会跳过 MultiRunner 的清理（关 client、排空通知队列），
+    新旧 client 会争抢同一个 ``.session`` 文件 —— 这正是 ``database is locked``
+    的历史根因。
+    """
+    old = await _started(manager, ["a"])
+
+    await asyncio.wait_for(manager.start_account("a"), DEADLOCK_GUARD)
+
+    assert old.shutdown_requested, "重启旧 runner 时必须先请它自己优雅退出"
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+
+async def test_start_account_restart_does_not_deadlock(manager: RuntimeManager) -> None:
+    """重启路径同样不能在持锁时调 ``start()``（``asyncio.Lock`` 不可重入）。"""
+    await _started(manager, ["a", "b"])
+
+    result = await asyncio.wait_for(manager.start_account("a"), DEADLOCK_GUARD)
+
+    assert result["ok"], result
+    assert result["accounts"] == ["a", "b"], "重启一个账号不该把另一个踢掉"
+    restarted = _FakeMultiRunner.instances[-1]
+    await asyncio.wait_for(restarted.started.wait(), DEADLOCK_GUARD)
+    assert restarted.names == ["a", "b"]
 
     await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
 

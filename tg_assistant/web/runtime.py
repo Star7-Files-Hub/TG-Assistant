@@ -447,21 +447,37 @@ class RuntimeManager:
         return {"ok": True, "message": f"已停止账号 {name}", "accounts": remaining}
 
     async def start_account(self, name: str) -> dict[str, Any]:
-        """单独启动一个账号。
+        """单独启动一个账号；**已经在跑的会被优雅重启**。
 
-        已经在跑的账号会被一并优雅重启 —— 原因同 :meth:`stop_account`：
+        ⚠️ 这里原来是「已在运行就返回 ``ok=False``」，2026-09-17 线上真踩到了：
+
+        账号的转发规则只在**启动时读一次**（``runner.py`` 里的
+        ``forward_rules=len(config.forward.active_rules)``），所以
+        **改完规则必须重启账号才生效**。而用户表达「让改过的规则生效」的动作
+        恰恰就是点那个按钮 —— 按钮叫「启动」，账号又正在跑，于是必然失败。
+        用户看到的还是笼统的「启动失败」（原因见 ``rules.html`` 的 ``detailText``），
+        只能一脸茫然。
+
+        所以语义改成「启动 = 让当前配置生效」：已在运行就重启它。
+        其余在跑的账号会被一并重启 —— 原因同 :meth:`stop_account`，
         ``MultiRunner`` 一次只接受一批账号。
         """
         async with self._lock:
             running = sorted(self._running_accounts()) if self.is_running else []
-            if name in running:
-                return {"ok": False, "message": f"账号 {name} 已在运行"}
+            restarted = name in running
             runner, task = self._detach_runner() if self.is_running else (None, None)
 
         if runner is not None or task is not None:
             await self._finish_stop(runner, task)
 
-        return await self.start([*running, name])
+        # 去重：被重启的那个账号本来就在 running 里，直接拼会重复。
+        names = list(dict.fromkeys([*running, name]))
+        result = await self.start(names)
+        if not result.get("ok"):
+            return result
+        if restarted:
+            return {**result, "restarted": True, "message": f"已重启「{name}」，新规则已生效"}
+        return result
 
     def _detach_runner(self) -> tuple[Any, Optional[asyncio.Task[None]]]:
         """把当前 runner 与任务摘下来交给调用方（必须在持锁时调用）。"""
