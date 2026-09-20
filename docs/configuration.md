@@ -118,13 +118,13 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].sources` | array | 来源会话：`@username`、`chat_id`、`t.me/...` 链接。**空数组 = 监听全部** |
 | `rules[].exclude_sources` | array | 只对**这一条规则**生效的排除来源 |
 | `rules[].targets` | array | 目标会话，格式同 sources |
-| `rules[].mode` | string | `forward`（带转发抬头）/ `copy`（无抬头）/ `text`（按模板重发）。⚠️ **`forward` 遇到受保护源会话时（Telegram 回 `CHAT_FORWARDS_RESTRICTED`）会自动改用复制**再发一次，不用手动改成 `copy`；那条消息的日志会显示 `mode=copy(降级)` |
+| `rules[].mode` | string | `forward`（原生转发，带「转发自」抬头）/ `copy`（**按 `file_id` 重新发送一条新消息**，不带来源标记，默认值）/ `text`（按模板重发纯文本）。⚠️ **`forward` 遇到受保护源会话时（Telegram 回 `CHAT_FORWARDS_RESTRICTED`）会自动改用复制**再发一次，不用手动改成 `copy`；那条消息的日志会显示 `mode=copy(降级)` |
 | `rules[].match.mode` | string | `regex` / `contains` / `exact` / `all` |
 | `rules[].match.patterns` | array | 匹配模式（正则或关键词） |
 | `rules[].match.exclude_patterns` | array | 排除模式 |
 | `rules[].match.fields` | array | 匹配范围：`text` / `caption` / `buttons` |
 | `rules[].template` | string | `text` 模式下的模板，可用变量见下文 |
-| `rules[].include_source_link` | bool | 是否附带来源链接（默认 `true`）。**`forward` 模式不需要它** —— Telegram 的「转发自」抬头本身就是回溯入口；**`copy` 模式**（含 `forward` 撞受保护源会话后的自动降级）没有抬头，会在正文/caption 末尾追加一行 `🔗原文链接：<t.me 链接>`（前面空一行）。实现上是发出后 `edit` 一次消息，**编辑失败不影响转发本身** |
+| `rules[].include_source_link` | bool | 是否附带来源链接（默认 `true`）。**`forward` 模式不需要它** —— Telegram 的「转发自」抬头本身就是回溯入口；**`copy` / `text` 模式**（含 `forward` 撞受保护源会话后的自动降级）没有抬头，会在正文/caption 末尾追加一行 `🔗原文链接：<t.me 链接>`（前面空一行）。实现上链接是**发送时就写进正文**的（`copy` 模式按 `file_id` 重发，文本走 `send_message`、媒体走 `send_cached_media`、相册走 `copy_media_group`），**不是**事后编辑 —— Telegram 拒绝编辑转发消息 |
 | `rules[].media_group` | bool | 是否聚合相册（攒齐后一次转发） |
 | `rules[].delay` | number | 命中后延迟多少秒再发 |
 | `rules[].min_interval` | number | 同一规则两次触发的最小间隔 |

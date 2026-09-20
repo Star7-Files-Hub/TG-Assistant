@@ -13,7 +13,13 @@
    重复更新造成二次转发；**跨账号** ``(chat_id, message_id, 目标)`` 共享表，防止多个账号
    都在同一个源群里时把同一条消息各发一遍。
 6. **forward 失败自动降级 copy**：源会话受保护时 Telegram 会拒 forward，此时自动改用
-   复制（``drop_author``）再发一次，而不是直接失败。
+   复制再发一次，而不是直接失败。
+
+⚠️ **``copy`` 模式 = 按 ``file_id`` 重新发送一条新消息**，不是
+``forward_messages(hide_sender_name=True)``。后者发出来的是**转发消息**，而 Telegram
+**拒绝编辑转发消息**（实测 ``400 Bad Request: message can't be edited``）⇒
+「先转发、再 edit 补上原文链接」这条路根本走不通。重发拿到的是全新消息，链接在**发送时**
+就写进正文，一次 RPC 搞定、零编辑。
 
 每条转发都会记录 ``pipeline_ms``（消息在 Telegram 的时间戳到发送完成的总耗时）和
 ``handler_ms``（本进程内耗时），日志里直接能看出慢在哪一段。
@@ -30,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.errors import ChatForwardsRestricted
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import LinkPreviewOptions
@@ -786,8 +793,7 @@ class ForwardEngine:
         返回 ``(已发送的消息 id, 是否发生了 forward→copy 降级)``。
 
         ``mode="forward"`` 遇到受保护源会话（Telegram 回 400 ``CHAT_FORWARDS_RESTRICTED``）
-        时**自动改用复制**再发一次 —— 这就是「copy 做备选」。复制是服务端另一次
-        ``forwardMessages``（只是带上 ``drop_author``），不需要下载再上传。
+        时**自动改用复制**再发一次 —— 这就是「copy 做备选」。
         """
         rule = prepared.rule
         chat_id, _, chat_title = chat_identity(message)
@@ -797,11 +803,21 @@ class ForwardEngine:
         if rule.silent:
             kwargs["disable_notification"] = True
 
+        #: 原文链接（``build_variables`` 给的 t.me 永久链接）。
+        link = str(variables.get("link") or "")
+        #: 只有 copy 需要显式写链接 —— forward 自带的「转发自」抬头本身就是回溯入口。
+        want_link = bool(rule.include_source_link and link)
+
+        def _with_link(base: str) -> str:
+            """把「🔗原文链接：…」接到正文 / caption 末尾（前面空一行）。"""
+            if not want_link or link in base:
+                return base
+            return f"{base}\n\n{SOURCE_LINK_PREFIX}{link}" if base else f"{SOURCE_LINK_PREFIX}{link}"
+
         async def _server_forward(hide_sender: bool) -> list[int]:
-            """服务端转发 / 复制。
+            """服务端转发。``hide_sender=True``（= raw ``drop_author``）去掉「转发自」抬头。
 
             单次 RPC 完成：天然保留相册分组与媒体，不需要下载再上传。
-            ``hide_sender=True``（= raw ``drop_author``）去掉「转发自」抬头，即 copy 模式。
             """
             sent = await self.client.forward_messages(
                 chat_id=target,
@@ -812,151 +828,151 @@ class ForwardEngine:
             )
             return _sent_ids(sent)
 
-        #: 原文链接（``build_variables`` 给的 t.me 永久链接）。
-        link = str(variables.get("link") or "")
+        async def _server_copy() -> list[int]:
+            """**真正的复制**：按 ``file_id`` 重新发送一条**新消息**。
 
-        async def _do() -> list[int]:
-            if rule.mode in {"forward", "copy"}:
-                return await _server_forward(rule.mode == "copy")
+            ⚠️ 不能拿 ``forward_messages(hide_sender_name=True)`` 当复制用。那样发出来的是
+            **转发消息**，而 Telegram **拒绝编辑转发消息**（2026-09-20 实测
+            ``400 Bad Request: message can't be edited``）⇒ 事后没法把原文链接追加进去。
+            「重新发送」拿到的是全新消息，链接在**发送时**就写进正文 / caption ——
+            一次 RPC 搞定，零编辑。
 
-            # text 模式：按模板重发纯文本
-            text = render_template(rule.template or "{text}", variables)
-            if rule.include_source_link and link and link not in text:
-                text = f"{text}\n\n{SOURCE_LINK_PREFIX}{link}"
-            text = truncate(text)
-            if not text.strip():
-                text = "（原消息无文本内容）"
-            sent = await self.client.send_message(
+            - 文本：``send_message``（带上原 entities，保留粗体 / 链接等格式）
+            - 媒体：``Message.copy``（内部 ``send_cached_media``，服务端按 file_id 复用，
+              不下载不上传）
+            - 相册：``copy_media_group``（服务端 ``SendMultiMedia``）。``captions`` 传 list 时
+              **按下标取值、越界回落原 caption** ⇒ 只覆盖第一项就能给相册首图加链接
+            """
+            if len(ids) > 1:
+                captions = None
+                if want_link:
+                    captions = [
+                        truncate(
+                            _with_link(getattr(message, "caption", None) or ""),
+                            CAPTION_LIMIT,
+                        )
+                    ]
+                sent = await self.client.copy_media_group(
+                    chat_id=target,
+                    from_chat_id=chat_id,
+                    message_id=ids[0],
+                    captions=captions,
+                    **kwargs,
+                )
+                return _sent_ids(sent)
+
+            text = getattr(message, "text", None)
+            if text is not None:
+                body = _with_link(text)
+                trimmed = truncate(body, MAX_TEXT_LENGTH)
+                if not trimmed.strip():
+                    trimmed = "（原消息无文本内容）"
+                sent = await self.client.send_message(
+                    chat_id=target,
+                    text=trimmed,
+                    # 截断可能切断实体边界 ⇒ Telegram 回 ENTITY_BOUNDS_INVALID，
+                    # 这种情况就丢掉 entities（宁可少点格式，也不能发不出去）
+                    entities=getattr(message, "entities", None) if trimmed == body else None,
+                    parse_mode=ParseMode.DISABLED,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    **kwargs,
+                )
+                return _sent_ids(sent)
+
+            sent = await message.copy(
                 chat_id=target,
-                text=text,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                caption=truncate(
+                    _with_link(getattr(message, "caption", None) or ""), CAPTION_LIMIT
+                ),
                 **kwargs,
             )
             return _sent_ids(sent)
 
-        try:
-            sent = await with_flood_retry(
-                _do,
-                alog=self.alog,
-                action=f"转发到 {target}",
-                retries=2,
-                max_flood_wait=60.0,
-            )
-        except SessionInvalid:
-            raise
-        except Exception as exc:
-            # ① 源会话禁止转发（受保护群/频道）⇒ 自动降级为复制。
-            #    Telegram 对受保护内容回 400 CHAT_FORWARDS_RESTRICTED，而「复制」是允许的
-            #    —— 这是唯一能靠换模式绕过去的错误，所以单独识别。
-            #    代价：该源会话的每条消息都要先撞一次失败。受保护与否是**源会话的属性**，
-            #    按 (规则, 源会话) 记忆能省掉这次 RPC，但源会话可能取消保护，
-            #    所以这里选择每次都真试一遍 —— 正确性优先。
-            if rule.mode == "forward" and _is_forwards_restricted(exc):
+        async def _copy_with_fallback() -> list[int]:
+            """复制；复制失败就退化成 ``drop_author`` 转发（内容能到，但**丢原文链接**）。"""
+            try:
+                return await with_flood_retry(
+                    _server_copy,
+                    alog=self.alog,
+                    action=f"复制到 {target}",
+                    retries=2,
+                    max_flood_wait=60.0,
+                )
+            except SessionInvalid:
+                raise
+            except Exception as exc:  # noqa: BLE001
                 self.alog.warning(
-                    "源会话禁止转发，自动降级为复制",
+                    "复制失败，退化为不带抬头的转发（原文链接会丢失）",
                     rule=rule.label,
                     target=target,
                     source_chat=chat_title or chat_id,
                     message_ids=",".join(map(str, ids)),
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                sent = await with_flood_retry(
+                return await with_flood_retry(
                     lambda: _server_forward(True),
                     alog=self.alog,
-                    action=f"复制到 {target}",
+                    action=f"转发到 {target}",
                     retries=2,
                     max_flood_wait=60.0,
                 )
-                self.stats["downgraded"] += 1
-                # 降级后发出去的同样是**复制内容** ⇒ 也要补原文链接。
-                if rule.include_source_link:
-                    await self._append_source_link(target, sent, message, link)
-                return sent, True
 
-            if rule.mode != "copy" or len(ids) > 1:
+        try:
+            if rule.mode == "forward":
+                sent = await with_flood_retry(
+                    lambda: _server_forward(False),
+                    alog=self.alog,
+                    action=f"转发到 {target}",
+                    retries=2,
+                    max_flood_wait=60.0,
+                )
+                return sent, False
+
+            if rule.mode == "copy":
+                return await _copy_with_fallback(), False
+
+            # text 模式：按模板重发纯文本
+            text = render_template(rule.template or "{text}", variables)
+            if want_link and link not in text:
+                text = f"{text}\n\n{SOURCE_LINK_PREFIX}{link}"
+            text = truncate(text)
+            if not text.strip():
+                text = "（原消息无文本内容）"
+            sent = await with_flood_retry(
+                lambda: self.client.send_message(
+                    chat_id=target,
+                    text=text,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    **kwargs,
+                ),
+                alog=self.alog,
+                action=f"发送到 {target}",
+                retries=2,
+                max_flood_wait=60.0,
+            )
+            return _sent_ids(sent), False
+        except SessionInvalid:
+            raise
+        except Exception as exc:
+            # 源会话禁止转发（受保护群/频道）⇒ 自动降级为复制。
+            # Telegram 对受保护内容回 400 CHAT_FORWARDS_RESTRICTED，而「复制」是允许的
+            # —— 这是唯一能靠换模式绕过去的错误，所以单独识别。
+            # 代价：该源会话的每条消息都要先撞一次失败。受保护与否是**源会话的属性**，
+            # 按 (规则, 源会话) 记忆能省掉这次 RPC，但源会话可能取消保护，
+            # 所以这里选择每次都真试一遍 —— 正确性优先。
+            if rule.mode != "forward" or not _is_forwards_restricted(exc):
                 raise
-            # 少数会话不允许 drop_author，退化为客户端复制（会多一次上传，但能发出去）
             self.alog.warning(
-                "服务端复制失败，尝试客户端复制回退",
+                "源会话禁止转发，自动降级为复制",
+                rule=rule.label,
                 target=target,
+                source_chat=chat_title or chat_id,
+                message_ids=",".join(map(str, ids)),
                 error=f"{type(exc).__name__}: {exc}",
             )
-            sent = await with_flood_retry(
-                lambda: message.copy(chat_id=target, **kwargs),
-                alog=self.alog,
-                action=f"客户端复制到 {target}",
-                retries=1,
-                max_flood_wait=30.0,
-            )
-            sent_ids = _sent_ids(sent)
-            if rule.include_source_link:
-                await self._append_source_link(target, sent_ids, message, link)
-            return sent_ids, False
-
-        # copy 模式发出去的没有「转发自」抬头 ⇒ 显式补上原文链接。
-        # forward 模式**不需要**：Telegram 的转发抬头本身就是回溯入口。
-        if rule.mode == "copy" and rule.include_source_link:
-            await self._append_source_link(target, sent, message, link)
-        return sent, False
-
-    async def _append_source_link(
-        self,
-        target: ChatRef,
-        sent_ids: Sequence[int],
-        message: Any,
-        link: str,
-    ) -> None:
-        """给**复制**出去的消息补上「🔗原文链接：…」。
-
-        为什么需要它：``copy`` 模式（以及 forward 撞上受保护源会话后的自动降级）用
-        ``forward_messages(hide_sender_name=True)`` 发出，Telegram **不带**「转发自」抬头
-        —— 那正是 copy 的目的，但也就**没有任何回溯原文的入口**，只能自己写进正文。
-
-        ⚠️ Telegram 不支持给已发出的消息**追加**文本，只能整体重写一遍
-        （``edit_message_text`` / ``edit_message_caption``）。正文取自**源消息**
-        （我们手上就有），不去读目标消息，所以源消息被删也不影响。
-
-        ⚠️ 编辑会触发 ``EditedMessageHandler``，但那是**目标会话**里的编辑 ⇒
-        ``chat_allowed`` 的「本规则的目标不能当来源」会拦掉，不会造成转发循环。
-
-        ⚠️ 刻意**不抛出**：内容已经发出去了，链接没加上不该让整条转发记成失败。
-        """
-        if not link or not sent_ids:
-            return
-        suffix = f"\n\n{SOURCE_LINK_PREFIX}{link}"
-        text = getattr(message, "text", None)
-        caption = getattr(message, "caption", None)
-        for sent_id in sent_ids:
-            try:
-                if text is not None:
-                    if link in text:
-                        # 正文里已经有这个链接 ⇒ 不发一次「内容没变」的编辑：
-                        # 白费一次 RPC，还会给消息打上「已编辑」标记。
-                        continue
-                    await self.client.edit_message_text(
-                        chat_id=target,
-                        message_id=sent_id,
-                        text=truncate(f"{text}{suffix}", MAX_TEXT_LENGTH),
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    )
-                else:
-                    # 纯媒体（无 caption）也能靠 edit_message_caption 加上一行文字。
-                    base = caption or ""
-                    if link in base:
-                        continue
-                    body = f"{base}{suffix}" if base else f"{SOURCE_LINK_PREFIX}{link}"
-                    await self.client.edit_message_caption(
-                        chat_id=target,
-                        message_id=sent_id,
-                        caption=truncate(body, CAPTION_LIMIT),
-                    )
-            except Exception as exc:  # noqa: BLE001
-                self.alog.warning(
-                    "追加原文链接失败",
-                    target=target,
-                    message_id=sent_id,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+            sent = await _copy_with_fallback()
+            self.stats["downgraded"] += 1
+            return sent, True
 
     def _submit_notify(
         self,
@@ -1000,7 +1016,7 @@ class ForwardEngine:
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
-#: 「原文链接」那一行的前缀。``copy`` 模式用 ``drop_author`` 去掉了「转发自」抬头，
+#: 「原文链接」那一行的前缀。``copy`` 模式发出来的是**新消息**（不带「转发自」抬头），
 #: Telegram 不会附带任何回溯入口，所以只能自己把链接写进正文。
 SOURCE_LINK_PREFIX = "🔗原文链接："
 
@@ -1032,8 +1048,8 @@ def _pipeline_ms(message: Any) -> Optional[float]:
 def _is_forwards_restricted(exc: Exception) -> bool:
     """是不是「源会话禁止转发」（受保护群 / 频道）。
 
-    这是**唯一**能靠「改用复制」绕过去的错误：它说明**源**会话受保护，而复制
-    （``drop_author``）是允许的，所以 ``mode="forward"`` 的规则遇到它要自动降级。
+    这是**唯一**能靠「改用复制」绕过去的错误：它说明**源**会话受保护，而复制是允许的，
+    所以 ``mode="forward"`` 的规则遇到它要自动降级。
 
     以异常类型为主、错误文本兜底 —— pyrogram 各版本类名一致，但代理层或包装层
     可能把它换成别的类型，而文本里一定带 ``CHAT_FORWARDS_RESTRICTED``。

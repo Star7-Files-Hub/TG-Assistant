@@ -121,6 +121,7 @@ def make_message(
     media_group_id: Optional[str] = None,
     service: Any = None,
     date: Any = None,
+    copy_error: Optional[BaseException] = None,
     **extra: Any,
 ) -> Any:
     if sender is DEFAULT_SENDER:
@@ -154,6 +155,17 @@ def make_message(
         contact=None,
         web_page=None,
     )
+    #: ``Message.copy`` 的替身 —— copy 模式的**媒体**消息走这里（文本走 send_message）。
+    #: 真身是 ``send_cached_media``（服务端按 file_id 复用），测试里只记录参数。
+    message.copy_calls = []
+
+    async def _copy(**kwargs: Any) -> Any:
+        if copy_error is not None:
+            raise copy_error
+        message.copy_calls.append(kwargs)
+        return types.SimpleNamespace(id=message_id + 500)
+
+    message.copy = _copy
     for key, value in extra.items():
         setattr(message, key, value)
     return message
@@ -170,6 +182,7 @@ class FakeClient:
         send_error: Optional[BaseException] = None,
         forward_error: Optional[BaseException] = None,
         forward_error_once: Optional[BaseException] = None,
+        copy_group_error: Optional[BaseException] = None,
     ) -> None:
         self.me = FakeUser(1, username="me", is_self=True)
         self.callback_answer = callback_answer
@@ -178,17 +191,15 @@ class FakeClient:
         self.forward_error = forward_error
         #: 只抛**第一次**的错误，之后恢复正常 —— 用来测「失败后自动降级重试」。
         self.forward_error_once = forward_error_once
+        #: ``copy_media_group`` 抛错用（测相册复制的降级回退）。
+        self.copy_group_error = copy_group_error
         self.sent: list[dict[str, Any]] = []
         self.forwarded: list[dict[str, Any]] = []
         #: ``forward_messages`` 的**调用次数**（含抛错的那些）。
         #: ``forwarded`` 只记成功的调用，测「先失败再重试」时必须看这个。
         self.forward_calls = 0
-        #: ``edit_message_text`` / ``edit_message_caption`` 抛错用
-        #: （测「补原文链接失败不影响整条转发」）。
-        self.edit_error: Optional[BaseException] = None
-        #: 两类编辑调用的参数记录 —— copy 模式补原文链接会走这里。
-        self.edited: list[dict[str, Any]] = []
-        self.edited_captions: list[dict[str, Any]] = []
+        #: ``copy_media_group`` 的参数记录 —— copy 模式的**相册**走这里。
+        self.copied_groups: list[dict[str, Any]] = []
         self.callbacks: list[dict[str, Any]] = []
         self.handlers: list[tuple[Any, int]] = []
         self.next_message_id = 9000
@@ -227,17 +238,15 @@ class FakeClient:
         self.next_message_id += 1
         return types.SimpleNamespace(id=self.next_message_id)
 
-    async def edit_message_text(self, **kwargs: Any) -> Any:
-        if self.edit_error is not None:
-            raise self.edit_error
-        self.edited.append(kwargs)
-        return types.SimpleNamespace(id=kwargs.get("message_id"))
-
-    async def edit_message_caption(self, **kwargs: Any) -> Any:
-        if self.edit_error is not None:
-            raise self.edit_error
-        self.edited_captions.append(kwargs)
-        return types.SimpleNamespace(id=kwargs.get("message_id"))
+    async def copy_media_group(self, **kwargs: Any) -> Any:
+        if self.copy_group_error is not None:
+            raise self.copy_group_error
+        self.copied_groups.append(kwargs)
+        result = []
+        for _ in range(2):
+            self.next_message_id += 1
+            result.append(types.SimpleNamespace(id=self.next_message_id))
+        return result
 
     async def request_callback_answer(self, **kwargs: Any) -> Any:
         self.callbacks.append(kwargs)

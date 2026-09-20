@@ -10,9 +10,10 @@ import types
 from typing import Any
 
 import pytest
+from pyrogram.enums import ParseMode
 from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
 
-from tg_assistant.config import AccountConfig, AccountRecord
+from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule
 from tg_assistant.forwarder import CrossAccountDedupe, DedupeCache, ForwardEngine, PreparedRule
 from tg_assistant.runner import AccountRunner, MultiRunner
 
@@ -29,6 +30,12 @@ def build_config(*, exclude_chats=None, **rule_overrides) -> AccountConfig:
         "sources": [SRC],
         "targets": [DST],
         "match": {"mode": "regex", "patterns": [r"关键词(\d+)"]},
+        # ⚠️ ``ForwardRule.mode`` 的**默认值是 ``copy``**。这里显式钉成 ``forward``，
+        # 因为 ``TestForwardEngine`` 考的是「匹配 / 派发 / 去重 / 防循环」这套引擎管道，
+        # 不是 copy 与 forward 的实现差异 —— 用 ``forward`` 才能让断言盯着
+        # ``forward_messages`` 这一条稳定通道。copy 的行为由
+        # ``TestCopyModeSourceLink`` / ``TestForwardFallsBackToCopy`` 专门覆盖。
+        "mode": "forward",
     }
     rule.update(rule_overrides)
     forward = {"enabled": True, "rules": [rule]}
@@ -348,12 +355,20 @@ class TestForwardEngine:
         assert len(client.forwarded) == 1
 
     @pytest.mark.asyncio
-    async def test_copy_mode_drops_author(self, client, alog):
+    async def test_copy_mode_is_not_a_forward(self, client, alog):
+        """``copy`` 模式发出来的是**新消息**，不是转发消息。
+
+        旧实现用 ``forward_messages(hide_sender_name=True)``（``drop_author``）冒充复制，
+        那样得到的是**转发消息**，而 Telegram 拒绝编辑转发消息
+        ⇒ 原文链接永远补不上去。见 :class:`TestCopyModeSourceLink`。
+        """
         engine = ForwardEngine(client, build_config(mode="copy"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
-        assert client.forwarded[0]["hide_sender_name"] is True
+        assert client.forwarded == [], "copy 不该产生转发消息"
+        assert len(client.sent) == 1
+        assert client.sent[0]["chat_id"] == DST
 
     @pytest.mark.asyncio
     async def test_forward_mode_keeps_author(self, client, alog):
@@ -410,12 +425,14 @@ class TestForwardEngine:
                             "id": "a",
                             "sources": [SRC],
                             "targets": [DST],
+                            "mode": "forward",
                             "match": {"mode": "contains", "patterns": ["关键词"]},
                         },
                         {
                             "id": "b",
                             "sources": [SRC],
                             "targets": [-1004444444444],
+                            "mode": "forward",
                             "match": {"mode": "contains", "patterns": ["关键"]},
                         },
                     ],
@@ -679,6 +696,11 @@ class TestForwardFallsBackToCopy:
 
     ⚠️ ``ForwardRule.mode`` 的**默认值是 ``copy``**，所以这里必须显式写
     ``mode="forward"`` —— 用默认值测的是 copy 路径，降级分支根本不会进。
+
+    ⚠️ 降级后的「复制」= **按 file_id 重新发送**（``send_message`` / ``Message.copy``
+    / ``copy_media_group``），**不是** ``forward_messages(drop_author=True)`` ——
+    后者发出来的是转发消息，Telegram 拒绝编辑，链接写不进去。见
+    :class:`TestCopyModeSourceLink`。
     """
 
     @pytest.mark.asyncio
@@ -689,9 +711,9 @@ class TestForwardFallsBackToCopy:
         engine._handle(src_message("这是关键词123的消息"), edited=False)
         await drain(engine)
 
-        assert client.forward_calls == 2, "应当先真转发失败一次，再以复制重试一次"
-        assert len(client.forwarded) == 1, "失败的调用不进 forwarded"
-        assert client.forwarded[0]["hide_sender_name"] is True, "第二次必须去掉「转发自」"
+        assert client.forward_calls == 1, "先真转发失败一次，之后就该换路子而不是再撞一次"
+        assert client.forwarded == [], "降级走复制，不该再有成功的转发"
+        assert len(client.sent) == 1, "降级后应当用复制发出"
         assert engine.stats["forwarded"] == 1
         assert engine.stats["failed"] == 0
         assert engine.stats["downgraded"] == 1
@@ -706,34 +728,43 @@ class TestForwardFallsBackToCopy:
         await drain(engine)
 
         assert client.forwarded == []
+        assert client.sent == []
         assert engine.stats["failed"] == 1
         assert engine.stats["downgraded"] == 0
 
     @pytest.mark.asyncio
     async def test_downgrade_failure_is_still_reported_as_failed(self, alog):
-        """降级也失败时不能假装成功。"""
-        client = FakeClient(forward_error=ChatForwardsRestricted(value=RESTRICTED))
+        """降级也失败时不能假装成功。
+
+        这里让转发和复制**都**失败（``forward_error`` + ``send_error`` 都是永久的），
+        最后连 ``drop_author`` 兜底也失败 ⇒ 必须如实记 failed。
+        """
+        client = FakeClient(
+            forward_error=ChatForwardsRestricted(value=RESTRICTED),
+            send_error=RuntimeError("copy boom"),
+        )
         engine = ForwardEngine(client, build_config(mode="forward"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
         assert client.forwarded == []
+        assert client.sent == []
         assert engine.stats["forwarded"] == 0
         assert engine.stats["failed"] == 1
-        assert engine.stats["downgraded"] == 0
+        assert engine.stats["downgraded"] == 0, "降级没成功就不该记成降级"
 
     @pytest.mark.asyncio
     async def test_copy_mode_is_unaffected(self, alog):
-        """本来就是 copy 的规则一次就带 ``hide_sender_name``，不会「先失败再降级」。"""
+        """本来就是 copy 的规则一次就发出去，不会「先失败再降级」。"""
         client = FakeClient()
         engine = ForwardEngine(client, build_config(mode="copy"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
-        assert len(client.forwarded) == 1
-        assert client.forwarded[0]["hide_sender_name"] is True
+        assert client.forward_calls == 0, "copy 模式压根不该调 forward_messages"
+        assert len(client.sent) == 1
         assert engine.stats["downgraded"] == 0
 
     @pytest.mark.asyncio
@@ -750,47 +781,92 @@ class TestForwardFallsBackToCopy:
             prepared, message, result, time.perf_counter(), message_ids=[100, 101]
         )
 
-        assert client.forward_calls == 2
-        assert len(client.forwarded) == 1
-        assert client.forwarded[0]["message_ids"] == [100, 101]
-        assert client.forwarded[0]["hide_sender_name"] is True
+        assert client.forward_calls == 1
+        assert len(client.copied_groups) == 1, "相册降级应当用 copy_media_group"
+        assert client.copied_groups[0]["message_id"] == 100
+        assert client.copied_groups[0]["from_chat_id"] == SRC
         assert engine.stats["forwarded"] == 1
 
 
 class TestCopyModeSourceLink:
-    """``copy`` 模式也要带上「🔗原文链接：…」。
+    """``copy`` 模式要把「🔗原文链接：…」写进正文 / caption。
 
     小白 2026-09-20：「附带来源的那个链接没有了」+「如果用 copy 能不能把链接放在
     copy 的下方，换行两次再加原文链接，格式改成 🔗原文链接：xxxx」。
 
-    背景：``include_source_link`` 原先**只在 text 模式生效** —— ``_do()`` 里
-    ``mode in {"forward", "copy"}`` 直接 return，压根走不到加链接那段。
-    而 copy（含 forward 撞受保护源会话后的自动降级）用 ``drop_author`` 去掉了
-    「转发自」抬头，Telegram 不再附带任何回溯入口 ⇒ 必须自己写进正文。
+    背景（两层，缺一不可）：
+    ① ``include_source_link`` 原先**只在 text 模式生效** —— ``_do()`` 里
+       ``mode in {"forward", "copy"}`` 直接 return，压根走不到加链接那段。
+    ② copy 原先用 ``forward_messages(hide_sender_name=True)``（raw ``drop_author``），
+       发出来的是**转发消息**，而 **Telegram 拒绝编辑转发消息**
+       （2026-09-20 实测 ``400 Bad Request: message can't be edited``）⇒
+       「先转发、再 edit 追加链接」这条路根本走不通，而且会被 ``except`` 吞成 warning，
+       **功能静默失效**（单测还全绿，因为假客户端永远成功）。
 
-    ⚠️ Telegram 不支持给已发出的消息**追加**文本，只能整体重写一遍
-    （``edit_message_text`` / ``edit_message_caption``）。
+    所以 copy 改成**按 ``file_id`` 重新发送一条新消息**，链接在**发送时**就写进正文：
+    文本走 ``send_message``、媒体走 ``Message.copy``、相册走 ``copy_media_group``。
+
+    ⚠️ 本类的 ``client.forwarded == []`` 断言就是钉住这个设计 —— 一旦有人把 copy
+    改回「转发 + 编辑」，这里立刻红。
     """
 
     #: ``src_message`` 默认 message_id=100、chat=-1001111111111（无 username）
     LINK = "https://t.me/c/1111111111/100"
 
+    def test_default_mode_is_copy(self):
+        """钉住默认值：``ForwardRule.mode`` 不填就是 ``copy``。
+
+        ⚠️ ``build_config()`` 为了测引擎管道把 mode 钉成了 ``forward``，
+        所以这里直接从 ``ForwardRule`` 读默认值 —— 免得哪天默认值被改掉都没人发现。
+        """
+        assert ForwardRule(id="x", sources=[SRC], targets=[DST]).mode == "copy"
+
     @pytest.mark.asyncio
-    async def test_copy_mode_appends_source_link(self, alog):
+    async def test_copy_mode_writes_link_at_send_time(self, alog):
         client = FakeClient()
         engine = ForwardEngine(client, build_config(mode="copy"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
-        assert len(client.edited) == 1, "copy 模式应当编辑一次，把链接补进正文"
-        payload = client.edited[0]
+        assert client.forwarded == [], "copy 不能走转发 —— 转发消息不可编辑，链接写不进去"
+        assert len(client.sent) == 1
+        payload = client.sent[0]
         assert payload["chat_id"] == DST
         assert payload["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
         assert payload["link_preview_options"] is not None, "必须禁掉链接预览"
+        assert engine.stats["forwarded"] == 1
 
     @pytest.mark.asyncio
-    async def test_forward_mode_does_not_edit(self, alog):
+    async def test_copy_mode_keeps_entities(self, alog):
+        """重新发送要带上原 entities —— 粗体 / 内联链接等格式不能丢。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123")
+        message.entities = ["FAKE-ENTITIES"]
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["entities"] == ["FAKE-ENTITIES"]
+        assert client.sent[0]["parse_mode"] is ParseMode.DISABLED
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_truncation_drops_entities(self, alog):
+        """截断可能切断实体边界（Telegram 回 ENTITY_BOUNDS_INVALID）⇒ 丢弃 entities。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123 " + "长" * 5000)
+        message.entities = ["FAKE-ENTITIES"]
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["entities"] is None
+        assert len(client.sent[0]["text"]) <= 4096
+
+    @pytest.mark.asyncio
+    async def test_forward_mode_does_not_write_link(self, alog):
         """forward 模式**不需要**补链接：Telegram 的「转发自」抬头本身就是回溯入口。"""
         client = FakeClient()
         engine = ForwardEngine(client, build_config(mode="forward"), alog)
@@ -798,37 +874,12 @@ class TestCopyModeSourceLink:
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
-        assert client.edited == []
+        assert client.sent == []
         assert client.forwarded[0]["hide_sender_name"] is None
 
     @pytest.mark.asyncio
-    async def test_downgrade_also_appends_link(self, alog):
-        """forward 撞受保护源会话自动降级成 copy ⇒ 同样要补链接。"""
-        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
-        engine = ForwardEngine(client, build_config(mode="forward"), alog)
-        engine.register()
-        engine._handle(src_message("关键词123"), edited=False)
-        await drain(engine)
-
-        assert engine.stats["downgraded"] == 1
-        assert len(client.edited) == 1
-        assert client.edited[0]["text"].endswith(f"🔗原文链接：{self.LINK}")
-
-    @pytest.mark.asyncio
-    async def test_include_source_link_false_skips_edit(self, alog):
-        client = FakeClient()
-        engine = ForwardEngine(
-            client, build_config(mode="copy", include_source_link=False), alog
-        )
-        engine.register()
-        engine._handle(src_message("关键词123"), edited=False)
-        await drain(engine)
-
-        assert client.edited == []
-
-    @pytest.mark.asyncio
-    async def test_media_message_uses_edit_caption(self, alog):
-        """媒体消息没有 ``text``，只能改 caption。"""
+    async def test_media_message_puts_link_in_caption(self, alog):
+        """媒体消息没有 ``text``，链接写进 caption。"""
         client = FakeClient()
         engine = ForwardEngine(client, build_config(mode="copy"), alog)
         engine.register()
@@ -837,22 +888,80 @@ class TestCopyModeSourceLink:
         engine._handle(message, edited=False)
         await drain(engine)
 
-        assert client.edited == []
-        assert len(client.edited_captions) == 1
-        assert client.edited_captions[0]["caption"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+        assert client.sent == []
+        assert len(message.copy_calls) == 1
+        assert message.copy_calls[0]["caption"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
 
     @pytest.mark.asyncio
-    async def test_edit_failure_does_not_fail_forward(self, alog):
-        """链接没加上不该让整条转发记成失败 —— 内容已经发出去了。"""
+    async def test_media_without_caption_gets_link_only(self, alog):
+        """纯媒体（无 caption）也要能加上链接那一行。"""
         client = FakeClient()
-        client.edit_error = RuntimeError("edit boom")
-        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine = ForwardEngine(client, build_config(mode="copy", match={"mode": "all"}), alog)
+        engine.register()
+        message = src_message("关键词123")
+        message.text = None
+        message.caption = None
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert message.copy_calls[0]["caption"] == f"🔗原文链接：{self.LINK}"
+
+    @pytest.mark.asyncio
+    async def test_album_uses_copy_media_group(self, alog):
+        """相册：``copy_media_group`` 的 ``captions`` 只传第一项，其余回落原 caption。
+
+        pyrogram 里 ``captions`` 是 list 时**按下标取值、越界项回落到原 caption**
+        ⇒ 只覆盖第一项就够了，不必先 ``get_media_group`` 拉一遍。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(mode="copy", match={"mode": "all"}, media_group_window=0.1), alog
+        )
+        engine.register()
+        for index in range(3):
+            engine._handle(
+                src_message(
+                    "相册",
+                    message_id=200 + index,
+                    caption="相册",
+                    media_group_id="mg-copy",
+                ),
+                edited=False,
+            )
+        await asyncio.sleep(0.2)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert len(client.copied_groups) == 1
+        payload = client.copied_groups[0]
+        assert payload["message_id"] == 200, "相册用第一条 id 定位整组"
+        assert payload["from_chat_id"] == SRC
+        assert payload["captions"] == [
+            "相册\n\n🔗原文链接：https://t.me/c/1111111111/200"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_downgrade_uses_copy_with_link(self, alog):
+        """forward 撞受保护源会话自动降级 ⇒ 降级后走复制，链接照样写进去。"""
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
+        assert engine.stats["downgraded"] == 1
         assert engine.stats["forwarded"] == 1
-        assert engine.stats["failed"] == 0
+        assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+
+    @pytest.mark.asyncio
+    async def test_include_source_link_false_writes_plain_copy(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy", include_source_link=False), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["text"] == "关键词123"
 
     @pytest.mark.asyncio
     async def test_existing_link_is_not_duplicated(self, alog):
@@ -863,7 +972,43 @@ class TestCopyModeSourceLink:
         engine._handle(src_message(f"关键词123 见 {self.LINK}"), edited=False)
         await drain(engine)
 
-        assert client.edited == [], "链接已在正文里，不该再编辑一次"
+        assert client.sent[0]["text"] == f"关键词123 见 {self.LINK}"
+
+    @pytest.mark.asyncio
+    async def test_copy_failure_falls_back_to_drop_author_forward(self, alog):
+        """复制失败（极少数会话不让按 file_id 复用）⇒ 退化成 drop_author 转发。
+
+        代价是**丢掉原文链接**，但内容能发出去 —— 不能因为加不上链接就不发。
+        """
+        client = FakeClient(send_error=RuntimeError("copy boom"))
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert client.forwarded[0]["hide_sender_name"] is True
+        assert engine.stats["forwarded"] == 1
+        assert engine.stats["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_album_copy_failure_falls_back_to_forward(self, alog):
+        """相册复制失败同样要有兜底，不能整组丢消息。"""
+        client = FakeClient(copy_group_error=RuntimeError("group boom"))
+        engine = ForwardEngine(
+            client, build_config(mode="copy", match={"mode": "all"}, media_group_window=0.1), alog
+        )
+        engine.register()
+        for index in range(2):
+            engine._handle(
+                src_message("相册", message_id=400 + index, media_group_id="mg-fb"), edited=False
+            )
+        await asyncio.sleep(0.2)
+        await drain(engine)
+
+        assert client.copied_groups == []
+        assert client.forwarded[0]["message_ids"] == [400, 401]
+        assert client.forwarded[0]["hide_sender_name"] is True
 
     @pytest.mark.asyncio
     async def test_text_mode_uses_same_prefix(self, alog):
