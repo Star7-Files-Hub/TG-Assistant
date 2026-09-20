@@ -527,6 +527,7 @@ class AccountRunner:
         paths: Paths,
         store: Optional[Any] = None,
         shared_dedupe: Optional[Any] = None,
+        pair_dedupe: Optional[Any] = None,
     ) -> None:
         self.record = record
         self.config = config
@@ -535,6 +536,8 @@ class AccountRunner:
         self.store = store
         #: 跨账号去重表（多账号共享同一个实例）。``None`` = 关闭跨账号去重。
         self.shared_dedupe = shared_dedupe
+        #: 「频道 ↔ 群组 同内容」去重表（同样多账号共享）。``None`` = 关闭这一层。
+        self.pair_dedupe = pair_dedupe
         self.alog = make_account_logger(record.name, "runner")
         self.client: Optional[Client] = None
         self.notifier: Optional[BotNotifier] = None
@@ -608,6 +611,9 @@ class AccountRunner:
             # 跨账号去重表由 MultiRunner 持有并注入 —— 多个账号共用**同一个实例**，
             # 否则两个账号都在同一个源群里时会把同一条消息各发一遍。
             shared_dedupe=self.shared_dedupe,
+            # 同理：「频道 ↔ 群组 同内容」去重表也要共享 —— 频道那条由账号 A 发出去、
+            # 群组那条由账号 B 收到时，B 得能撤回 A 发的那条。
+            pair_dedupe=self.pair_dedupe,
         )
         self.forwarder.register()
 
@@ -681,6 +687,10 @@ class AccountRunner:
                     # 这两个数字是判断「去重生效没有」「降级生效没有」的**唯一可见口径** ——
                     # 明细日志是 debug 级，线上 TGA_LOG_LEVEL=INFO 看不到。
                     "cross_deduped": snapshot["cross_deduped"],
+                    # 「同一内容由频道和群组各发一遍」时被群组挤掉的频道消息数 / 群组那条
+                    # 后到、把已发出的频道消息撤回掉的次数。
+                    "pair_deduped": snapshot["pair_deduped"],
+                    "pair_superseded": snapshot["pair_superseded"],
                     "downgraded": snapshot["downgraded"],
                 }
             )
@@ -721,6 +731,7 @@ class MultiRunner:
         store: Store,
         settings: Settings,
         dedupe: Optional[CrossAccountDedupe] = None,
+        pair_dedupe: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -728,6 +739,8 @@ class MultiRunner:
         #: 允许外部传入，是因为面板点「启动」会重建 MultiRunner —— 由 RuntimeManager
         #: 拿着同一张表传进来，去重窗口才不会因为一次重启而被清空。
         self.dedupe = dedupe if dedupe is not None else CrossAccountDedupe()
+        #: 「频道 ↔ 群组 同内容」去重表，同样是所有账号共享同一个实例、同样要跨面板重建复用。
+        self.pair_dedupe = pair_dedupe
         self.runners: dict[str, AccountRunner] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._shutdown = asyncio.Event()
@@ -817,6 +830,7 @@ class MultiRunner:
                     self.store.paths,
                     store=self.store,
                     shared_dedupe=self.dedupe,
+                    pair_dedupe=self.pair_dedupe,
                 )
                 self.runners[name] = runner
                 await runner.start()

@@ -15,11 +15,13 @@ from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWai
 
 from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule
 from tg_assistant.forwarder import (
+    ChannelGroupDedupe,
     CrossAccountDedupe,
     DedupeCache,
     ForwardEngine,
     PreparedRule,
     _pipeline_ms,
+    content_fingerprint,
 )
 from tg_assistant.runner import AccountRunner, MultiRunner
 
@@ -27,6 +29,8 @@ from .conftest import FakeChat, FakeClient, FakeUser, make_message
 
 SRC = -1001111111111
 DST = -1002222222222
+#: 「频道 ↔ 群组 同内容」那对用到的两个来源会话。``SRC`` 是群组，``CH_SRC`` 是频道。
+CH_SRC = -1003333333333
 
 
 def build_config(*, exclude_chats=None, **rule_overrides) -> AccountConfig:
@@ -52,6 +56,18 @@ def build_config(*, exclude_chats=None, **rule_overrides) -> AccountConfig:
 
 def src_message(text: str, **kwargs):
     kwargs.setdefault("chat", FakeChat(SRC, title="来源群"))
+    return make_message(text, **kwargs)
+
+
+def group_message(text: str, **kwargs):
+    """群组来源的消息（``supergroup`` ⇒ ``chat_kind`` 归一成 ``group``）。"""
+    kwargs.setdefault("chat", FakeChat(SRC, title="来源群", chat_type="supergroup"))
+    return make_message(text, **kwargs)
+
+
+def channel_message(text: str, **kwargs):
+    """频道来源的消息。"""
+    kwargs.setdefault("chat", FakeChat(CH_SRC, title="来源频道", chat_type="channel"))
     return make_message(text, **kwargs)
 
 
@@ -1758,3 +1774,374 @@ class TestHeartbeatSurfacesNewCounters:
 
         assert captured["cross_deduped"] == 3
         assert captured["downgraded"] == 2
+        assert captured["pair_deduped"] == 0
+        assert captured["pair_superseded"] == 0
+
+    def test_heartbeat_includes_pair_counters(self, paths, client, alog):
+        """「频道 ↔ 群组」那层去重的计数也必须进心跳 —— 明细日志是 INFO 级，
+        但这个数字是「规则到底有没有生效」的**唯一**可查口径（同 cross_deduped）。"""
+        runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
+        runner.started_at = time.time()
+        runner.forwarder = ForwardEngine(client, build_config(), alog)
+        runner.forwarder.stats["pair_deduped"] = 5
+        runner.forwarder.stats["pair_superseded"] = 1
+
+        captured: dict[str, Any] = {}
+        runner.alog = types.SimpleNamespace(info=lambda msg, **kw: captured.update(kw))
+
+        runner._log_heartbeat()
+
+        assert captured["pair_deduped"] == 5
+        assert captured["pair_superseded"] == 1
+
+
+class TestContentFingerprint:
+    """跨会话比对「是不是同一条内容」的指纹。"""
+
+    def test_same_text_same_fingerprint(self):
+        a = content_fingerprint(src_message("同一条推广"))
+        b = content_fingerprint(src_message("同一条推广", message_id=999))
+        assert a is not None
+        assert a == b, "同一条推广在频道/群组各发一遍 ⇒ 指纹必须相同"
+
+    def test_surrounding_whitespace_ignored(self):
+        assert content_fingerprint(src_message("  推广  ")) == content_fingerprint(src_message("推广"))
+
+    def test_different_text_differs(self):
+        assert content_fingerprint(src_message("推广A")) != content_fingerprint(src_message("推广B"))
+
+    def test_caption_counts_as_body(self):
+        a = content_fingerprint(make_message(None, caption="同一条推广"))
+        b = content_fingerprint(src_message("同一条推广"))
+        assert a is not None and a == b, "caption 与 text 都是正文，同内容要能对上"
+
+    def test_text_wins_over_media(self):
+        """同一段正文配不同图（重发时换了图）也要算同一条 —— 这类推广帖正文才是标识。
+
+        线上那两对的正文都是长文，媒体反而是次要的；只用媒体 id 会比不出来。
+        """
+        a = content_fingerprint(
+            make_message("同一条推广", photo=types.SimpleNamespace(file_unique_id="PH1"))
+        )
+        b = content_fingerprint(
+            make_message("同一条推广", photo=types.SimpleNamespace(file_unique_id="PH2"))
+        )
+        assert a == b
+
+    def test_media_unique_id_used_without_text(self):
+        a = content_fingerprint(make_message(None, photo=types.SimpleNamespace(file_unique_id="PH1")))
+        b = content_fingerprint(make_message(None, photo=types.SimpleNamespace(file_unique_id="PH1")))
+        c = content_fingerprint(make_message(None, photo=types.SimpleNamespace(file_unique_id="PH2")))
+        assert a is not None and a == b and a != c
+
+    def test_no_body_no_media_returns_none(self):
+        assert content_fingerprint(make_message(None)) is None
+
+
+class TestChannelGroupDedupe:
+    """频道与它的关联群组各发一遍同一条内容 ⇒ 只保留**群组**那条。
+
+    小白 2026-09-21 的需求：「频道发送消息时会在群组也同时发送一条，两条是一样的但是
+    原文链接不一样，我只需要保留群组这一条」。
+
+    线上取证（``tg-assistant chats`` + 直接读消息）钉死了两件事，正是这两点决定了
+    实现方式：
+
+    1. 群里那条**不是**频道的转发（``forward_origin`` / ``forward_from_chat`` 都是空）
+       ⇒ 拿不到「同一条原始消息」这个强标识，只能比**内容指纹**；
+    2. 先后顺序**随机** —— 流光画廊那对是群组先到（47.505 / 48.354），秀儿那对却是
+       **频道先到**（频道 37.651、群组 39.144）⇒ 「先到先得」会留下一半的错那条，
+       必须支持「群组那条后到时把已发的频道那条撤回」。
+    """
+
+    # ---------------------------------------------------------------- #
+    # 顺序两种都要对
+    # ---------------------------------------------------------------- #
+    def test_group_first_then_channel_is_skipped(self):
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "group", 300).send is True
+        decision = dedupe.claim("fp", DST, "channel", 300)
+        assert decision.send is False, "群组已发过 ⇒ 频道这条不该再发"
+        assert decision.withdraw == (), "没有已发的频道消息可撤"
+        assert (dedupe.claimed, dedupe.rejected) == (1, 1)
+
+    def test_channel_first_then_group_supersedes(self):
+        """群组那条后到 ⇒ 照样发，并把先前发出去的频道那条（含链接那条）撤回。"""
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "channel", 300).send is True
+        dedupe.mark_sent("fp", DST, [11, 12])
+
+        decision = dedupe.claim("fp", DST, "group", 300)
+
+        assert decision.send is True
+        assert decision.withdraw == (11, 12)
+        assert dedupe.superseded == 1
+
+    def test_superseded_channel_sent_ids_are_cleared(self):
+        """顶替之后旧记录要换成群组那条 —— 否则再来的频道消息还能读到过期的 sent。"""
+        dedupe = ChannelGroupDedupe()
+        dedupe.claim("fp", DST, "channel", 300)
+        dedupe.mark_sent("fp", DST, [11])
+        dedupe.claim("fp", DST, "group", 300)
+
+        assert dedupe.claim("fp", DST, "channel", 300).send is False
+
+    # ---------------------------------------------------------------- #
+    # 不能误杀
+    # ---------------------------------------------------------------- #
+    def test_same_kind_is_not_deduped(self):
+        """两个**群组**发的同内容帖子不能被误杀 —— 只有「频道 ↔ 群组」才算一对。"""
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "group", 300).send is True
+        assert dedupe.claim("fp", DST, "group", 300).send is True
+        assert dedupe.rejected == 0
+
+    def test_unknown_kind_is_not_deduped(self):
+        """类型判不出来（例如 pyrogram 的 ``community``）⇒ 宁可漏去重也不误杀。"""
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, None, 300).send is True
+        assert dedupe.claim("fp", DST, "channel", 300).send is True
+        assert dedupe.rejected == 0
+
+    def test_different_targets_are_independent(self):
+        """键必须带目标：同一条内容发往不同目标时互不影响。"""
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "group", 300).send is True
+        assert dedupe.claim("fp", -1009999999999, "channel", 300).send is True
+
+    def test_different_content_is_independent(self):
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp1", DST, "group", 300).send is True
+        assert dedupe.claim("fp2", DST, "channel", 300).send is True
+
+    def test_zero_ttl_disables(self):
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "group", 0).send is True
+        assert dedupe.claim("fp", DST, "channel", 0).send is True
+
+    def test_claim_expires_after_ttl(self, monkeypatch):
+        dedupe = ChannelGroupDedupe()
+        now = [1000.0]
+        monkeypatch.setattr("tg_assistant.forwarder.time.monotonic", lambda: now[0])
+
+        assert dedupe.claim("fp", DST, "group", 10).send is True
+        now[0] += 5
+        assert dedupe.claim("fp", DST, "channel", 10).send is False
+        now[0] += 6  # 超过 TTL
+        assert dedupe.claim("fp", DST, "channel", 10).send is True
+
+    # ---------------------------------------------------------------- #
+    # release：发送失败必须退还名额
+    # ---------------------------------------------------------------- #
+    def test_release_frees_the_slot(self):
+        """🔴 不退的话，同内容的群组那条会被判成重复而跳过 ⇒ 消息彻底丢。"""
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "group", 300).send is True
+        assert dedupe.claim("fp", DST, "channel", 300).send is False
+
+        dedupe.release("fp", DST)
+
+        assert dedupe.claim("fp", DST, "channel", 300).send is True
+        assert dedupe.released == 1
+
+    def test_release_is_idempotent(self):
+        dedupe = ChannelGroupDedupe()
+        dedupe.release("nope", DST)
+        dedupe.release("nope", DST)
+        assert len(dedupe) == 0
+        assert dedupe.released == 2
+
+    def test_mark_sent_on_missing_key_is_noop(self):
+        dedupe = ChannelGroupDedupe()
+        dedupe.mark_sent("nope", DST, [1, 2])
+        assert len(dedupe) == 0
+
+    def test_snapshot_counts(self):
+        dedupe = ChannelGroupDedupe()
+        dedupe.claim("fp", DST, "group", 300)
+        dedupe.claim("fp", DST, "channel", 300)
+        snapshot = dedupe.snapshot()
+        assert snapshot == {
+            "size": 1,
+            "claimed": 1,
+            "rejected": 1,
+            "superseded": 0,
+            "released": 0,
+        }
+
+
+class TestChannelGroupSameContentInEngine:
+    """引擎层：同一条内容由频道和群组各发一遍，目标里只留群组那条。"""
+
+    @pytest.mark.asyncio
+    async def test_group_first_channel_is_dropped(self, alog):
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(channel_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1, "群组已发过 ⇒ 频道那条不该再发一遍"
+        assert engine.stats["pair_deduped"] == 1
+        assert engine.stats["pair_superseded"] == 0
+        assert client.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_channel_first_group_supersedes_and_withdraws(self, alog):
+        """线上实测到的顺序之一（秀儿那对：频道 00:01:37 先到、群组 00:01:39 后到）。"""
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        before = client.next_message_id
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        first_sent = list(range(before + 1, client.next_message_id + 1))
+        assert len(first_sent) == 2, "forward 模式：转发消息 + 下方补的链接消息"
+        assert client.deleted == []
+
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2, "群组那条必须发出去"
+        assert [call["message_ids"] for call in client.deleted] == [first_sent], (
+            "群组那条后到 ⇒ 先前发出的频道消息（含链接那条）要撤回"
+        )
+        assert engine.stats["pair_superseded"] == 1
+        assert engine.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_withdraw_failure_still_sends_group_copy(self, alog):
+        """撤回失败（目标里没有删除权限等）**不能**把群组那条也丢掉。"""
+        pair = ChannelGroupDedupe()
+        client = FakeClient(delete_error=RuntimeError("no rights"))
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2
+        assert engine.stats["pair_superseded"] == 0, "撤回失败不算顶替成功"
+        assert engine.stats["failed"] == 0, "撤回失败不该把这次转发记成失败"
+
+    @pytest.mark.asyncio
+    async def test_different_content_both_sent(self, alog):
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(channel_message("关键词456", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2, "内容不同就不是同一条，都要发"
+        assert engine.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_two_groups_same_content_both_sent(self, alog):
+        """两个**群组**发的同内容帖子不能被误杀 —— 只有「频道 ↔ 群组」才算一对。"""
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+        other_group = FakeChat(-1007777777777, title="另一个群", chat_type="supergroup")
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(make_message("关键词123", message_id=200, chat=other_group), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2
+        assert engine.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_send_releases_pair_slot(self, alog):
+        """🔴 频道那条**发送失败**时必须退还名额，否则同内容的群组那条会被当成
+        「频道已发过」而跳过 ⇒ 这条消息对该目标彻底丢。"""
+        pair = ChannelGroupDedupe()
+        broken = FakeClient(forward_error=RuntimeError("network boom"))
+        engine_a = ForwardEngine(broken, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        engine_a._handle(channel_message("关键词123"), edited=False)
+        await drain(engine_a)
+
+        assert engine_a.stats["failed"] == 1
+        assert pair.released == 1, "发送失败必须把名额退回去"
+
+        healthy = FakeClient()
+        engine_b = ForwardEngine(healthy, build_config(sources=[]), alog, pair_dedupe=pair)
+        engine_b._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine_b)
+
+        assert len(healthy.forwarded) == 1, "频道那条失败了，群组那条必须能发出去"
+        assert engine_b.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_table_means_disabled(self, alog):
+        """不传表（单测 / 离线场景）时行为与从前完全一致：两条都发。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog)
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(channel_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2
+        assert engine.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_skipped_channel_releases_cross_account_slot(self, alog):
+        """被本层跳过的频道那条，要把**跨账号**名额也退掉 —— 否则那个键在整个 TTL 里
+        被占死，别的账号连「补发」的机会都没有。"""
+        pair = ChannelGroupDedupe()
+        shared = CrossAccountDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(sources=[]), alog, shared_dedupe=shared, pair_dedupe=pair
+        )
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(channel_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert engine.stats["pair_deduped"] == 1
+        assert shared.released == 1
+
+    def test_snapshot_exposes_pair_table(self, client, alog):
+        pair = ChannelGroupDedupe()
+        engine = ForwardEngine(client, build_config(), alog, pair_dedupe=pair)
+        pair.claim("fp", DST, "group", 300)
+        assert engine.snapshot()["pair_dedupe"]["claimed"] == 1
+
+
+class TestPairDedupeWiring:
+    """共享表必须真的接到引擎上，且能跨面板重建复用。"""
+
+    def test_multi_runner_keeps_injected_pair_table(self):
+        pair = ChannelGroupDedupe()
+        assert MultiRunner(None, None, pair_dedupe=pair).pair_dedupe is pair
+
+    def test_multi_runner_defaults_to_disabled(self):
+        assert MultiRunner(None, None).pair_dedupe is None
+
+    def test_account_runner_stores_pair_table(self, paths):
+        pair = ChannelGroupDedupe()
+        runner = AccountRunner(
+            AccountRecord(name="acc-a"),
+            build_config(),
+            None,
+            paths,
+            pair_dedupe=pair,
+        )
+        assert runner.pair_dedupe is pair
+
+    def test_account_runner_defaults_to_disabled(self, paths):
+        runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
+        assert runner.pair_dedupe is None

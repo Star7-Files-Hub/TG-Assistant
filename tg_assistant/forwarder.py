@@ -9,9 +9,11 @@
 3. **正则预编译**：配置加载时编译一次。
 4. **相册聚合**：同一 ``media_group_id`` 的多条消息在 ``media_group_window`` 内攒齐后
    一次性 ``forward_messages(message_ids=[...])``，避免拆成多条丢失排版。
-5. **去重**：两层 —— 账号内 ``(规则 id, chat_id, message_id)`` + TTL，防止编辑事件或
+5. **去重**：三层 —— 账号内 ``(规则 id, chat_id, message_id)`` + TTL，防止编辑事件或
    重复更新造成二次转发；**跨账号** ``(chat_id, message_id, 目标)`` 共享表，防止多个账号
-   都在同一个源群里时把同一条消息各发一遍。
+   都在同一个源群里时把同一条消息各发一遍；**「频道 ↔ 群组 同内容」**（见
+   :class:`ChannelGroupDedupe`）共享表，同一个运营方把同一条推广分别发到频道和它的群组时
+   只留群组那条 —— 这两张共享表都跨面板重建复用，否则窗口会被清空。
 6. **forward 失败自动降级 copy**：源会话受保护时 Telegram 会拒 forward，此时自动改用
    复制再发一次，而不是直接失败。
 7. **日志里的 ``mode=`` 是「实际生效」的模式**，不是配置值。取值见
@@ -37,11 +39,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -194,6 +197,217 @@ class CrossAccountDedupe:
 
 
 # --------------------------------------------------------------------------- #
+# 频道 ↔ 群组 双份消息去重
+# --------------------------------------------------------------------------- #
+#: 媒体字段（按优先级）—— 用来给「没有正文」的消息取指纹。
+_MEDIA_ATTRS = (
+    "photo",
+    "video",
+    "audio",
+    "document",
+    "animation",
+    "voice",
+    "video_note",
+    "sticker",
+)
+
+
+def _media_signature(message: Any) -> Optional[str]:
+    """媒体指纹：优先 ``file_unique_id``（同一个文件在不同会话里都一样），退回 ``file_id``。"""
+    for attr in _MEDIA_ATTRS:
+        obj = getattr(message, attr, None)
+        if obj is None:
+            continue
+        for key in ("file_unique_id", "file_id"):
+            value = getattr(obj, key, None)
+            if value:
+                return f"{attr}:{value}"
+        return attr
+    return None
+
+
+def content_fingerprint(message: Any) -> Optional[str]:
+    """跨会话比对「是不是同一条内容」用的指纹；无从比对时返回 ``None``。
+
+    为什么需要它：同一个运营方会把**同一条推广**分别发到频道和它的关联群里，两条正文
+    一模一样、只有「原文链接」不同（链接是按**来源会话**生成的），用户只想留群组那条。
+
+    🔴 2026-09-21 线上取证**推翻**了两个想当然的假设，所以这里才必须是「内容指纹 + 会话
+    类型」，而不是「看转发关系」或「先到先得」：
+
+    1. 群里那条**不是**频道的转发（``forward_origin`` / ``forward_from_chat`` 都是空）
+       ⇒ 拿不到「同一条原始消息」这个强标识，只能比内容；
+    2. 两条的**先后顺序是随机的** —— 流光画廊那对是群组先到（47.505 / 48.354），
+       秀儿那对却是**频道先到**（37.651 / 39.144，而群组 39.144 反而在后）
+       ⇒ 「先到先得」会留下一半的错那条。
+
+    取正文（``text`` / ``caption``）优先：这类推广帖一定有正文，规则本身也是按正文匹配的。
+    没有正文时才退回媒体自身的 id。两者都没有 ⇒ ``None``，调用方直接放行。
+
+    ⚠️ 用 ``surrogatepass`` 编码：消息里可能含非法代理对，直接 ``encode`` 会抛
+    ``UnicodeEncodeError``，而这里只是算指纹，不该因为一条脏消息把转发链路带崩。
+    """
+    text = message_text(message).strip()
+    if text:
+        digest = hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+        return f"text:{digest}"
+    media = _media_signature(message)
+    return f"media:{media}" if media else None
+
+
+def _is_channel_group_pair(kind_a: Optional[str], kind_b: Optional[str]) -> bool:
+    """是不是「一边频道、一边群组」这一对。
+
+    只认 ``{"channel", "group"}`` 这一种组合（``supergroup`` / ``forum`` 已被
+    :func:`~tg_assistant.matching.normalize_chat_kind` 归一成 ``group``）。
+    类型判不出来（``None``，例如 pyrogram 的 ``community``）时**一律不算** ——
+    宁可漏去重（目标里多一条重复），也不能误杀（消息彻底丢掉）。
+    """
+    return {kind_a, kind_b} == {"channel", "group"}
+
+
+class _PairEntry:
+    """``ChannelGroupDedupe`` 里的一条记录。"""
+
+    __slots__ = ("deadline", "kind", "sent")
+
+    def __init__(self, deadline: float, kind: Optional[str]) -> None:
+        self.deadline = deadline
+        self.kind = kind
+        #: 已经发到目标的那些消息 id —— 群组那条后到时用它们把频道那条撤回。
+        self.sent: list[int] = []
+
+
+class PairDecision(NamedTuple):
+    """``ChannelGroupDedupe.claim`` 的结论。"""
+
+    #: 这一条要不要发出去。
+    send: bool
+    #: 发之前要**撤回**的、先前已经发出去的消息 id（群组那条后到时非空）。
+    withdraw: tuple[int, ...] = ()
+
+
+_SEND = PairDecision(send=True)
+_SKIP = PairDecision(send=False)
+
+
+class ChannelGroupDedupe:
+    """频道与它的关联群组各发一遍同一条内容时，只保留**群组**那条。
+
+    为什么需要它：同一个运营方会把同一条推广分别发到频道和群里（两条正文完全一样、
+    只有来源链接不同 —— 链接是按**来源会话**生成的）。两条都命中同一条规则，
+    于是目标里出现两份，用户只要群组那份。
+
+    键是 ``(内容指纹, 目标会话)``，**必须带目标**：同一条内容发往不同目标时互不影响。
+
+    **群组优先，且与先后顺序无关**：
+
+    - 群组那条先到 ⇒ 频道那条判成重复，直接不发；
+    - 频道那条先到 ⇒ 群组那条照样发，并**把先前发出去的频道那条撤回**
+      （``PairDecision.withdraw``）—— 这是线上实测到的真实顺序之一（秀儿那对），
+      不是理论情况。
+
+    为什么用进程内共享表：所有账号的 handler 跑在**同一个事件循环**上，而 :meth:`claim`
+    是**纯同步、无 await** 的 ⇒ 天然原子，不可能两条同时抢到名额。
+    """
+
+    __slots__ = ("_seen", "_ops", "claimed", "rejected", "superseded", "released")
+
+    def __init__(self) -> None:
+        #: 键 -> 记录（``deadline`` 用 ``time.monotonic()`` 基准）。
+        self._seen: dict[tuple[str, str], _PairEntry] = {}
+        self._ops = 0
+        #: 建立记录（= 本条内容在这个目标上第一次出现）的次数。
+        self.claimed = 0
+        #: 频道那条被群组挤掉（直接不发）的次数。
+        self.rejected = 0
+        #: 群组那条后到、把先前发出去的频道消息顶掉的次数（含撤回）。
+        self.superseded = 0
+        #: 发送失败后**退还**名额的次数。
+        self.released = 0
+
+    def claim(
+        self,
+        fingerprint: str,
+        target: Any,
+        kind: Optional[str],
+        ttl: float,
+    ) -> PairDecision:
+        """登记「这条内容要发往这个目标」，返回该不该发、要不要先撤回旧的。
+
+        ``ttl <= 0`` 表示关闭本层去重，恒放行。
+        """
+        if ttl <= 0:
+            self.claimed += 1
+            return _SEND
+        now = time.monotonic()
+        self._ops += 1
+        if self._ops % 256 == 0:
+            self._purge(now)
+        key = (fingerprint, str(target))
+        entry = self._seen.get(key)
+        if entry is not None and entry.deadline <= now:
+            self._seen.pop(key, None)
+            entry = None
+
+        if entry is None:
+            self._seen[key] = _PairEntry(now + ttl, kind)
+            self.claimed += 1
+            return _SEND
+
+        if not _is_channel_group_pair(entry.kind, kind):
+            # 不是「频道 ↔ 群组」那一对（同类型，或类型判不出来）⇒ 不去重，各自发。
+            # ⚠️ 这里**不能**顺手记 claimed/覆盖记录：否则两个群组发的同内容帖子会被误杀。
+            return _SEND
+
+        if kind == "channel":
+            # 当前是频道、已记的是群组 ⇒ 保留群组那条，这条不发。
+            self.rejected += 1
+            return _SKIP
+
+        # 当前是群组、已记的是频道 ⇒ 群组优先：把先前发出去的频道那条撤回。
+        self.superseded += 1
+        withdraw = tuple(entry.sent)
+        self._seen[key] = _PairEntry(now + ttl, kind)
+        return PairDecision(send=True, withdraw=withdraw)
+
+    def mark_sent(self, fingerprint: str, target: Any, sent_ids: Sequence[int]) -> None:
+        """记下「这条内容发到该目标后，生成了哪些消息 id」。
+
+        只有记了 id，群组那条后到时才撤得掉频道那条。发送成功后调用；没记录时是空操作。
+        """
+        entry = self._seen.get((fingerprint, str(target)))
+        if entry is not None:
+            entry.sent = [int(i) for i in sent_ids]
+
+    def release(self, fingerprint: str, target: Any) -> None:
+        """退还名额 —— **发送失败时必须调用**。
+
+        不退的话，这个「内容 + 目标」键会在整个 TTL 里保持被占：同内容的群组那条会被
+        判成重复而跳过 ⇒ 这条消息对该目标**彻底丢了**（与
+        :meth:`CrossAccountDedupe.release` 同一个坑）。不存在的键退还是无害空操作。
+        """
+        self._seen.pop((fingerprint, str(target)), None)
+        self.released += 1
+
+    def _purge(self, now: float) -> None:
+        for key in [k for k, entry in self._seen.items() if entry.deadline <= now]:
+            self._seen.pop(key, None)
+
+    def __len__(self) -> int:
+        return len(self._seen)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "size": len(self._seen),
+            "claimed": self.claimed,
+            "rejected": self.rejected,
+            "superseded": self.superseded,
+            "released": self.released,
+        }
+
+
+# --------------------------------------------------------------------------- #
 # 预编译规则
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -336,6 +550,7 @@ class ForwardEngine:
         store: Optional[Any] = None,
         account: Optional[str] = None,
         shared_dedupe: Optional[CrossAccountDedupe] = None,
+        pair_dedupe: Optional[ChannelGroupDedupe] = None,
     ) -> None:
         self.client = client
         self.config = config
@@ -351,6 +566,9 @@ class ForwardEngine:
         #: 由 ``MultiRunner`` 创建、多个账号**共享同一个实例**；不传（单测 / 离线场景）
         #: 即关闭跨账号去重，行为与从前一致。
         self._shared_dedupe = shared_dedupe
+        #: 「频道 ↔ 群组 同内容」去重表（同样是多账号共享同一个实例）。
+        #: 不传（单测 / 离线场景）即关闭这一层，行为与从前一致。
+        self._pair_dedupe = pair_dedupe
 
         # ---- 规则热重载 ----
         #: 只有同时给了 ``store`` 与 ``account`` 才开启；单测 / 离线场景不传，
@@ -374,6 +592,10 @@ class ForwardEngine:
             "deduped": 0,
             #: 因**别的账号**已经把这条消息发往同一目标而跳过的次数。
             "cross_deduped": 0,
+            #: 同一条内容已由**群组**发往同一目标，因而跳过**频道**这条的次数。
+            "pair_deduped": 0,
+            #: 群组那条后到，把先前发出去的**频道**那条撤回掉的次数。
+            "pair_superseded": 0,
             #: 源会话禁止转发、自动改用复制的次数。
             "downgraded": 0,
         }
@@ -762,6 +984,10 @@ class ForwardEngine:
         rule = prepared.rule
         chat_id, _, chat_title = chat_identity(message)
         ids = list(message_ids) if message_ids else [message.id]
+        #: 来源会话类型（``channel`` / ``group`` / ...）与内容指纹 —— 供「频道 ↔ 群组 同内容」
+        #: 去重判断用。指纹为 ``None``（既没正文也没媒体）时这一层直接放行。
+        kind = chat_kind(message)
+        fingerprint = content_fingerprint(message)
 
         if rule.delay > 0:
             await asyncio.sleep(rule.delay)
@@ -771,7 +997,7 @@ class ForwardEngine:
         variables["rule_id"] = rule.id
 
         delivered: list[tuple[ChatRef, int]] = []
-        #: 跨账号去重窗口。与账号内去重同源（账号级 ``dedupe_window``）。
+        #: 去重窗口。账号内 / 跨账号 / 频道↔群组 三层同源（账号级 ``dedupe_window``）。
         dedupe_ttl = float(self.config.forward.dedupe_window)
         for target in rule.targets:
             # 跨账号去重：同一条源消息发往**同一个目标**，只允许一个账号发出去。
@@ -790,12 +1016,37 @@ class ForwardEngine:
                     target=target,
                 )
                 continue
+
+            # 频道 ↔ 群组 同内容去重。放在跨账号去重**之后**是刻意的：
+            # 顺序反过来的话，一条「因别的账号已发而被跳过」的消息也会在本表留下记录，
+            # 于是随后到达的群组那条会被当成「频道已发过」而顶替掉 —— 消息白丢。
+            decision = _SEND
+            if self._pair_dedupe is not None and fingerprint is not None:
+                decision = self._pair_dedupe.claim(fingerprint, target, kind, dedupe_ttl)
+                if not decision.send:
+                    self.stats["pair_deduped"] += 1
+                    # ⚠️ 名额要退：本账号不发这条，别把跨账号名额也一起占死。
+                    self._release_claim(chat_id, ids[0], target)
+                    self.alog.info(
+                        "同内容去重：该内容已由群组发往同一目标，跳过频道这条",
+                        rule=rule.label,
+                        source_chat=chat_title or chat_id,
+                        source_kind=kind,
+                        message_id=ids[0],
+                        target=target,
+                    )
+                    continue
+                if decision.withdraw:
+                    await self._withdraw_superseded(
+                        target, decision.withdraw, rule, chat_title or chat_id, ids[0]
+                    )
             try:
                 sent_ids, actual_mode = await self._send_to_target(
                     prepared, message, ids, target, variables
                 )
             except SessionInvalid:
                 # 会话已失效 ⇒ 本账号发不出去了，把名额让给别的账号再试。
+                self._release_pair(fingerprint, target)
                 self._release_claim(chat_id, ids[0], target)
                 raise
             except Exception as exc:
@@ -812,8 +1063,13 @@ class ForwardEngine:
                 )
                 # ⚠️ **必须退还名额**：`claim` 是先占位后发送，不退的话这个键会在整个 TTL
                 # （默认 300s）里保持被占 ⇒ 另一个账号也补发不了，这条消息对该目标彻底丢失。
+                self._release_pair(fingerprint, target)
                 self._release_claim(chat_id, ids[0], target)
                 continue
+
+            # 记下这一条发出去生成了哪些消息 id —— 群组那条后到时靠它把频道这条撤回。
+            if self._pair_dedupe is not None and fingerprint is not None:
+                self._pair_dedupe.mark_sent(fingerprint, target, sent_ids)
 
             prepared.stats["sent"] += 1
             self.stats["forwarded"] += 1
@@ -843,6 +1099,51 @@ class ForwardEngine:
         """把跨账号去重名额退回去（发送失败时用）。没配共享表时是空操作。"""
         if self._shared_dedupe is not None:
             self._shared_dedupe.release(source_chat_id, message_id, target)
+
+    def _release_pair(self, fingerprint: Optional[str], target: ChatRef) -> None:
+        """把「频道 ↔ 群组 同内容」名额退回去（发送失败时用）。没配表 / 没指纹时空操作。"""
+        if self._pair_dedupe is not None and fingerprint is not None:
+            self._pair_dedupe.release(fingerprint, target)
+
+    async def _withdraw_superseded(
+        self,
+        target: ChatRef,
+        message_ids: Sequence[int],
+        rule: ForwardRule,
+        source_chat: Any,
+        source_message_id: int,
+    ) -> None:
+        """群组那条**后到**时，把先前发出去的频道那条从目标里撤回。
+
+        线上实测这个顺序真实存在（2026-09-21 秀儿那对：频道 00:01:37 先到、群组
+        00:01:39 后到），不是理论情况 —— 所以「群组优先」必须能补救已经发出去的那条。
+
+        撤回是**尽力而为**：目标里没有删除权限、消息太旧等情况都会失败，这时只打
+        WARNING 并照常发群组那条（结果就是目标里多一条重复），绝不能因为撤回失败
+        把新的一条也丢掉。
+        """
+        try:
+            await self.client.delete_messages(chat_id=target, message_ids=list(message_ids))
+        except Exception as exc:  # noqa: BLE001 - 撤回失败不该影响后续发送
+            self.alog.warning(
+                "撤回被群组顶替的频道消息失败（目标里可能会多一条重复）",
+                rule=rule.label,
+                target=target,
+                source_chat=source_chat,
+                message_id=source_message_id,
+                withdraw_ids=",".join(map(str, message_ids)),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self.stats["pair_superseded"] += 1
+        self.alog.info(
+            "群组那条后到：已撤回先前发出的频道消息",
+            rule=rule.label,
+            target=target,
+            source_chat=source_chat,
+            message_id=source_message_id,
+            withdraw_ids=",".join(map(str, message_ids)),
+        )
 
     async def _send_to_target(
         self,
@@ -1160,6 +1461,9 @@ class ForwardEngine:
         if self._shared_dedupe is not None:
             # ⚠️ 这是**跨账号共享表**的数字（所有账号合计），不是本账号的。
             data["cross_dedupe"] = self._shared_dedupe.snapshot()
+        if self._pair_dedupe is not None:
+            #: 同样是跨账号共享表（「频道 ↔ 群组 同内容」那一层）。
+            data["pair_dedupe"] = self._pair_dedupe.snapshot()
         return data
 
 
@@ -1246,10 +1550,13 @@ def random_jitter(base: float, jitter: float) -> float:
 __all__ = [
     "CAPTION_LIMIT",
     "SOURCE_LINK_PREFIX",
+    "ChannelGroupDedupe",
     "CrossAccountDedupe",
     "DedupeCache",
     "ForwardEngine",
     "MediaGroupBuffer",
+    "PairDecision",
     "PreparedRule",
+    "content_fingerprint",
     "random_jitter",
 ]

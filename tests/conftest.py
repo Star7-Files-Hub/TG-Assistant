@@ -183,6 +183,7 @@ class FakeClient:
         forward_error: Optional[BaseException] = None,
         forward_error_once: Optional[BaseException] = None,
         copy_group_error: Optional[BaseException] = None,
+        delete_error: Optional[BaseException] = None,
     ) -> None:
         self.me = FakeUser(1, username="me", is_self=True)
         self.callback_answer = callback_answer
@@ -193,8 +194,12 @@ class FakeClient:
         self.forward_error_once = forward_error_once
         #: ``copy_media_group`` 抛错用（测相册复制的降级回退）。
         self.copy_group_error = copy_group_error
+        #: ``delete_messages`` 抛错用（测「撤回失败也不能把新的一条丢掉」）。
+        self.delete_error = delete_error
         self.sent: list[dict[str, Any]] = []
         self.forwarded: list[dict[str, Any]] = []
+        #: ``delete_messages`` 的参数记录 —— 「群组那条后到」时撤回频道那条走这里。
+        self.deleted: list[dict[str, Any]] = []
         #: ``forward_messages`` 的**调用次数**（含抛错的那些）。
         #: ``forwarded`` 只记成功的调用，测「先失败再重试」时必须看这个。
         self.forward_calls = 0
@@ -260,6 +265,15 @@ class FakeClient:
         if self.callback_error is not None:
             raise self.callback_error
         return types.SimpleNamespace(message=self.callback_answer)
+
+    async def delete_messages(self, **kwargs: Any) -> int:
+        """撤回消息 —— 「群组那条后到」时用它把先前发出的频道消息撤掉。"""
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append(kwargs)
+        self.calls.append(("delete_messages", kwargs))
+        ids = kwargs.get("message_ids")
+        return len(ids) if isinstance(ids, (list, tuple)) else 1
 
 
 @pytest.fixture

@@ -34,12 +34,20 @@ class _FakeMultiRunner:
 
     instances: list["_FakeMultiRunner"] = []
 
-    def __init__(self, store: Any, settings: Any, dedupe: Any = None) -> None:
+    def __init__(
+        self,
+        store: Any,
+        settings: Any,
+        dedupe: Any = None,
+        pair_dedupe: Any = None,
+    ) -> None:
         self.store = store
         self.settings = settings
         #: 跨账号去重表。真实 MultiRunner 会自建一张；这里只记录传进来的那个，
         #: 供「面板重建 runner 时去重表必须延续」的断言使用。
         self.dedupe = dedupe
+        #: 「频道 ↔ 群组 同内容」去重表，同样要跨面板重建延续（理由同上）。
+        self.pair_dedupe = pair_dedupe
         self.names: list[str] = []
         self.run_kwargs: dict[str, Any] = {}
         self.started = asyncio.Event()
@@ -104,6 +112,22 @@ async def test_restart_reuses_the_same_dedupe_table(manager: RuntimeManager) -> 
     assert first is not second, "这个用例的前提就是 runner 确实被重建了"
     assert first.dedupe is not None
     assert second.dedupe is first.dedupe, "重建 runner 时去重表必须复用同一个实例"
+
+
+async def test_restart_reuses_the_same_pair_dedupe_table(manager: RuntimeManager) -> None:
+    """「频道 ↔ 群组 同内容」去重表同理必须延续。
+
+    每次换新表的话：刚由账号 A 转发出去的**频道**那条记录就没了，随后到达的
+    **群组**那条读不到它的消息 id ⇒ 撤不回来，目标里照样两份。
+    """
+    first = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    second = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    assert first.pair_dedupe is not None
+    assert second.pair_dedupe is first.pair_dedupe, "重建 runner 时这张表也要复用同一个实例"
 
 
 async def test_stop_account_does_not_deadlock(manager: RuntimeManager) -> None:
