@@ -533,11 +533,15 @@ def _rules_html() -> str:
 def test_rules_start_button_becomes_restart_when_running() -> None:
     """🔴 回归：账号在运行时点「启动」必然失败（线上就是这么踩的）。
 
-    转发规则只在账号**启动时**读一次，所以「改完规则 → 点启动」是用户表达
-    「让新规则生效」的唯一动作。而账号正在跑时后端原来直接返回
+    历史上转发规则只在账号**启动时**读一次，所以「改完规则 → 点启动」是用户
+    表达「让新规则生效」的唯一动作。而账号正在跑时后端原来直接返回
     ``ok=False / "账号 X 已在运行"``，于是这条最自然的操作路径必然失败。
 
-    修法分两半，这里钉前端那一半：按钮在运行中必须显示成「重启」，
+    ⚠️ 规则现已**自动热重载**（`5ecb201`），改完不用再点这个按钮；
+    但它在运行中仍必须显示成「重启」—— 重启账号本身（卡住 / 重连会话）
+    依然是它的职责，而且用户已经习惯了这个位置。
+
+    这里钉前端那一半：按钮在运行中必须显示成「重启」，
     否则用户根本不知道该点哪儿（页面上只有「启动」和「停止」两个键）。
     """
     html = _rules_html()
@@ -545,7 +549,7 @@ def test_rules_start_button_becomes_restart_when_running() -> None:
     assert "acc.running ? '重启' : '启动'" in html, (
         "运行中的账号，按钮文案必须变成「重启」——否则用户只会反复点「启动」然后失败"
     )
-    assert "重启该账号（改完规则要重启才生效）" in html, "按钮 title 没说明重启的目的"
+    assert "重启该账号（改规则不用点这里，会自动生效）" in html, "按钮 title 没说明重启的目的"
 
     # 图标也要跟着换：播放三角 ≠ 重启。
     # ⚠️ 断言必须**限定在按钮那一块**里 —— 页面顶部的「刷新」按钮用的是同一个
@@ -558,7 +562,7 @@ def test_rules_start_button_becomes_restart_when_running() -> None:
 
 
 def test_rules_start_account_shows_backend_message() -> None:
-    """成功时要把后端的 ``message``（「已重启「X」，新规则已生效」）显示出来。"""
+    """成功时要把后端的 ``message``（「已重启「X」」）显示出来。"""
     body = _js_function_body(_rules_html(), "startAccount")
 
     assert "data.message" in body, "成功分支没用后端的 message，用户看不到「已重启」"

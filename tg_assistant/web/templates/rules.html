@@ -12,7 +12,7 @@
             <h1>转发规则</h1>
             <p class="text-muted">
                 规则按账号独立保存；新建时不勾账号 = 写入全部账号。
-                改完规则要重启账号才生效。
+                改完规则会自动生效（引擎盯着配置文件，最迟 1 秒），不用重启账号。
             </p>
         </div>
         <div class="rules-header-right">
@@ -374,13 +374,13 @@
                         <span class="rules-account-count">${st.text} · ${rules.length} 条规则</span>
                     </div>
                     <div class="rules-account-group-actions">
-                        <label class="rules-master-toggle" title="该账号的转发总开关（改完规则要重启账号才生效）">
+                        <label class="rules-master-toggle" title="该账号的转发总开关（改完自动生效，不用重启）">
                             <input type="checkbox" data-role="forward-enabled" ${acc.forward_enabled ? 'checked' : ''} />
                             <span class="toggle-slider"></span>
                             <span class="toggle-label">转发总开关</span>
                         </label>
                         <button class="tg-btn tg-btn-sm" data-action="start"
-                                title="${acc.running ? '重启该账号（改完规则要重启才生效）' : '启动该账号'}">
+                                title="${acc.running ? '重启该账号（改规则不用点这里，会自动生效）' : '启动该账号'}">
                             ${acc.running
                                 ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>'
                                 : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>'}
@@ -530,9 +530,11 @@
     // ==================== 账号级操作 ====================
     async function startAccount(name) {
         if (!name) return;
-        // 这个按钮在账号已运行时叫「重启」——因为**转发规则只在启动时读一次**，
-        // 「改完规则 → 点它」必须真的把新规则加载进去。后端 `start_account()`
-        // 遇到已运行会优雅重启，不再返回 ok=false。
+        // 这个按钮在账号已运行时叫「重启」，但**改规则已经不需要点它了**：
+        // 引擎自己盯 config.json 的 mtime，最迟 1 秒热重载
+        // （见 `forwarder.ForwardEngine.reload_rules`）。
+        // 它现在只用于「账号卡住 / 要重连会话」这类真正的重启。
+        // 后端 `start_account()` 遇到已运行会优雅重启，不再返回 ok=false。
         //
         // 这里**不再**弹确认框。以前弹是因为一个架构缺陷：服务用
         // `tg-assistant run --web` 启动时，真正在跑的 MultiRunner 属于 CLI，

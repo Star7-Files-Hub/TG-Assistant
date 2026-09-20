@@ -476,7 +476,10 @@ class RuntimeManager:
         if not result.get("ok"):
             return result
         if restarted:
-            return {**result, "restarted": True, "message": f"已重启「{name}」，新规则已生效"}
+            # 文案刻意不提「新规则已生效」——规则现在自己热重载（见
+            # forwarder.ForwardEngine.reload_rules），点这个按钮只是为了
+            # 重启账号本身（卡住 / 重连会话）。
+            return {**result, "restarted": True, "message": f"已重启「{name}」"}
         return result
 
     def _detach_runner(self) -> tuple[Any, Optional[asyncio.Task[None]]]:
