@@ -794,6 +794,170 @@ class TestForwardFallsBackToCopy:
         assert engine.stats["forwarded"] == 1
 
 
+class TestDeliveryModeIsHonest:
+    """``转发成功 ... mode=`` 必须反映**实际生效**的模式 —— 日志不能撒谎。
+
+    2026-09-20 发现：``_copy_with_fallback`` 在复制失败时会退成 ``drop_author`` 转发
+    （发出来的是**转发消息**，正文里**没有原文链接**），但调用方一律把它记成
+    ``mode=copy`` ⇒ 日志显示「复制成功」，实际链接丢了。
+
+    为什么这个必须修：小白正是靠这一行 ``mode=`` 判断「链接有没有加上」。
+    日志撒谎 = 他按日志判断会得出错误结论，比不写日志更糟。
+
+    修法：``_send_to_target`` 返回**真实模式字符串**（原来是 ``degraded: bool``）。
+    取值：``forward`` / ``copy`` / ``text`` / ``copy(降级)`` /
+    ``copy(退化为转发·丢链接)`` / ``forward(降级·丢链接)``。
+    """
+
+    LINK = "https://t.me/c/1111111111/100"
+
+    async def _deliver(
+        self,
+        alog,
+        *,
+        mode: str,
+        forward_error: BaseException | None = None,
+        forward_error_once: BaseException | None = None,
+        send_error: BaseException | None = None,
+        include_source_link: bool = True,
+    ):
+        """直接调 ``_send_to_target``，返回 ``(client, engine, sent_ids, actual_mode)``。
+
+        直接调它而不是走 ``_handle``：模式字符串就是它的返回值，断言在这里最精确，
+        不依赖日志管道。
+        """
+        client = FakeClient(
+            forward_error=forward_error,
+            forward_error_once=forward_error_once,
+            send_error=send_error,
+        )
+        engine = ForwardEngine(
+            client,
+            build_config(mode=mode, include_source_link=include_source_link),
+            alog,
+        )
+        engine.register()
+        message = src_message("关键词123")
+        prepared = engine.rules[0]
+        sent_ids, actual = await engine._send_to_target(
+            prepared, message, [message.id], DST, {"link": self.LINK}
+        )
+        return client, engine, sent_ids, actual
+
+    # --- 与配置一致的那三种 ------------------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_forward_mode_reports_forward(self, alog):
+        client, _, _, actual = await self._deliver(
+            alog, mode="forward", include_source_link=False
+        )
+        assert actual == "forward"
+        assert len(client.forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_reports_copy(self, alog):
+        client, _, _, actual = await self._deliver(alog, mode="copy")
+        assert actual == "copy"
+        assert client.forwarded == [], "copy 不该用转发实现"
+        assert len(client.sent) == 1
+        # 链接在**发送时**就写进正文（不是事后编辑）
+        assert self.LINK in client.sent[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_text_mode_reports_text(self, alog):
+        _, _, _, actual = await self._deliver(alog, mode="text")
+        assert actual == "text"
+
+    # --- 降级：forward 撞受保护 → copy ------------------------------------ #
+
+    @pytest.mark.asyncio
+    async def test_downgrade_reports_copy_downgraded(self, alog):
+        client, engine, _, actual = await self._deliver(
+            alog, mode="forward", forward_error_once=ChatForwardsRestricted(value=RESTRICTED)
+        )
+        assert actual == "copy(降级)", "降级后真复制成功，链接在正文里 —— 照实写"
+        assert client.forward_calls == 1
+        assert len(client.sent) == 1
+        assert self.LINK in client.sent[0]["text"]
+        assert engine.stats["downgraded"] == 1
+
+    # --- 🔴 关键：复制失败退成 drop_author 转发时，**链接是丢的** ---------- #
+
+    @pytest.mark.asyncio
+    async def test_copy_fallback_reports_link_loss(self, alog):
+        """``copy`` 复制失败 → 退成 ``drop_author`` 转发 ⇒ 必须明说「丢链接」。
+
+        这是本轮修的核心：改之前这里返回的是「成功」，日志写 ``mode=copy``，
+        小白看了会以为链接加上了，实际那条是转发消息、正文里啥都没有。
+        """
+        client, _, _, actual = await self._deliver(
+            alog, mode="copy", send_error=RuntimeError("copy boom")
+        )
+        assert actual == "copy(退化为转发·丢链接)", "退化成转发还写 copy = 日志撒谎"
+        assert client.sent == [], "复制确实失败了，没有新消息"
+        assert len(client.forwarded) == 1
+        # 确实是 drop_author 转发（隐藏来源抬头），而不是普通转发
+        assert client.forwarded[0]["hide_sender_name"] is True
+        # 发出去的那条里**没有**链接 —— 这正是「丢链接」三个字的依据
+        assert self.LINK not in str(client.forwarded[0])
+
+    @pytest.mark.asyncio
+    async def test_downgrade_then_copy_failure_reports_link_loss(self, alog):
+        """``forward`` 撞受保护 → 降级去复制 → 复制也失败 → 再退成转发 ⇒ 同样丢链接。"""
+        client, engine, _, actual = await self._deliver(
+            alog,
+            mode="forward",
+            forward_error_once=ChatForwardsRestricted(value=RESTRICTED),
+            send_error=RuntimeError("copy boom"),
+        )
+        assert actual == "forward(降级·丢链接)"
+        assert client.forward_calls == 2, "第一次 forward 失败，兜底那次才成功"
+        assert client.sent == []
+        assert len(client.forwarded) == 1
+        assert engine.stats["downgraded"] == 1, "走到降级分支就记数，真实结果看 mode"
+
+    # --- 端到端：日志里那个 mode 字段 -------------------------------------- #
+
+    @pytest.mark.asyncio
+    async def test_success_log_carries_actual_mode(self, alog, caplog):
+        """走完整 ``_handle`` → ``_forward_one``，断言日志里的 ``mode`` 字段。
+
+        上面几条钉的是返回值，这条钉的是**真正打出来的日志** —— 中间那一层
+        （``_forward_one`` 拿返回值拼日志）也要对，否则前面全对、日志照样撒谎。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        with caplog.at_level("INFO"):
+            engine._handle(src_message("关键词123"), edited=False)
+            await drain(engine)
+
+        modes = [
+            r.extra_fields.get("mode")
+            for r in caplog.records
+            if getattr(r, "extra_fields", None) and r.getMessage() == "转发成功"
+        ]
+        assert modes == ["copy"], f"日志里的 mode 字段不对: {modes}"
+
+    @pytest.mark.asyncio
+    async def test_success_log_never_says_copy_when_link_lost(self, alog, caplog):
+        """回归守卫：链接丢了的时候，日志里**不能出现** ``mode=copy``。"""
+        client = FakeClient(send_error=RuntimeError("copy boom"))
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        with caplog.at_level("INFO"):
+            engine._handle(src_message("关键词123"), edited=False)
+            await drain(engine)
+
+        modes = [
+            r.extra_fields.get("mode")
+            for r in caplog.records
+            if getattr(r, "extra_fields", None) and r.getMessage() == "转发成功"
+        ]
+        assert modes == ["copy(退化为转发·丢链接)"], f"实际: {modes}"
+        assert "copy" not in modes, "丢链接还写 copy，等于骗人"
+
+
 class TestCopyModeSourceLink:
     """``copy`` 模式要把「🔗原文链接：…」写进正文 / caption。
 

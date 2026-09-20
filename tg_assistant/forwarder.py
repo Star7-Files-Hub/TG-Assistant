@@ -14,6 +14,11 @@
    都在同一个源群里时把同一条消息各发一遍。
 6. **forward 失败自动降级 copy**：源会话受保护时 Telegram 会拒 forward，此时自动改用
    复制再发一次，而不是直接失败。
+7. **日志里的 ``mode=`` 是「实际生效」的模式**，不是配置值。取值见
+   :meth:`ForwardEngine._send_to_target` 的文档 —— 带「丢链接」字样的那两种说明
+   消息是**退成转发发出去的、正文里没有原文链接**（同时会打一条 WARNING）。
+   ⚠️ 别把这里改回「一律写 ``rule.mode``」：那样日志会和同时打出的 WARNING 自相矛盾，
+   而用户正是靠这一行判断链接有没有加上。
 
 ⚠️ **``copy`` 模式 = 按 ``file_id`` 重新发送一条新消息**，不是
 ``forward_messages(hide_sender_name=True)``。后者发出来的是**转发消息**，而 Telegram
@@ -785,7 +790,7 @@ class ForwardEngine:
                 )
                 continue
             try:
-                sent_ids, degraded = await self._send_to_target(
+                sent_ids, actual_mode = await self._send_to_target(
                     prepared, message, ids, target, variables
                 )
             except SessionInvalid:
@@ -818,8 +823,10 @@ class ForwardEngine:
             self.alog.info(
                 "转发成功",
                 rule=rule.label,
-                # 源会话受保护时 forward 会失败并自动降级成复制，这里显示**实际生效**的模式。
-                mode="copy(降级)" if degraded else rule.mode,
+                # **实际生效**的模式（不是配置里的 `rule.mode`）：源会话受保护时 forward 会
+                # 降级成复制；复制又失败时还会退成 drop_author 转发（那种情况下**链接是丢的**）。
+                # 小白靠这一行判断「链接有没有加上」，所以这里必须说真话，不能一律写 copy。
+                mode=actual_mode,
                 source_chat=chat_title or chat_id,
                 target=target,
                 message_ids=",".join(map(str, ids)),
@@ -843,13 +850,20 @@ class ForwardEngine:
         ids: list[int],
         target: ChatRef,
         variables: dict[str, Any],
-    ) -> tuple[list[int], bool]:
+    ) -> tuple[list[int], str]:
         """把消息发到 ``target``。
 
-        返回 ``(已发送的消息 id, 是否发生了 forward→copy 降级)``。
+        返回 ``(已发送的消息 id, **实际生效的模式**)``。
 
-        ``mode="forward"`` 遇到受保护源会话（Telegram 回 400 ``CHAT_FORWARDS_RESTRICTED``）
-        时**自动改用复制**再发一次 —— 这就是「copy 做备选」。
+        模式取值（就是日志里 ``转发成功 ... mode=`` 打出来的那个）：
+        ``forward`` / ``copy`` / ``text`` —— 与配置一致；
+        ``copy(降级)`` —— ``forward`` 撞上受保护源会话，已改用复制（**链接在正文里**）；
+        ``copy(退化为转发·丢链接)`` —— ``copy`` 失败，退成 ``drop_author`` 转发；
+        ``forward(降级·丢链接)`` —— 降级去复制，复制也失败，又退成 ``drop_author`` 转发。
+
+        🔴 后两种带「丢链接」字样的，说明**发出去的是转发消息、正文里没有原文链接**
+        （唯一的线索是同时打了一条 WARNING）。日志必须如实反映，否则会误导排查
+        —— 2026-09-20 之前这里一律写 ``copy``，属于「日志撒谎」。
         """
         rule = prepared.rule
         chat_id, _, chat_title = chat_identity(message)
@@ -981,10 +995,18 @@ class ForwardEngine:
                 return []
             return _sent_ids(sent)
 
-        async def _copy_with_fallback() -> list[int]:
-            """复制；复制失败就退化成 ``drop_author`` 转发（内容能到，但**丢原文链接**）。"""
+        async def _copy_with_fallback() -> tuple[list[int], bool]:
+            """复制；复制失败就退化成 ``drop_author`` 转发（内容能到，但**丢原文链接**）。
+
+            返回 ``(已发送的消息 id, 是否**真的复制成功**)``。
+
+            ⚠️ 第二项**必须**往上传：退化成 drop_author 转发时，发出来的是**转发消息**、
+            正文里没有链接。调用方若一律按 ``copy`` 记日志，就会出现
+            「日志说 copy，实际链接丢了」—— 而小白正是靠这条日志判断链接有没有加上。
+            这里返回真实结果，由调用方如实报告（2026-09-20 修）。
+            """
             try:
-                return await with_flood_retry(
+                sent = await with_flood_retry(
                     _server_copy,
                     alog=self.alog,
                     action=f"复制到 {target}",
@@ -1002,13 +1024,15 @@ class ForwardEngine:
                     message_ids=",".join(map(str, ids)),
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                return await with_flood_retry(
+                sent = await with_flood_retry(
                     lambda: _server_forward(True),
                     alog=self.alog,
                     action=f"转发到 {target}",
                     retries=2,
                     max_flood_wait=60.0,
                 )
+                return _sent_ids(sent), False
+            return _sent_ids(sent), True
 
         try:
             if rule.mode == "forward":
@@ -1023,10 +1047,12 @@ class ForwardEngine:
                 # 链接在它下方单独补一条。
                 if want_link:
                     sent = [*sent, *await _forward_link_note()]
-                return sent, False
+                return sent, "forward"
 
             if rule.mode == "copy":
-                return await _copy_with_fallback(), False
+                sent, copied = await _copy_with_fallback()
+                # ⚠️ 不能一律写 "copy" —— 退化那条是 drop_author 转发，正文里**没有链接**。
+                return sent, "copy" if copied else "copy(退化为转发·丢链接)"
 
             # text 模式：按模板重发纯文本
             text = render_template(rule.template or "{text}", variables)
@@ -1047,7 +1073,7 @@ class ForwardEngine:
                 retries=2,
                 max_flood_wait=60.0,
             )
-            return _sent_ids(sent), False
+            return _sent_ids(sent), "text"
         except SessionInvalid:
             raise
         except Exception as exc:
@@ -1067,9 +1093,10 @@ class ForwardEngine:
                 message_ids=",".join(map(str, ids)),
                 error=f"{type(exc).__name__}: {exc}",
             )
-            sent = await _copy_with_fallback()
+            sent, copied = await _copy_with_fallback()
+            # 计数口径：走到降级分支就 +1（哪怕复制本身又退了）。真实结果看日志的 mode。
             self.stats["downgraded"] += 1
-            return sent, True
+            return sent, "copy(降级)" if copied else "forward(降级·丢链接)"
 
     def _submit_notify(
         self,

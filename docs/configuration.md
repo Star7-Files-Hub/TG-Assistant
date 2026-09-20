@@ -118,7 +118,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].sources` | array | 来源会话：`@username`、`chat_id`、`t.me/...` 链接。**空数组 = 监听全部** |
 | `rules[].exclude_sources` | array | 只对**这一条规则**生效的排除来源 |
 | `rules[].targets` | array | 目标会话，格式同 sources |
-| `rules[].mode` | string | `forward`（原生转发，带「转发自」抬头）/ `copy`（**按 `file_id` 重新发送一条新消息**，不带来源标记，默认值）/ `text`（按模板重发纯文本）。⚠️ **`forward` 遇到受保护源会话时（Telegram 回 `CHAT_FORWARDS_RESTRICTED`）会自动改用复制**再发一次，不用手动改成 `copy`；那条消息的日志会显示 `mode=copy(降级)` |
+| `rules[].mode` | string | `forward`（原生转发，带「转发自」抬头）/ `copy`（**按 `file_id` 重新发送一条新消息**，不带来源标记，默认值）/ `text`（按模板重发纯文本）。⚠️ **`forward` 遇到受保护源会话时（Telegram 回 `CHAT_FORWARDS_RESTRICTED`）会自动改用复制**再发一次，不用手动改成 `copy`；那条消息的日志会显示 `mode=copy(降级)`。日志里的 `mode` 是**实际生效**值，还可能出 `copy(退化为转发·丢链接)` / `forward(降级·丢链接)`（复制也失败、退成转发 ⇒ **正文里没有原文链接**，同时打一条 WARNING） |
 | `rules[].match.mode` | string | `regex` / `contains` / `exact` / `all` |
 | `rules[].match.patterns` | array | 匹配模式（正则或关键词） |
 | `rules[].match.exclude_patterns` | array | 排除模式 |
