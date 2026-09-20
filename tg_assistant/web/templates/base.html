@@ -27,8 +27,18 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
                     账号管理
                 </a>
-                <div class="nav-group-title">任务配置</div>
-                <div class="nav-submenu">
+                <button type="button"
+                        class="nav-group-title nav-group-toggle"
+                        id="nav-group-listen"
+                        aria-controls="nav-submenu-listen"
+                        aria-expanded="true"
+                        data-submenu="nav-submenu-listen"
+                        title="展开 / 收起监听任务"
+                        onclick="toggleNavGroup(this)">
+                    <span>监听任务</span>
+                    <svg class="nav-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+                <div class="nav-submenu" id="nav-submenu-listen">
                     <a href="/rules" class="nav-item {% if page == 'rules' %}active{% endif %}">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
                         转发规则
@@ -81,6 +91,55 @@
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('sidebar-overlay').classList.toggle('show');
         }
+
+        /* ---- 可折叠的侧边栏分组（例：监听任务） ----
+           ⚠️ 子菜单的 id 由按钮的 ``data-submenu`` 给出，不要拼字符串
+           （``'nav-submenu-' + id`` 这种写法一旦拼错，getElementById 返回 null，
+           页面上表现为「点了没反应」，而模板照样渲染、测试也全绿）。
+        */
+
+        function navGroupMenu(btn) {
+            return document.getElementById(btn.getAttribute('data-submenu'));
+        }
+
+        function navGroupKey(btn) {
+            return 'tga.navgroup.' + btn.id;
+        }
+
+        function setNavGroup(btn, expanded) {
+            var menu = navGroupMenu(btn);
+            if (!menu) return;
+            btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+            menu.classList.toggle('collapsed', !expanded);
+        }
+
+        function toggleNavGroup(btn) {
+            var expanded = btn.getAttribute('aria-expanded') === 'true';
+            setNavGroup(btn, !expanded);
+            try {
+                localStorage.setItem(navGroupKey(btn), expanded ? '0' : '1');
+            } catch (e) {
+                /* 隐私模式下 localStorage 会抛异常 —— 不影响本次折叠 */
+            }
+        }
+
+        function initNavGroups() {
+            document.querySelectorAll('.nav-group-toggle').forEach(function (btn) {
+                var menu = navGroupMenu(btn);
+                var stored = null;
+                try {
+                    stored = localStorage.getItem(navGroupKey(btn));
+                } catch (e) {
+                    stored = null;
+                }
+                // 当前页就在这个分组里 ⇒ 必须展开。否则用户收起后跳到「转发规则」，
+                // 侧边栏里连自己在哪一页都看不出来。
+                var hasActive = !!menu && menu.querySelector('.nav-item.active') !== null;
+                setNavGroup(btn, hasActive || stored === null || stored === '1');
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', initNavGroups);
     </script>
     {% block scripts %}{% endblock %}
 </body>

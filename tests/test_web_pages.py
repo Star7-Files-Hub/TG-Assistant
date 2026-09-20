@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import tg_assistant
 from tg_assistant.config import AccountRecord, utc_now_iso
 from tg_assistant.web import create_app
 from tg_assistant.web.auth import COOKIE_NAME, cookie_value
@@ -57,6 +58,52 @@ def test_page_renders(client, path: str) -> None:
 def test_account_pages_render(client, account, path: str) -> None:
     resp = client.get(path.format(name=NAME))
     assert resp.status_code == 200, f"{path} -> {resp.status_code}\n{resp.text[:500]}"
+
+
+def test_nav_group_renamed_to_listen_tasks(client) -> None:
+    """侧边栏分组「任务配置」改名「监听任务」，并且**不再出现旧名字**。"""
+    html = client.get("/").text
+
+    assert "监听任务" in html, "分组没改名"
+    assert "任务配置" not in html, "旧名字还在 —— 改名要改干净，别两处并存"
+
+
+def test_nav_group_is_collapsible(client) -> None:
+    """「监听任务」是一个**能展开/收起的子菜单**：按钮和子菜单的 id 必须对得上。
+
+    JS 是靠 ``nav-group-<id>`` / ``nav-submenu-<id>`` 这两个 id 配对的，
+    任何一边写错都会变成「点了没反应」，单看模板不容易发现。
+    """
+    html = client.get("/").text
+
+    assert 'id="nav-group-listen"' in html
+    assert 'aria-controls="nav-submenu-listen"' in html
+    # 子菜单 id 挂在按钮的 data-submenu 上（JS 不拼字符串，拼错会静默失效）
+    assert 'data-submenu="nav-submenu-listen"' in html
+    assert "toggleNavGroup(this)" in html
+
+    submenu = re.search(
+        r'<div class="nav-submenu" id="nav-submenu-listen">(.*?)\n\s*</div>', html, re.S
+    )
+    assert submenu is not None, "子菜单必须带 id —— JS 靠 id 找到它再切 .collapsed"
+    body = submenu.group(1)
+    assert 'href="/rules"' in body, "转发规则挪出子菜单了"
+    assert 'href="/red_packet"' in body, "抢红包挪出子菜单了"
+
+
+def test_nav_collapsed_class_really_hides_submenu() -> None:
+    """``.collapsed`` 必须真的藏得住子菜单。
+
+    🔴 坑：``.nav-submenu`` 自带 ``display: flex``，如果 ``.collapsed`` 写在它**前面**，
+    会被同权重的 flex 盖掉 ⇒ 「收起了但内容还在」这种最尴尬的半失效状态。
+    """
+    css_path = Path(tg_assistant.__file__).parent / "web" / "static" / "css" / "style.css"
+    css = css_path.read_text(encoding="utf-8")
+
+    base = css.index(".nav-submenu {")
+    collapsed = css.index(".nav-submenu.collapsed {")
+    assert base < collapsed, ".collapsed 必须排在 .nav-submenu 之后，否则 display:flex 会盖掉它"
+    assert "display: none" in css[collapsed : collapsed + 120]
 
 
 @pytest.mark.parametrize("path", ["/config/{name}", "/chats/{name}"])
