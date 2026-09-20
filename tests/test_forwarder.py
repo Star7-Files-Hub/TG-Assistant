@@ -6,6 +6,8 @@ import asyncio
 import datetime as dt
 import os
 import time
+import types
+from typing import Any
 
 import pytest
 from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
@@ -888,3 +890,28 @@ class TestDedupeWiring:
     def test_account_runner_defaults_to_disabled(self, paths):
         runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
         assert runner.shared_dedupe is None
+
+
+class TestHeartbeatSurfacesNewCounters:
+    """心跳必须带上 ``cross_deduped`` / ``downgraded``。
+
+    这两件事的明细日志是 **debug 级**，而线上 ``TGA_LOG_LEVEL=INFO`` —— 所以心跳里
+    的这两个数字是**唯一**能确认「跨账号去重 / forward 降级到底有没有生效」的地方。
+    字段被删掉就等于功能彻底不可观测，这里钉住它。
+    """
+
+    def test_heartbeat_includes_cross_dedupe_and_downgrade(self, paths, client, alog):
+        runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
+        runner.started_at = time.time()
+        runner.forwarder = ForwardEngine(client, build_config(), alog)
+        runner.forwarder.stats["cross_deduped"] = 3
+        runner.forwarder.stats["downgraded"] = 2
+
+        # 直接换掉 logger 收集字段，不去赌日志传播配置。
+        captured: dict[str, Any] = {}
+        runner.alog = types.SimpleNamespace(info=lambda msg, **kw: captured.update(kw))
+
+        runner._log_heartbeat()
+
+        assert captured["cross_deduped"] == 3
+        assert captured["downgraded"] == 2

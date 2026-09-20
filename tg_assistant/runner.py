@@ -677,6 +677,11 @@ class AccountRunner:
                     "forwarded": snapshot["forwarded"],
                     "fwd_failed": snapshot["failed"],
                     "deduped": snapshot["deduped"],
+                    # 跨账号去重跳过 / forward 自动降级 copy 的次数。
+                    # 这两个数字是判断「去重生效没有」「降级生效没有」的**唯一可见口径** ——
+                    # 明细日志是 debug 级，线上 TGA_LOG_LEVEL=INFO 看不到。
+                    "cross_deduped": snapshot["cross_deduped"],
+                    "downgraded": snapshot["downgraded"],
                 }
             )
         if self.hunter is not None:
