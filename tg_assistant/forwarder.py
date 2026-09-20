@@ -124,7 +124,7 @@ class CrossAccountDedupe:
     可以配不同的值，共享表不能只有一个 TTL。
     """
 
-    __slots__ = ("_seen", "_ops", "claimed", "rejected")
+    __slots__ = ("_seen", "_ops", "claimed", "rejected", "released")
 
     def __init__(self) -> None:
         #: 键 -> 过期时刻（``time.monotonic()`` 基准）。
@@ -134,6 +134,8 @@ class CrossAccountDedupe:
         self.claimed = 0
         #: 因「别的账号已经发过」而跳过的次数。
         self.rejected = 0
+        #: 占用之后又**退还**的次数（发送失败）。用来把「真去重」和「占位后失败」分开。
+        self.released = 0
 
     def claim(self, source_chat_id: Any, message_id: Any, target: Any, ttl: float) -> bool:
         """尝试占用「这条源消息发往这个目标」的名额。
@@ -157,6 +159,18 @@ class CrossAccountDedupe:
         self.claimed += 1
         return True
 
+    def release(self, source_chat_id: Any, message_id: Any, target: Any) -> None:
+        """退还名额 —— **发送失败时必须调用**。
+
+        ``claim`` 是「**先占位、后发送**」（为了在事件循环里保持同步原子）。一旦发送失败
+        而名额不退，这个键会在整个 TTL（默认 300s）内保持被占 ⇒ **另一个账号也补发不了**
+        —— 这条消息对该目标就**彻底丢了**。退还之后别的账号还能正常补上。
+
+        不存在的键退还也无害（幂等），所以调用方不必先判断。
+        """
+        self._seen.pop((source_chat_id, message_id, str(target)), None)
+        self.released += 1
+
     def _purge(self, now: float) -> None:
         for key in [k for k, deadline in self._seen.items() if deadline <= now]:
             self._seen.pop(key, None)
@@ -165,7 +179,12 @@ class CrossAccountDedupe:
         return len(self._seen)
 
     def snapshot(self) -> dict[str, Any]:
-        return {"size": len(self._seen), "claimed": self.claimed, "rejected": self.rejected}
+        return {
+            "size": len(self._seen),
+            "claimed": self.claimed,
+            "rejected": self.rejected,
+            "released": self.released,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +203,17 @@ class PreparedRule:
     #: 转发目标集合。**只用于"目标不能当来源"的防循环判断**，不参与其它筛选。
     targets: RefSet
     last_fired: float = 0.0
-    stats: dict[str, int] = field(default_factory=lambda: {"matched": 0, "sent": 0, "failed": 0, "skipped": 0})
+    stats: dict[str, int] = field(
+        default_factory=lambda: {
+            "matched": 0,
+            "sent": 0,
+            "failed": 0,
+            "skipped": 0,
+            #: 会话层就被拒的次数（来源不匹配 / 被排除 / 私聊 / 命中「目标不能当来源」）。
+            #: 规则配了却不生效时，这个数字是线上**唯一**能一眼看出问题的信号。
+            "chat_rejected": 0,
+        }
+    )
 
     @classmethod
     def build(cls, rule: ForwardRule) -> "PreparedRule":
@@ -559,6 +588,20 @@ class ForwardEngine:
 
             allowed, reason = prepared.chat_allowed(chat_id, chat_username, kind)
             if not allowed:
+                # ⚠️ 这里以前是**裸 continue、零日志零计数** —— 规则配了却不生效时，
+                # 线上完全查不出是「群 ID 写错 / 配置没生效 / 消息根本没进来」。
+                # 计数会进 snapshot（`status` / 面板），能直接看到「这条规则收到了消息，
+                # 但全被会话层拒了」；日志给 debug，因为这条路径在 sources 限定下很常见，
+                # INFO 级会刷屏。
+                prepared.stats["chat_rejected"] += 1
+                self.alog.debug(
+                    "跳过消息",
+                    rule=prepared.label,
+                    reason=reason,
+                    chat=chat_title or chat_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
                 continue
             allowed, reason = prepared.sender_allowed(sender_id, sender_username, is_self)
             if not allowed:
@@ -746,6 +789,8 @@ class ForwardEngine:
                     prepared, message, ids, target, variables
                 )
             except SessionInvalid:
+                # 会话已失效 ⇒ 本账号发不出去了，把名额让给别的账号再试。
+                self._release_claim(chat_id, ids[0], target)
                 raise
             except Exception as exc:
                 prepared.stats["failed"] += 1
@@ -759,6 +804,9 @@ class ForwardEngine:
                     error=f"{type(exc).__name__}: {exc}",
                     hint=_forward_hint(exc),
                 )
+                # ⚠️ **必须退还名额**：`claim` 是先占位后发送，不退的话这个键会在整个 TTL
+                # （默认 300s）里保持被占 ⇒ 另一个账号也补发不了，这条消息对该目标彻底丢失。
+                self._release_claim(chat_id, ids[0], target)
                 continue
 
             prepared.stats["sent"] += 1
@@ -782,6 +830,11 @@ class ForwardEngine:
 
         if rule.notify and self.notifier is not None and delivered:
             self._submit_notify(prepared, variables, delivered)
+
+    def _release_claim(self, source_chat_id: Any, message_id: Any, target: ChatRef) -> None:
+        """把跨账号去重名额退回去（发送失败时用）。没配共享表时是空操作。"""
+        if self._shared_dedupe is not None:
+            self._shared_dedupe.release(source_chat_id, message_id, target)
 
     async def _send_to_target(
         self,
@@ -1085,8 +1138,14 @@ def _pipeline_ms(message: Any) -> Optional[float]:
     if not isinstance(date, _dt.datetime):
         return None
     if date.tzinfo is None:
-        date = date.replace(tzinfo=_dt.timezone.utc)
-    return (_dt.datetime.now(_dt.timezone.utc) - date).total_seconds() * 1000
+        # ⚠️ **不能当 UTC**。pyrogram 的 ``utils.timestamp_to_datetime`` 是
+        # ``datetime.fromtimestamp(ts)`` ⇒ 拿到的是 **naive 本地时间**（服务器 TZ = CST）。
+        # 这里原先写的是 ``date.replace(tzinfo=timezone.utc)``，于是 pipeline_ms 恒为
+        # **-8 小时**（2026-09-20 线上实测 -28799461.9ms，189 条）。
+        # ``astimezone()`` 会把 naive 时间**按本地时区**解释并补上 tzinfo，这才是对的。
+        date = date.astimezone()
+    # 时钟偏差（消息时间戳略超前于本机）仍可能算出一丁点负值；「负耗时」没有意义，兜底 0。
+    return max(0.0, (_dt.datetime.now(_dt.timezone.utc) - date).total_seconds() * 1000)
 
 
 def _is_forwards_restricted(exc: Exception) -> bool:

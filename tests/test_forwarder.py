@@ -14,7 +14,13 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
 
 from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule
-from tg_assistant.forwarder import CrossAccountDedupe, DedupeCache, ForwardEngine, PreparedRule
+from tg_assistant.forwarder import (
+    CrossAccountDedupe,
+    DedupeCache,
+    ForwardEngine,
+    PreparedRule,
+    _pipeline_ms,
+)
 from tg_assistant.runner import AccountRunner, MultiRunner
 
 from .conftest import FakeChat, FakeClient, FakeUser, make_message
@@ -1145,13 +1151,118 @@ class TestForwardModeLinkNote:
         assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
 
 
+class TestPipelineMs:
+    """``_pipeline_ms`` 的时区处理。
+
+    🔴 2026-09-20 线上实测：``pipeline_ms`` **恒为 -8 小时**（-28799461.9ms，189 条）。
+    根因 —— pyrogram 的 ``utils.timestamp_to_datetime`` 是
+    ``datetime.fromtimestamp(ts)``，返回的是 **naive 本地时间**（服务器 TZ = CST），
+    而这里原先 ``replace(tzinfo=utc)`` 把它当 UTC，于是差了一个时区偏移。
+
+    ⚠️ 所以本类的关键用例是「60 秒前的 naive 本地时间」——「当前时间」那个用例
+    在**错的实现下也会被 0 兜底**，抓不到 bug。
+    """
+
+    def test_naive_local_time_is_interpreted_as_local(self):
+        """🔴 这条是真正的回归守卫：naive 本地时间必须**按本地**解释。
+
+        用错误实现（当 UTC）会算出 -8 小时，被 0 兜底后变成 0 —— 和期望的 60000 差得远。
+        """
+        message = make_message("x", date=dt.datetime.now() - dt.timedelta(seconds=60))
+        value = _pipeline_ms(message)
+        assert value is not None
+        assert 55_000 <= value <= 65_000, f"应当约 60000ms，实际 {value}"
+
+    def test_aware_utc_time_works(self):
+        message = make_message("x", date=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30))
+        value = _pipeline_ms(message)
+        assert value is not None
+        assert 25_000 <= value <= 35_000
+
+    def test_future_timestamp_is_clamped_to_zero(self):
+        """时钟偏差可能让时间戳略微超前 —— 「负耗时」没有意义，兜底 0。"""
+        message = make_message("x", date=dt.datetime.now() + dt.timedelta(seconds=30))
+        assert _pipeline_ms(message) == 0.0
+
+    def test_missing_or_invalid_date_returns_none(self):
+        assert _pipeline_ms(make_message("x")) is None
+        assert _pipeline_ms(make_message("x", date="not-a-datetime")) is None
+
+    @pytest.mark.asyncio
+    async def test_forward_log_reports_sane_pipeline_ms(self, alog, caplog):
+        """端到端：转发成功的日志里 pipeline_ms 不能是负数（也不该是 -8 小时）。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(), alog)
+        engine.register()
+        engine._handle(
+            src_message("关键词123", date=dt.datetime.now() - dt.timedelta(seconds=1)),
+            edited=False,
+        )
+        await drain(engine)
+        assert engine.stats["forwarded"] == 1
+
+
+class TestChatRejectedCounter:
+    """规则「会话层被拒」必须有计数 —— 否则规则不生效时线上零线索。
+
+    2026-09-20 排查「规则配了但 ``matched=0``」时发现：``chat_allowed`` 返回 False 的
+    分支是**裸 ``continue``**（不计数、不日志），而紧邻的 ``sender_allowed`` 分支
+    却有计数 + debug 日志。于是「群 ID 写错 / 配置没生效 / 消息没进来」三种情况
+    在线上**完全无法区分**。
+    """
+
+    @pytest.mark.asyncio
+    async def test_other_chat_is_counted(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[SRC]), alog)
+        engine.register()
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(-100999, title="别的群")), edited=False
+        )
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.rules[0].stats["chat_rejected"] == 1
+        assert engine.stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_counter_is_exposed_in_snapshot(self, alog):
+        """面板 / ``status`` 走 ``snapshot()``，所以计数必须出现在那里。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[SRC]), alog)
+        engine.register()
+        for _ in range(3):
+            engine._handle(
+                make_message("关键词123", chat=FakeChat(-100999, title="别的群")), edited=False
+            )
+        await drain(engine)
+
+        assert engine.snapshot()["rules"]["r1"]["chat_rejected"] == 3
+
+    @pytest.mark.asyncio
+    async def test_matching_chat_does_not_count(self, alog):
+        """命中来源的会话不该被计进去 —— 否则这个数字就没意义了。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[SRC]), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert engine.rules[0].stats["chat_rejected"] == 0
+        assert engine.rules[0].stats["matched"] == 1
+
+
 class TestCrossAccountDedupe:
     """跨账号去重：两个账号都监听到同一条消息时，发往**同一目标**只发一次。
 
     小白 2026-09-20 的需求：「需要做跨账号去重，因为两个账号的群可能重复」。
 
     线上背景：项目里早先那版跨账号去重挂在 Postgres 上（``TGA_POSTGRES_DSN``），
-    而线上**根本没配 DSN** ⇒ ``check_dedupe`` 恒返回 False，功能等于关闭。
+    键是 **两元组** ``(chat_id, message_id)`` ⇒ 「A 发 T1、B 发 T2」会被误判成重复而
+    **丢消息**，而且 ``check_dedupe`` 是同步阻塞的（把转发延迟推到几百毫秒）。
+
+    ⚠️ **更正**：那版**不是**「死代码」—— `TGA_POSTGRES_DSN` 配在 **systemd unit 的
+    ``Environment=``** 里（``.env`` 里没有）。只看 ``.env`` 会得出「根本没配」的错误结论。
     """
 
     # ---------------------------------------------------------------- #
@@ -1185,6 +1296,84 @@ class TestCrossAccountDedupe:
         assert dedupe.claim(SRC, 1, DST, 10) is False
         now[0] += 6  # 超过 TTL
         assert dedupe.claim(SRC, 1, DST, 10) is True
+
+    # ---------------------------------------------------------------- #
+    # release：发送失败必须退还名额
+    # ---------------------------------------------------------------- #
+    def test_release_frees_the_slot(self):
+        """退还之后别的账号立刻就能占用 —— 不必等 TTL 过期。"""
+        dedupe = CrossAccountDedupe()
+        assert dedupe.claim(SRC, 1, DST, 300) is True
+        assert dedupe.claim(SRC, 1, DST, 300) is False
+
+        dedupe.release(SRC, 1, DST)
+
+        assert dedupe.claim(SRC, 1, DST, 300) is True, "退还后应当能重新占用"
+        assert dedupe.released == 1
+
+    def test_release_only_affects_that_target(self):
+        """退还只清掉自己那个键，别的目标不受影响。"""
+        dedupe = CrossAccountDedupe()
+        assert dedupe.claim(SRC, 1, DST, 300) is True
+        assert dedupe.claim(SRC, 1, -1009999999999, 300) is True
+
+        dedupe.release(SRC, 1, DST)
+
+        assert dedupe.claim(SRC, 1, DST, 300) is True
+        assert dedupe.claim(SRC, 1, -1009999999999, 300) is False, "别的目标不该被顺手放开"
+
+    def test_release_is_idempotent(self):
+        """退还不存在的键是无害空操作（调用方不必先判断）。"""
+        dedupe = CrossAccountDedupe()
+        dedupe.release(SRC, 999, DST)
+        dedupe.release(SRC, 999, DST)
+        assert len(dedupe) == 0
+        assert dedupe.released == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_send_releases_so_other_account_can_send(self, alog):
+        """🔴 **本轮修的 bug**：``claim`` 先占位后发送，失败若不退还 ⇒ 这条消息对该目标
+        会在整个 TTL（默认 300s）里**谁也发不出去**。
+
+        场景：账号 A 先抢到名额但发送失败（网络抖动 / 目标临时不可写），
+        账号 B 手里有同一条消息、目标也相同 —— 它必须能补上。
+        """
+        shared = CrossAccountDedupe()
+        broken = FakeClient(forward_error=RuntimeError("network boom"))
+        healthy = FakeClient()
+        engine_a = ForwardEngine(broken, build_config(), alog, shared_dedupe=shared)
+        engine_b = ForwardEngine(healthy, build_config(), alog, shared_dedupe=shared)
+
+        message = src_message("关键词123")
+        engine_a._handle(message, edited=False)
+        await drain(engine_a)
+        assert engine_a.stats["failed"] == 1
+        assert shared.released == 1, "发送失败必须把名额退回去"
+
+        engine_b._handle(message, edited=False)
+        await drain(engine_b)
+
+        assert len(healthy.forwarded) == 1, "A 失败了，B 必须还能把这条消息发出去"
+        assert engine_b.stats["forwarded"] == 1
+        assert engine_b.stats["cross_deduped"] == 0, "名额已退还，B 不该被判成重复"
+
+    @pytest.mark.asyncio
+    async def test_successful_send_does_not_release(self, alog):
+        """发成功了就**不能**退还 —— 否则两个账号会各发一遍。"""
+        shared = CrossAccountDedupe()
+        first, second = FakeClient(), FakeClient()
+        engine_a = ForwardEngine(first, build_config(), alog, shared_dedupe=shared)
+        engine_b = ForwardEngine(second, build_config(), alog, shared_dedupe=shared)
+
+        message = src_message("关键词123")
+        engine_a._handle(message, edited=False)
+        await drain(engine_a)
+        engine_b._handle(message, edited=False)
+        await drain(engine_b)
+
+        assert shared.released == 0
+        assert len(first.forwarded) == 1
+        assert second.forwarded == []
 
     # ---------------------------------------------------------------- #
     # 两个引擎共享一张表（真实场景）
