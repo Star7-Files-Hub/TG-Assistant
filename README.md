@@ -229,6 +229,9 @@ A: `copy` 模式**按 `file_id` 重新发送一条全新消息**：文本走 `se
 **Q: `include_source_link` 在两种模式下表现一样吗？**
 A: 不一样。**`forward`**：那条转发消息**原样不动**，在它**下方单独补发一条**只含 `🔗原文链接：<链接>` 的消息。**`copy` / `text`**：链接写进**当前这条消息**的正文末尾（前面空一行）。补链接失败只记 warning，不影响转发本身。
 
+**Q: 消息很长的时候，链接会不会被截断掉？**
+A: **不会** —— 实现上是**先给链接留出位置，再截断原文**（`truncate(base, limit - len(链接块))`）。顺序反过来的话，`truncate` 是从**末尾**砍掉再补「…（已截断）」，链接正好在末尾，就会被吃掉。⚠️ 这一点很容易写错，所以 `tests/test_forwarder.py::TestLinkSurvivesTruncation` 专门守着（覆盖正文 4096 / caption 1024 / 相册 caption / `text` 模式 3800 四条路径）。
+
 **Q: `copy` 模式复制失败了怎么办？**
 A: 会退化成「不带来源抬头的转发」（`forward_messages(hide_sender_name=True)`）把内容发出去，代价是**这一条带不上原文链接**，日志里会有 `复制失败，退化为不带抬头的转发（原文链接会丢失）` 的 warning。
 

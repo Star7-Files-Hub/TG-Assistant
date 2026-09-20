@@ -54,6 +54,7 @@ from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
     MAX_TEXT_LENGTH,
+    SAFE_TEXT_LENGTH,
     CompiledMatcher,
     MatchResult,
     RefSet,
@@ -880,11 +881,31 @@ class ForwardEngine:
         #: ``forward`` 在**下方**单独补一条 —— 转发消息本身不可编辑，也不该动。
         want_link = bool(rule.include_source_link and link)
 
-        def _with_link(base: str) -> str:
-            """把「🔗原文链接：…」接到正文 / caption 末尾（前面空一行）。"""
+        def _with_link(base: str, limit: int) -> tuple[str, bool]:
+            """把「🔗原文链接：…」接到正文 / caption 末尾，并保证总长不超 ``limit``。
+
+            返回 ``(拼好的文本, 原文是否被**完整**保留)`` —— 第二项决定能不能沿用原来的
+            ``entities``（截断会切断实体边界 ⇒ Telegram 回 ``ENTITY_BOUNDS_INVALID``）。
+
+            🔴 **必须先给链接留位置、再截断原文**。顺序反了（先拼再截断）的话：
+            :func:`~tg_assistant.matching.truncate` 是**从末尾砍掉**再补「…（已截断）」，
+            而链接正好拼在末尾 ⇒ 消息一长，用户最想要的那行反而被吃掉，
+            而且**日志一切正常**（静默丢）。2026-09-20 审出来的边界 bug。
+
+            ⚠️ ``CAPTION_LIMIT`` 只有 **1024**，比正文更容易撞到 —— 资源帖的长 caption
+            正是这条规则匹配的东西，所以这不是理论问题。
+            """
             if not want_link or link in base:
-                return base
-            return f"{base}\n\n{SOURCE_LINK_PREFIX}{link}" if base else f"{SOURCE_LINK_PREFIX}{link}"
+                return truncate(base, limit), len(base) <= limit
+
+            # 正文为空时不加前导空行（否则 caption 会以两个换行开头，很难看）
+            block = f"\n\n{SOURCE_LINK_PREFIX}{link}" if base else f"{SOURCE_LINK_PREFIX}{link}"
+            room = limit - len(block)
+            if room <= 0:
+                # 链接本身就长到放不下（t.me 链接不会这么长，纯属兜底）：
+                # 保链接、牺牲原文 —— 链接是用户明确要的那部分。
+                return truncate(block.lstrip("\n"), limit), False
+            return truncate(base, room) + block, len(base) <= room
 
         async def _server_forward(hide_sender: bool) -> list[int]:
             """服务端转发。``hide_sender=True``（= raw ``drop_author``）去掉「转发自」抬头。
@@ -918,12 +939,8 @@ class ForwardEngine:
             if len(ids) > 1:
                 captions = None
                 if want_link:
-                    captions = [
-                        truncate(
-                            _with_link(getattr(message, "caption", None) or ""),
-                            CAPTION_LIMIT,
-                        )
-                    ]
+                    # 只覆盖第一项（pyrogram 按下标取值、越界回落原 caption）
+                    captions = [_with_link(getattr(message, "caption", None) or "", CAPTION_LIMIT)[0]]
                 sent = await self.client.copy_media_group(
                     chat_id=target,
                     from_chat_id=chat_id,
@@ -935,16 +952,19 @@ class ForwardEngine:
 
             text = getattr(message, "text", None)
             if text is not None:
-                body = _with_link(text)
-                trimmed = truncate(body, MAX_TEXT_LENGTH)
-                if not trimmed.strip():
-                    trimmed = "（原消息无文本内容）"
+                body, intact = _with_link(text, MAX_TEXT_LENGTH)
+                if not body.strip():
+                    body = "（原消息无文本内容）"
+                    intact = False
                 sent = await self.client.send_message(
                     chat_id=target,
-                    text=trimmed,
-                    # 截断可能切断实体边界 ⇒ Telegram 回 ENTITY_BOUNDS_INVALID，
-                    # 这种情况就丢掉 entities（宁可少点格式，也不能发不出去）
-                    entities=getattr(message, "entities", None) if trimmed == body else None,
+                    text=body,
+                    # 截断（或退化成占位文案）会切断实体边界 ⇒ Telegram 回
+                    # ENTITY_BOUNDS_INVALID，这种情况就丢掉 entities
+                    # （宁可少点格式，也不能发不出去）。
+                    # ⚠️ 只在**原文被完整保留**时才沿用：单纯在末尾追加链接不影响前面
+                    # 实体的 offsets，所以「加了链接但没截断」仍然可以带 entities。
+                    entities=getattr(message, "entities", None) if intact else None,
                     parse_mode=ParseMode.DISABLED,
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                     **kwargs,
@@ -953,9 +973,7 @@ class ForwardEngine:
 
             sent = await message.copy(
                 chat_id=target,
-                caption=truncate(
-                    _with_link(getattr(message, "caption", None) or ""), CAPTION_LIMIT
-                ),
+                caption=_with_link(getattr(message, "caption", None) or "", CAPTION_LIMIT)[0],
                 **kwargs,
             )
             return _sent_ids(sent)
@@ -1057,8 +1075,16 @@ class ForwardEngine:
             # text 模式：按模板重发纯文本
             text = render_template(rule.template or "{text}", variables)
             if want_link and link not in text:
-                text = f"{text}\n\n{SOURCE_LINK_PREFIX}{link}"
-            text = truncate(text)
+                # ⚠️ 同样**先给链接留位置再截断**，否则长消息会把链接砍掉
+                # （truncate 的默认上限是 SAFE_TEXT_LENGTH=3800）。
+                block = f"\n\n{SOURCE_LINK_PREFIX}{link}"
+                room = SAFE_TEXT_LENGTH - len(block)
+                if room <= 0:
+                    text = truncate(block.lstrip("\n"))
+                else:
+                    text = truncate(text, room) + block
+            else:
+                text = truncate(text)
             if not text.strip():
                 text = "（原消息无文本内容）"
             sent = await with_flood_retry(

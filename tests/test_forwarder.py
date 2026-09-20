@@ -958,6 +958,108 @@ class TestDeliveryModeIsHonest:
         assert "copy" not in modes, "丢链接还写 copy，等于骗人"
 
 
+class TestLinkSurvivesTruncation:
+    """长正文 + 附带来源链接时，**链接不能被截断吃掉**。
+
+    2026-09-20 逐行审新代码时发现的边界 bug：原先是「**先拼链接、再 truncate**」，
+    而 :func:`truncate` 是**从末尾砍掉**再补「…（已截断）」——
+    链接正好拼在末尾 ⇒ 消息一长，用户最想要的那行反而被吃掉，
+    而且**日志一切正常**（静默丢，和前面几个缺陷同一个家族）。
+
+    正确顺序：**先给链接留出位置，再截断原文**。
+
+    ⚠️ 这是够得着的现实场景，不是理论问题：``CAPTION_LIMIT`` 只有 **1024**，
+    而「宸澄」规则匹配的正是那种带一长串说明文字的资源帖 caption。
+    """
+
+    LINK = "https://t.me/c/1111111111/100"
+
+    @pytest.mark.asyncio
+    async def test_long_text_keeps_link(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123 " + "长" * 5000), edited=False)
+        await drain(engine)
+
+        sent = client.sent[0]["text"]
+        assert self.LINK in sent, "链接被 truncate 吃掉了 —— 用户最想要的那行丢了"
+        assert len(sent) <= 4096, "保链接不能以超长为代价（Telegram 会直接拒收）"
+
+    @pytest.mark.asyncio
+    async def test_long_caption_keeps_link(self, alog):
+        """caption 上限只有 1024，比正文更容易撞到。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123", caption="关键词123 " + "长" * 1200)
+        message.text = None
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        caption = message.copy_calls[0]["caption"]
+        assert self.LINK in caption, "长 caption 里链接被吃掉了"
+        assert len(caption) <= 1024
+
+    @pytest.mark.asyncio
+    async def test_long_album_caption_keeps_link(self, alog):
+        """相册走 ``copy_media_group`` 的 ``captions``，同样是 caption 上限。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123", caption="关键词123 " + "长" * 1200)
+        message.text = None
+        message.media_group_id = "g1"
+        prepared = engine.rules[0]
+        result = prepared.matcher.match(message)
+        await engine._forward_one(
+            prepared, message, result, time.perf_counter(), message_ids=[100, 101]
+        )
+
+        caption = client.copied_groups[0]["captions"][0]
+        assert self.LINK in caption, "相册长 caption 里链接被吃掉了"
+        assert len(caption) <= 1024
+
+    @pytest.mark.asyncio
+    async def test_text_mode_long_message_keeps_link(self, alog):
+        """``text`` 模式走 ``truncate`` 的**默认**上限（``SAFE_TEXT_LENGTH``=3800），
+        同样会把末尾的链接砍掉。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="text"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123 " + "长" * 5000), edited=False)
+        await drain(engine)
+
+        sent = client.sent[0]["text"]
+        assert self.LINK in sent, "text 模式长消息里链接被吃掉了"
+
+    @pytest.mark.asyncio
+    async def test_truncation_still_drops_entities(self, alog):
+        """保链接不能顺手把「截断就丢 entities」这条安全规则弄没了。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123 " + "长" * 5000)
+        message.entities = ["FAKE-ENTITIES"]
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["entities"] is None
+
+    @pytest.mark.asyncio
+    async def test_short_text_still_keeps_entities(self, alog):
+        """没截断时 entities 必须照旧保留 —— 别为了修截断把格式保真弄坏。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123")
+        message.entities = ["FAKE-ENTITIES"]
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["entities"] == ["FAKE-ENTITIES"]
+
+
 class TestCopyModeSourceLink:
     """``copy`` 模式要把「🔗原文链接：…」写进正文 / caption。
 
