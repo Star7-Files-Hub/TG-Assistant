@@ -183,6 +183,12 @@ class FakeClient:
         #: ``forward_messages`` 的**调用次数**（含抛错的那些）。
         #: ``forwarded`` 只记成功的调用，测「先失败再重试」时必须看这个。
         self.forward_calls = 0
+        #: ``edit_message_text`` / ``edit_message_caption`` 抛错用
+        #: （测「补原文链接失败不影响整条转发」）。
+        self.edit_error: Optional[BaseException] = None
+        #: 两类编辑调用的参数记录 —— copy 模式补原文链接会走这里。
+        self.edited: list[dict[str, Any]] = []
+        self.edited_captions: list[dict[str, Any]] = []
         self.callbacks: list[dict[str, Any]] = []
         self.handlers: list[tuple[Any, int]] = []
         self.next_message_id = 9000
@@ -220,6 +226,18 @@ class FakeClient:
             return result
         self.next_message_id += 1
         return types.SimpleNamespace(id=self.next_message_id)
+
+    async def edit_message_text(self, **kwargs: Any) -> Any:
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edited.append(kwargs)
+        return types.SimpleNamespace(id=kwargs.get("message_id"))
+
+    async def edit_message_caption(self, **kwargs: Any) -> Any:
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edited_captions.append(kwargs)
+        return types.SimpleNamespace(id=kwargs.get("message_id"))
 
     async def request_callback_answer(self, **kwargs: Any) -> Any:
         self.callbacks.append(kwargs)

@@ -757,6 +757,128 @@ class TestForwardFallsBackToCopy:
         assert engine.stats["forwarded"] == 1
 
 
+class TestCopyModeSourceLink:
+    """``copy`` 模式也要带上「🔗原文链接：…」。
+
+    小白 2026-09-20：「附带来源的那个链接没有了」+「如果用 copy 能不能把链接放在
+    copy 的下方，换行两次再加原文链接，格式改成 🔗原文链接：xxxx」。
+
+    背景：``include_source_link`` 原先**只在 text 模式生效** —— ``_do()`` 里
+    ``mode in {"forward", "copy"}`` 直接 return，压根走不到加链接那段。
+    而 copy（含 forward 撞受保护源会话后的自动降级）用 ``drop_author`` 去掉了
+    「转发自」抬头，Telegram 不再附带任何回溯入口 ⇒ 必须自己写进正文。
+
+    ⚠️ Telegram 不支持给已发出的消息**追加**文本，只能整体重写一遍
+    （``edit_message_text`` / ``edit_message_caption``）。
+    """
+
+    #: ``src_message`` 默认 message_id=100、chat=-1001111111111（无 username）
+    LINK = "https://t.me/c/1111111111/100"
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_appends_source_link(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.edited) == 1, "copy 模式应当编辑一次，把链接补进正文"
+        payload = client.edited[0]
+        assert payload["chat_id"] == DST
+        assert payload["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+        assert payload["link_preview_options"] is not None, "必须禁掉链接预览"
+
+    @pytest.mark.asyncio
+    async def test_forward_mode_does_not_edit(self, alog):
+        """forward 模式**不需要**补链接：Telegram 的「转发自」抬头本身就是回溯入口。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.edited == []
+        assert client.forwarded[0]["hide_sender_name"] is None
+
+    @pytest.mark.asyncio
+    async def test_downgrade_also_appends_link(self, alog):
+        """forward 撞受保护源会话自动降级成 copy ⇒ 同样要补链接。"""
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert engine.stats["downgraded"] == 1
+        assert len(client.edited) == 1
+        assert client.edited[0]["text"].endswith(f"🔗原文链接：{self.LINK}")
+
+    @pytest.mark.asyncio
+    async def test_include_source_link_false_skips_edit(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(mode="copy", include_source_link=False), alog
+        )
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.edited == []
+
+    @pytest.mark.asyncio
+    async def test_media_message_uses_edit_caption(self, alog):
+        """媒体消息没有 ``text``，只能改 caption。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        message = src_message("关键词123", caption="关键词123")
+        message.text = None
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.edited == []
+        assert len(client.edited_captions) == 1
+        assert client.edited_captions[0]["caption"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+
+    @pytest.mark.asyncio
+    async def test_edit_failure_does_not_fail_forward(self, alog):
+        """链接没加上不该让整条转发记成失败 —— 内容已经发出去了。"""
+        client = FakeClient()
+        client.edit_error = RuntimeError("edit boom")
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert engine.stats["forwarded"] == 1
+        assert engine.stats["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_existing_link_is_not_duplicated(self, alog):
+        """原文里已经有同一个链接时不再重复追加。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message(f"关键词123 见 {self.LINK}"), edited=False)
+        await drain(engine)
+
+        assert client.edited == [], "链接已在正文里，不该再编辑一次"
+
+    @pytest.mark.asyncio
+    async def test_text_mode_uses_same_prefix(self, alog):
+        """text 模式的文案统一成 ``🔗原文链接：``（原来只有 ``🔗 ``）。"""
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(mode="text", template="{text}", include_source_link=True), alog
+        )
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+
+
 class TestCrossAccountDedupe:
     """跨账号去重：两个账号都监听到同一条消息时，发往**同一目标**只发一次。
 

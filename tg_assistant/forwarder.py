@@ -38,6 +38,7 @@ from .client import SessionInvalid, with_flood_retry
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
+    MAX_TEXT_LENGTH,
     CompiledMatcher,
     MatchResult,
     RefSet,
@@ -811,16 +812,17 @@ class ForwardEngine:
             )
             return _sent_ids(sent)
 
+        #: 原文链接（``build_variables`` 给的 t.me 永久链接）。
+        link = str(variables.get("link") or "")
+
         async def _do() -> list[int]:
             if rule.mode in {"forward", "copy"}:
                 return await _server_forward(rule.mode == "copy")
 
             # text 模式：按模板重发纯文本
             text = render_template(rule.template or "{text}", variables)
-            if rule.include_source_link and variables.get("link"):
-                link = str(variables["link"])
-                if link not in text:
-                    text = f"{text}\n\n🔗 {link}"
+            if rule.include_source_link and link and link not in text:
+                text = f"{text}\n\n{SOURCE_LINK_PREFIX}{link}"
             text = truncate(text)
             if not text.strip():
                 text = "（原消息无文本内容）"
@@ -833,15 +835,12 @@ class ForwardEngine:
             return _sent_ids(sent)
 
         try:
-            return (
-                await with_flood_retry(
-                    _do,
-                    alog=self.alog,
-                    action=f"转发到 {target}",
-                    retries=2,
-                    max_flood_wait=60.0,
-                ),
-                False,
+            sent = await with_flood_retry(
+                _do,
+                alog=self.alog,
+                action=f"转发到 {target}",
+                retries=2,
+                max_flood_wait=60.0,
             )
         except SessionInvalid:
             raise
@@ -869,6 +868,9 @@ class ForwardEngine:
                     max_flood_wait=60.0,
                 )
                 self.stats["downgraded"] += 1
+                # 降级后发出去的同样是**复制内容** ⇒ 也要补原文链接。
+                if rule.include_source_link:
+                    await self._append_source_link(target, sent, message, link)
                 return sent, True
 
             if rule.mode != "copy" or len(ids) > 1:
@@ -886,7 +888,75 @@ class ForwardEngine:
                 retries=1,
                 max_flood_wait=30.0,
             )
-            return _sent_ids(sent), False
+            sent_ids = _sent_ids(sent)
+            if rule.include_source_link:
+                await self._append_source_link(target, sent_ids, message, link)
+            return sent_ids, False
+
+        # copy 模式发出去的没有「转发自」抬头 ⇒ 显式补上原文链接。
+        # forward 模式**不需要**：Telegram 的转发抬头本身就是回溯入口。
+        if rule.mode == "copy" and rule.include_source_link:
+            await self._append_source_link(target, sent, message, link)
+        return sent, False
+
+    async def _append_source_link(
+        self,
+        target: ChatRef,
+        sent_ids: Sequence[int],
+        message: Any,
+        link: str,
+    ) -> None:
+        """给**复制**出去的消息补上「🔗原文链接：…」。
+
+        为什么需要它：``copy`` 模式（以及 forward 撞上受保护源会话后的自动降级）用
+        ``forward_messages(hide_sender_name=True)`` 发出，Telegram **不带**「转发自」抬头
+        —— 那正是 copy 的目的，但也就**没有任何回溯原文的入口**，只能自己写进正文。
+
+        ⚠️ Telegram 不支持给已发出的消息**追加**文本，只能整体重写一遍
+        （``edit_message_text`` / ``edit_message_caption``）。正文取自**源消息**
+        （我们手上就有），不去读目标消息，所以源消息被删也不影响。
+
+        ⚠️ 编辑会触发 ``EditedMessageHandler``，但那是**目标会话**里的编辑 ⇒
+        ``chat_allowed`` 的「本规则的目标不能当来源」会拦掉，不会造成转发循环。
+
+        ⚠️ 刻意**不抛出**：内容已经发出去了，链接没加上不该让整条转发记成失败。
+        """
+        if not link or not sent_ids:
+            return
+        suffix = f"\n\n{SOURCE_LINK_PREFIX}{link}"
+        text = getattr(message, "text", None)
+        caption = getattr(message, "caption", None)
+        for sent_id in sent_ids:
+            try:
+                if text is not None:
+                    if link in text:
+                        # 正文里已经有这个链接 ⇒ 不发一次「内容没变」的编辑：
+                        # 白费一次 RPC，还会给消息打上「已编辑」标记。
+                        continue
+                    await self.client.edit_message_text(
+                        chat_id=target,
+                        message_id=sent_id,
+                        text=truncate(f"{text}{suffix}", MAX_TEXT_LENGTH),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                else:
+                    # 纯媒体（无 caption）也能靠 edit_message_caption 加上一行文字。
+                    base = caption or ""
+                    if link in base:
+                        continue
+                    body = f"{base}{suffix}" if base else f"{SOURCE_LINK_PREFIX}{link}"
+                    await self.client.edit_message_caption(
+                        chat_id=target,
+                        message_id=sent_id,
+                        caption=truncate(body, CAPTION_LIMIT),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.alog.warning(
+                    "追加原文链接失败",
+                    target=target,
+                    message_id=sent_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
     def _submit_notify(
         self,
@@ -930,6 +1000,14 @@ class ForwardEngine:
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
+#: 「原文链接」那一行的前缀。``copy`` 模式用 ``drop_author`` 去掉了「转发自」抬头，
+#: Telegram 不会附带任何回溯入口，所以只能自己把链接写进正文。
+SOURCE_LINK_PREFIX = "🔗原文链接："
+
+#: 媒体 caption 的硬上限（Telegram 限制），比正文的 4096 短得多。
+CAPTION_LIMIT = 1024
+
+
 def _sent_ids(sent: Any) -> list[int]:
     if sent is None:
         return []
@@ -994,6 +1072,8 @@ def random_jitter(base: float, jitter: float) -> float:
 
 
 __all__ = [
+    "CAPTION_LIMIT",
+    "SOURCE_LINK_PREFIX",
     "CrossAccountDedupe",
     "DedupeCache",
     "ForwardEngine",

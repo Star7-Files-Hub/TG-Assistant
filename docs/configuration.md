@@ -124,6 +124,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].match.exclude_patterns` | array | 排除模式 |
 | `rules[].match.fields` | array | 匹配范围：`text` / `caption` / `buttons` |
 | `rules[].template` | string | `text` 模式下的模板，可用变量见下文 |
+| `rules[].include_source_link` | bool | 是否附带来源链接（默认 `true`）。**`forward` 模式不需要它** —— Telegram 的「转发自」抬头本身就是回溯入口；**`copy` 模式**（含 `forward` 撞受保护源会话后的自动降级）没有抬头，会在正文/caption 末尾追加一行 `🔗原文链接：<t.me 链接>`（前面空一行）。实现上是发出后 `edit` 一次消息，**编辑失败不影响转发本身** |
 | `rules[].media_group` | bool | 是否聚合相册（攒齐后一次转发） |
 | `rules[].delay` | number | 命中后延迟多少秒再发 |
 | `rules[].min_interval` | number | 同一规则两次触发的最小间隔 |
