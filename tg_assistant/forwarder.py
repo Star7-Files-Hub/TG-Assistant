@@ -371,14 +371,34 @@ class ChannelGroupDedupe:
         self._seen[key] = _PairEntry(now + ttl, kind)
         return PairDecision(send=True, withdraw=withdraw)
 
-    def mark_sent(self, fingerprint: str, target: Any, sent_ids: Sequence[int]) -> None:
-        """记下「这条内容发到该目标后，生成了哪些消息 id」。
+    def mark_sent(
+        self,
+        fingerprint: str,
+        target: Any,
+        kind: Optional[str],
+        sent_ids: Sequence[int],
+    ) -> bool:
+        """记下「这条内容发到该目标后，生成了哪些消息 id」；返回**本条是否已被顶替**。
 
-        只有记了 id，群组那条后到时才撤得掉频道那条。发送成功后调用；没记录时是空操作。
+        只有记了 id，群组那条后到时才撤得掉频道那条。发送成功后调用；没记录时返回 ``False``。
+
+        🔴 **为什么还要判断「已被顶替」**：:meth:`claim` 和真正发送之间隔着一个 ``await``
+        （线上 ``pipeline_ms`` 实测到过 **4223ms**）。群组那条完全可能**就在这个窗口里到达** ——
+        它 :meth:`claim` 时读到的 ``sent`` 还是空的（频道那条还没发完），撤不掉任何东西，
+        于是两条都发出去了，等于没去重。
+
+        所以发送完成后再看一次记录：如果记录已经被换成**群组**那条（而本条是频道），
+        说明本条的发送期间被顶替了 ⇒ 返回 ``True``，调用方据此**撤回自己刚发出去的**。
         """
         entry = self._seen.get((fingerprint, str(target)))
-        if entry is not None:
+        if entry is None:
+            return False
+        if entry.kind == kind:
             entry.sent = [int(i) for i in sent_ids]
+            return False
+        # 记录被换成了另一类会话。只有「本条是频道、记录已是群组」这一种可能
+        # （群组 claim 会覆盖记录，而频道 claim 只会被拒、不会覆盖）。
+        return kind == "channel" and entry.kind == "group"
 
     def release(self, fingerprint: str, target: Any) -> None:
         """退还名额 —— **发送失败时必须调用**。
@@ -1068,8 +1088,15 @@ class ForwardEngine:
                 continue
 
             # 记下这一条发出去生成了哪些消息 id —— 群组那条后到时靠它把频道这条撤回。
-            if self._pair_dedupe is not None and fingerprint is not None:
-                self._pair_dedupe.mark_sent(fingerprint, target, sent_ids)
+            # 🔴 返回值是「**发送期间**被群组顶替了」：`claim` 与发送之间隔着一个 await
+            # （线上 pipeline_ms 到过 4223ms），群组那条可能就在这个窗口里到达、读不到
+            # 我们的 sent ⇒ 撤不掉。那就由**我们自己**把刚发出去的这条撤回。
+            if self._pair_dedupe is not None and fingerprint is not None and self._pair_dedupe.mark_sent(
+                fingerprint, target, kind, sent_ids
+            ):
+                await self._withdraw_superseded(
+                    target, sent_ids, rule, chat_title or chat_id, ids[0]
+                )
 
             prepared.stats["sent"] += 1
             self.stats["forwarded"] += 1

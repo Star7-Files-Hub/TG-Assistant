@@ -81,6 +81,25 @@ async def drain(engine: ForwardEngine) -> None:
     await asyncio.sleep(0)
 
 
+class SlowFirstForwardClient(FakeClient):
+    """**第一次** ``forward_messages`` 卡住，直到 :attr:`release` 被 set。
+
+    用来制造「频道那条还在发、群组那条已经到」的竞态窗口 —— 线上 ``claim`` 与发送之间
+    隔着一个 ``await``（``pipeline_ms`` 实测到过 **4223ms**），这个窗口是真实存在的。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self._first = True
+
+    async def forward_messages(self, **kwargs: Any) -> Any:
+        if self._first:
+            self._first = False
+            await self.release.wait()
+        return await super().forward_messages(**kwargs)
+
+
 class TestDedupeCache:
     def test_first_wins(self):
         cache = DedupeCache(60)
@@ -1869,7 +1888,7 @@ class TestChannelGroupDedupe:
         """群组那条后到 ⇒ 照样发，并把先前发出去的频道那条（含链接那条）撤回。"""
         dedupe = ChannelGroupDedupe()
         assert dedupe.claim("fp", DST, "channel", 300).send is True
-        dedupe.mark_sent("fp", DST, [11, 12])
+        assert dedupe.mark_sent("fp", DST, "channel", [11, 12]) is False
 
         decision = dedupe.claim("fp", DST, "group", 300)
 
@@ -1881,10 +1900,43 @@ class TestChannelGroupDedupe:
         """顶替之后旧记录要换成群组那条 —— 否则再来的频道消息还能读到过期的 sent。"""
         dedupe = ChannelGroupDedupe()
         dedupe.claim("fp", DST, "channel", 300)
-        dedupe.mark_sent("fp", DST, [11])
+        dedupe.mark_sent("fp", DST, "channel", [11])
         dedupe.claim("fp", DST, "group", 300)
 
         assert dedupe.claim("fp", DST, "channel", 300).send is False
+
+    # ---------------------------------------------------------------- #
+    # 🔴 claim 与发送之间的竞态：发送期间被群组顶替
+    # ---------------------------------------------------------------- #
+    def test_mark_sent_reports_superseded_during_send(self):
+        """🔴 `claim` 与真正发送之间隔着一个 ``await``（线上 `pipeline_ms` 到过 4223ms）。
+
+        群组那条可能**就在这个窗口里**到达：它 `claim` 时读到的 ``sent`` 还是空的，
+        撤不掉任何东西。⇒ 发送完成后必须能发现自己已被顶替，由调用方撤回自己刚发的。
+        """
+        dedupe = ChannelGroupDedupe()
+        assert dedupe.claim("fp", DST, "channel", 300).send is True
+        # 频道那条还在发（sent 还是空的），群组那条到了 —— 它撤不掉东西
+        group_decision = dedupe.claim("fp", DST, "group", 300)
+        assert group_decision.send is True
+        assert group_decision.withdraw == (), "此刻频道那条还没发完，没有 id 可撤"
+
+        # 频道那条发完了 ⇒ 必须自报「我被顶替了」
+        assert dedupe.mark_sent("fp", DST, "channel", [11, 12]) is True, (
+            "发送期间被群组顶替，mark_sent 必须返回 True 让调用方撤回自己"
+        )
+
+    def test_mark_sent_is_false_when_not_superseded(self):
+        dedupe = ChannelGroupDedupe()
+        dedupe.claim("fp", DST, "group", 300)
+        assert dedupe.mark_sent("fp", DST, "group", [11]) is False
+
+    def test_group_send_is_never_reported_superseded(self):
+        """群组那条自己是赢家，不该被报告成顶替（否则会把自己撤回）。"""
+        dedupe = ChannelGroupDedupe()
+        dedupe.claim("fp", DST, "channel", 300)
+        dedupe.claim("fp", DST, "group", 300)
+        assert dedupe.mark_sent("fp", DST, "group", [21]) is False
 
     # ---------------------------------------------------------------- #
     # 不能误杀
@@ -1953,7 +2005,7 @@ class TestChannelGroupDedupe:
 
     def test_mark_sent_on_missing_key_is_noop(self):
         dedupe = ChannelGroupDedupe()
-        dedupe.mark_sent("nope", DST, [1, 2])
+        assert dedupe.mark_sent("nope", DST, "channel", [1, 2]) is False
         assert len(dedupe) == 0
 
     def test_snapshot_counts(self):
@@ -2012,6 +2064,41 @@ class TestChannelGroupSameContentInEngine:
         )
         assert engine.stats["pair_superseded"] == 1
         assert engine.stats["pair_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_send_in_flight_when_group_arrives_still_ends_with_one(self, alog):
+        """🔴 竞态：频道那条**还在发**的时候群组那条就到了。
+
+        ``claim`` 与真正发送之间隔着一个 ``await``（线上 ``pipeline_ms`` 实测到过 **4223ms**）。
+        群组那条此刻 ``claim`` 读到的 ``sent`` 还是空的、撤不到任何东西 ⇒ 两条都会发出去，
+        除非**频道那条自己**在发送完成后发现被顶替并撤回。最终目标里只该剩群组那条。
+        """
+        pair = ChannelGroupDedupe()
+        client = SlowFirstForwardClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+
+        before = client.next_message_id
+        engine._handle(channel_message("关键词123"), edited=False)
+        await asyncio.sleep(0.05)  # 频道那条卡在 forward_messages 里
+        assert client.forwarded == [], "前提：频道那条确实还没发出去"
+
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await asyncio.sleep(0.05)  # 群组那条发完（它不受闸门影响）
+        group_sent = list(range(before + 1, client.next_message_id + 1))
+        assert len(group_sent) == 2, "群组那条先发完（转发消息 + 下方链接消息）"
+        assert client.deleted == [], "此刻还没有可撤的东西"
+
+        client.release.set()  # 放行频道那条
+        await drain(engine)
+
+        channel_sent = [
+            i for i in range(before + 1, client.next_message_id + 1) if i not in group_sent
+        ]
+        assert len(client.forwarded) == 2, "竞态窗口里两条都发出去过"
+        assert [call["message_ids"] for call in client.deleted] == [channel_sent], (
+            "频道那条发送完成后必须自己撤回 —— 群组那条 claim 时它还没发完，撤不到它"
+        )
+        assert engine.stats["pair_superseded"] == 1
 
     @pytest.mark.asyncio
     async def test_withdraw_failure_still_sends_group_copy(self, alog):
