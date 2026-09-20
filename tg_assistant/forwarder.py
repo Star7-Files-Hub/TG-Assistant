@@ -21,6 +21,9 @@
 「先转发、再 edit 补上原文链接」这条路根本走不通。重发拿到的是全新消息，链接在**发送时**
 就写进正文，一次 RPC 搞定、零编辑。
 
+⚠️ **``forward`` 模式不动那条转发消息**：原文链接在它**下方**单独补发一条
+（``🔗原文链接：<link>``）。``copy`` 才是写进当前消息正文。
+
 每条转发都会记录 ``pipeline_ms``（消息在 Telegram 的时间戳到发送完成的总耗时）和
 ``handler_ms``（本进程内耗时），日志里直接能看出慢在哪一段。
 """
@@ -805,7 +808,9 @@ class ForwardEngine:
 
         #: 原文链接（``build_variables`` 给的 t.me 永久链接）。
         link = str(variables.get("link") or "")
-        #: 只有 copy 需要显式写链接 —— forward 自带的「转发自」抬头本身就是回溯入口。
+        #: 要不要附带原文链接。两种模式的**加法不同**：
+        #: ``copy`` 写进**这条消息**的正文末尾（它是重发出来的新消息，正文可写）；
+        #: ``forward`` 在**下方**单独补一条 —— 转发消息本身不可编辑，也不该动。
         want_link = bool(rule.include_source_link and link)
 
         def _with_link(base: str) -> str:
@@ -888,6 +893,41 @@ class ForwardEngine:
             )
             return _sent_ids(sent)
 
+        async def _forward_link_note() -> list[int]:
+            """``forward`` 模式：**不动**那条转发消息，在它**下方**补发一条独立消息。
+
+            为什么不能把链接写进转发消息本身：Telegram **拒绝编辑转发消息**
+            （实测 ``400 Bad Request: message can't be edited``）。所以 forward 模式
+            只能单独发一条 —— 这也正是小白要的格式：
+            「转发的消息不用编辑，直接在下方加一条原文链接」。
+
+            刻意**不抛出**：内容已经发出去了，链接没补上不该让整条转发记成失败。
+            """
+            try:
+                sent = await with_flood_retry(
+                    lambda: self.client.send_message(
+                        chat_id=target,
+                        text=f"{SOURCE_LINK_PREFIX}{link}",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        **kwargs,
+                    ),
+                    alog=self.alog,
+                    action=f"补发原文链接到 {target}",
+                    retries=2,
+                    max_flood_wait=60.0,
+                )
+            except SessionInvalid:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.alog.warning(
+                    "补发原文链接失败",
+                    rule=rule.label,
+                    target=target,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return []
+            return _sent_ids(sent)
+
         async def _copy_with_fallback() -> list[int]:
             """复制；复制失败就退化成 ``drop_author`` 转发（内容能到，但**丢原文链接**）。"""
             try:
@@ -926,6 +966,10 @@ class ForwardEngine:
                     retries=2,
                     max_flood_wait=60.0,
                 )
+                # 转发消息本身**不编辑**（Telegram 也拒绝编辑转发消息）——
+                # 链接在它下方单独补一条。
+                if want_link:
+                    sent = [*sent, *await _forward_link_note()]
                 return sent, False
 
             if rule.mode == "copy":

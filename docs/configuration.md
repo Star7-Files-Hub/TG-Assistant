@@ -124,7 +124,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].match.exclude_patterns` | array | 排除模式 |
 | `rules[].match.fields` | array | 匹配范围：`text` / `caption` / `buttons` |
 | `rules[].template` | string | `text` 模式下的模板，可用变量见下文 |
-| `rules[].include_source_link` | bool | 是否附带来源链接（默认 `true`）。**`forward` 模式不需要它** —— Telegram 的「转发自」抬头本身就是回溯入口；**`copy` / `text` 模式**（含 `forward` 撞受保护源会话后的自动降级）没有抬头，会在正文/caption 末尾追加一行 `🔗原文链接：<t.me 链接>`（前面空一行）。实现上链接是**发送时就写进正文**的（`copy` 模式按 `file_id` 重发，文本走 `send_message`、媒体走 `send_cached_media`、相册走 `copy_media_group`），**不是**事后编辑 —— Telegram 拒绝编辑转发消息 |
+| `rules[].include_source_link` | bool | 是否附带来源链接（默认 `true`）。**两种模式的加法不同**：`forward` 模式**不动**那条转发消息（Telegram 本来就拒绝编辑转发消息），在它**下方**单独补发一条只含 `🔗原文链接：<t.me 链接>` 的消息；`copy` / `text` 模式写进**当前消息**的正文/caption 末尾（前面空一行）。`copy` 的链接是**发送时就写进正文**的（按 `file_id` 重发：文本走 `send_message`、媒体走 `send_cached_media`、相册走 `copy_media_group`），**不是**事后编辑。补链接失败只 warning，不影响转发本身 |
 | `rules[].media_group` | bool | 是否聚合相册（攒齐后一次转发） |
 | `rules[].delay` | number | 命中后延迟多少秒再发 |
 | `rules[].min_interval` | number | 同一规则两次触发的最小间隔 |

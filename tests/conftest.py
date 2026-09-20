@@ -200,6 +200,10 @@ class FakeClient:
         self.forward_calls = 0
         #: ``copy_media_group`` 的参数记录 —— copy 模式的**相册**走这里。
         self.copied_groups: list[dict[str, Any]] = []
+        #: **按发生顺序**记下所有发送类调用 ``(方法名, 参数)``。
+        #: ``sent`` / ``forwarded`` 是两个独立列表，跨类型的先后顺序看不出来 ——
+        #: 而「原文链接补在转发消息**下方**」恰恰考的就是顺序。
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self.callbacks: list[dict[str, Any]] = []
         self.handlers: list[tuple[Any, int]] = []
         self.next_message_id = 9000
@@ -217,6 +221,7 @@ class FakeClient:
         if self.send_error is not None:
             raise self.send_error
         self.sent.append(kwargs)
+        self.calls.append(("send_message", kwargs))
         self.next_message_id += 1
         return types.SimpleNamespace(id=self.next_message_id)
 
@@ -228,6 +233,7 @@ class FakeClient:
             error, self.forward_error_once = self.forward_error_once, None
             raise error
         self.forwarded.append(kwargs)
+        self.calls.append(("forward_messages", kwargs))
         ids = kwargs.get("message_ids")
         if isinstance(ids, (list, tuple)):
             result = []
@@ -242,6 +248,7 @@ class FakeClient:
         if self.copy_group_error is not None:
             raise self.copy_group_error
         self.copied_groups.append(kwargs)
+        self.calls.append(("copy_media_group", kwargs))
         result = []
         for _ in range(2):
             self.next_message_id += 1

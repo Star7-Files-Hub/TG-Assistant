@@ -866,16 +866,20 @@ class TestCopyModeSourceLink:
         assert len(client.sent[0]["text"]) <= 4096
 
     @pytest.mark.asyncio
-    async def test_forward_mode_does_not_write_link(self, alog):
-        """forward 模式**不需要**补链接：Telegram 的「转发自」抬头本身就是回溯入口。"""
+    async def test_forward_mode_never_edits_forwarded_message(self, alog):
+        """forward 模式**不动**那条转发消息，链接改在**下方**单独补一条。
+
+        Telegram 拒绝编辑转发消息，所以「就地加链接」这条路根本不存在。
+        """
         client = FakeClient()
         engine = ForwardEngine(client, build_config(mode="forward"), alog)
         engine.register()
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
-        assert client.sent == []
-        assert client.forwarded[0]["hide_sender_name"] is None
+        assert client.forwarded[0]["hide_sender_name"] is None, "原生转发要保留「转发自」抬头"
+        assert len(client.sent) == 1, "链接是**单独**一条消息，不是编辑"
+        assert client.sent[0]["text"] == f"🔗原文链接：{self.LINK}"
 
     @pytest.mark.asyncio
     async def test_media_message_puts_link_in_caption(self, alog):
@@ -1021,6 +1025,123 @@ class TestCopyModeSourceLink:
         engine._handle(src_message("关键词123"), edited=False)
         await drain(engine)
 
+        assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+
+
+class TestForwardModeLinkNote:
+    """``forward`` 模式：转发消息**不动**，原文链接在它**下方**单独补一条。
+
+    小白 2026-09-20 的原话：「转发的消息不用编辑直接在下方加一条原文链接即可，
+    **只有 copy 才在当前消息加上原文链接**」。
+
+    两条设计约束：
+    ① **不编辑**那条转发消息 —— Telegram 本来就拒绝编辑转发消息
+       （``400 message can't be edited``），而且小白明确不要动它；
+    ② 链接必须是**下方**的独立消息 ⇒ 顺序有要求，用 ``client.calls`` 钉住。
+    """
+
+    LINK = "https://t.me/c/1111111111/100"
+
+    @pytest.mark.asyncio
+    async def test_note_is_a_separate_message_below(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert [name for name, _ in client.calls] == ["forward_messages", "send_message"], (
+            "必须是「先转发、后补链接」，链接在那条转发消息的下方"
+        )
+        note = client.sent[0]
+        assert note["chat_id"] == DST, "链接要发到同一个目标"
+        assert note["text"] == f"🔗原文链接：{self.LINK}"
+        assert note["link_preview_options"] is not None, "补链接不该再撑出一张预览卡"
+
+    @pytest.mark.asyncio
+    async def test_note_carries_silent_and_thread(self, alog):
+        """静默 / 话题（thread）设置要跟着一起带过去，否则补的那条会跑错话题。"""
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(mode="forward", silent=True, target_thread_id=777),
+            alog,
+        )
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        note = client.sent[0]
+        assert note["disable_notification"] is True
+        assert note["message_thread_id"] == 777
+
+    @pytest.mark.asyncio
+    async def test_note_skipped_when_link_disabled(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="forward", include_source_link=False), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.sent == []
+        assert len(client.forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_album_forward_gets_exactly_one_note(self, alog):
+        """相册转发一条补一条链接 —— 不能每个分片都补。"""
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(mode="forward", match={"mode": "all"}, media_group_window=0.1), alog
+        )
+        engine.register()
+        for index in range(3):
+            engine._handle(
+                src_message("相册", message_id=600 + index, media_group_id="mg-note"), edited=False
+            )
+        await asyncio.sleep(0.2)
+        await drain(engine)
+
+        assert client.forwarded[0]["message_ids"] == [600, 601, 602]
+        assert len(client.sent) == 1
+        assert client.sent[0]["text"] == "🔗原文链接：https://t.me/c/1111111111/600"
+
+    @pytest.mark.asyncio
+    async def test_note_failure_does_not_fail_forward(self, alog):
+        """链接没补上不该让整条转发记成失败 —— 内容已经发出去了。"""
+        client = FakeClient(send_error=RuntimeError("note boom"))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert client.sent == []
+        assert engine.stats["forwarded"] == 1
+        assert engine.stats["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_downgrade_does_not_send_note(self, alog):
+        """降级成 copy 后链接已经写进正文 ⇒ **不再**另发一条，避免重复。"""
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert engine.stats["downgraded"] == 1
+        assert [name for name, _ in client.calls] == ["send_message"], "只有一条：复制出来的正文"
+        assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_has_no_separate_note(self, alog):
+        """对照：copy 模式链接在**当前消息正文里**，不另发一条。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert [name for name, _ in client.calls] == ["send_message"]
         assert client.sent[0]["text"] == f"关键词123\n\n🔗原文链接：{self.LINK}"
 
 

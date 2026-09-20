@@ -298,8 +298,9 @@ class ForwardRule(StrictModel):
     mode: ForwardMode = "copy"
     #: ``mode="text"`` 时的模板，可用变量见 README。
     template: Optional[str] = None
-    #: 在正文末尾追加来源链接（默认开）。``forward`` 用不到它 —— 转发抬头本身就是回溯入口；
-    #: ``copy`` / ``text`` 会追加一行 ``🔗原文链接：<t.me 链接>``（前面空一行）。
+    #: 是否附带来源链接（默认开）。两种模式的加法不同：
+    #: ``forward`` 不动转发消息，在它**下方**单独补发一条 ``🔗原文链接：<链接>``；
+    #: ``copy`` / ``text`` 写进**当前消息**的正文末尾（前面空一行）。
     include_source_link: bool = True
     #: 相册（media group）聚合转发；聚合窗口内的多张图会作为一组发送。
     media_group: bool = True
