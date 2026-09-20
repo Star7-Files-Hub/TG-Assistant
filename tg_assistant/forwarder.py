@@ -207,12 +207,19 @@ class ForwardEngine:
     #: handler group：转发用 0，抢红包用 1，互不干扰。
     HANDLER_GROUP = 0
 
+    #: 热重载检查间隔（秒）。只决定「多久发现一次变更」，不影响正确性 ——
+    #: 真正决定要不要重载的是 ``config.json`` 的 mtime。
+    RELOAD_CHECK_INTERVAL = 1.0
+
     def __init__(
         self,
         client: Client,
         config: AccountConfig,
         alog: AccountLogger,
         notifier: Optional[BotNotifier] = None,
+        *,
+        store: Optional[Any] = None,
+        account: Optional[str] = None,
     ) -> None:
         self.client = client
         self.config = config
@@ -224,6 +231,16 @@ class ForwardEngine:
         #: 账号级全局排除：这些会话任何规则都不监听（与每条规则的 exclude_sources 互补）。
         self._exclude_chats = RefSet(config.forward.exclude_chats)
         self.dedupe = DedupeCache(config.forward.dedupe_window)
+
+        # ---- 规则热重载 ----
+        #: 只有同时给了 ``store`` 与 ``account`` 才开启；单测 / 离线场景不传，
+        #: 行为与从前完全一致（永不读盘）。
+        self._store = store
+        self._account = account
+        self._config_file = self._resolve_config_file()
+        #: 上次读到的 config.json mtime。``None`` = 还没读到过。
+        self._rules_mtime: Optional[float] = self._config_mtime()
+        self._last_reload_check = 0.0
         self._handlers: list[tuple[Any, int]] = []
         self._tasks: set[asyncio.Task[None]] = set()
         self._media_groups: dict[tuple[int, str], MediaGroupBuffer] = {}
@@ -236,6 +253,99 @@ class ForwardEngine:
             "failed": 0,
             "deduped": 0,
         }
+
+    # ------------------------------------------------------------------ #
+    # 规则热重载（改完配置不用重启账号）
+    # ------------------------------------------------------------------ #
+    def _resolve_config_file(self) -> Optional[Any]:
+        """账号 ``config.json`` 的路径；没给 store/account 时返回 ``None``（关闭热重载）。"""
+        if self._store is None or self._account is None:
+            return None
+        try:
+            return self._store.paths.account(self._account).config_file
+        except Exception:  # pragma: no cover - 账号名异常时静默关闭热重载
+            return None
+
+    def _config_mtime(self) -> Optional[float]:
+        if self._config_file is None:
+            return None
+        try:
+            return self._config_file.stat().st_mtime
+        except OSError:
+            return None
+
+    def _rules_signature(self) -> tuple[Any, ...]:
+        """规则指纹。用来识别「mtime 变了但内容其实没变」（例如面板原样保存一次）。"""
+        return (
+            self.config.forward.enabled,
+            tuple(rule.model_dump(mode="json") for rule in self.config.forward.active_rules),
+            tuple(str(chat) for chat in self.config.forward.exclude_chats),
+        )
+
+    def reload_rules(self) -> bool:
+        """重新从磁盘读账号配置，重建规则与 handler 过滤器。返回 True 表示确实变了。
+
+        **为什么 handler 必须一起重建**：``sources`` 决定 handler 的过滤器
+        （限定了来源用 ``filters.chat(chats)``，未限定用 ``filters.group | filters.channel``）。
+        只换 ``self.rules`` 而不换过滤器的话，把 ``sources`` 从「指定群」改成 ``[]``
+        （= 监听全部）之后，**新群的消息根本进不来** —— 规则配得再对也没用。
+        """
+        if self._store is None or self._account is None:
+            return False
+        try:
+            config = self._store.load_account_config(self._account, create=False)
+        except Exception as exc:
+            # 配置被写坏（例如面板提交了非法正则）时**保留旧规则继续跑**，
+            # 不能因为一次坏写就让转发整个停摆。
+            self.alog.warning("规则热重载失败，继续沿用旧规则", error=str(exc))
+            return False
+
+        before = self._rules_signature()
+        self.config = config
+        self.rules = [PreparedRule.build(rule) for rule in config.forward.active_rules]
+        self._exclude_chats = RefSet(config.forward.exclude_chats)
+        if self._rules_signature() == before:
+            return False
+
+        self.alog.info(
+            "转发规则已热重载（无需重启）",
+            rules=len(self.rules),
+            enabled=config.forward.enabled,
+            exclude_chats=len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
+            rule_ids=",".join(prepared.id for prepared in self.rules),
+        )
+        self._refresh_handlers()
+        return True
+
+    def _maybe_reload(self) -> None:
+        """按 :attr:`RELOAD_CHECK_INTERVAL` 节流检查 mtime，变了才真去读盘。
+
+        全程**没有 await**，所以在事件循环里是原子的 —— 不会出现
+        「检查到一半规则被换掉」的中间态。
+        """
+        if self._config_file is None:
+            return
+        now = time.monotonic()
+        if now - self._last_reload_check < self.RELOAD_CHECK_INTERVAL:
+            return
+        self._last_reload_check = now
+        mtime = self._config_mtime()
+        if mtime is None or mtime == self._rules_mtime:
+            return
+        self._rules_mtime = mtime
+        self.reload_rules()
+
+    def _refresh_handlers(self) -> None:
+        """注销旧 handler，再按新规则重新注册。
+
+        规则被全部禁用时 ``register()`` 会直接返回 —— 此时 handler 保持已注销状态，
+        正是想要的（不监听）。之后重新启用会再次触发重载并重新注册。
+        """
+        for handler, group in self._handlers:
+            with contextlib.suppress(Exception):
+                self.client.remove_handler(handler, group)
+        self._handlers.clear()
+        self.register()
 
     # ------------------------------------------------------------------ #
     @property
@@ -324,6 +434,9 @@ class ForwardEngine:
 
     def _handle(self, message: Any, *, edited: bool) -> None:
         started = time.perf_counter()
+        # 先看磁盘上的规则有没有变（有节流，不是每条都 stat）。放在最前面，
+        # 保证这一条消息就已经用上新规则。
+        self._maybe_reload()
         self.stats["received"] += 1
         chat_id, chat_username, chat_title = chat_identity(message)
         message_id = getattr(message, "id", None)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 
 import pytest
 from pyrogram.errors import ChatWriteForbidden, FloodWait
@@ -566,3 +567,95 @@ class TestForwardEngine:
         engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
         await drain(engine)
         assert client.forwarded == []
+
+
+class TestRulesHotReload:
+    """规则热重载：改完配置**不用重启账号**（2026-09-20 新增）。
+
+    回归背景：``ForwardEngine.__init__`` 只在账号启动时读一次
+    ``config.forward.active_rules``，面板改完规则必须重启账号才生效 ——
+    而账号本来就在跑，用户每次想让规则生效都会撞上「已经在运行」。
+    """
+
+    ACCOUNT = "hot-reload"
+
+    def _make(self, store, client, alog, config: AccountConfig) -> ForwardEngine:
+        store.save_account_config(self.ACCOUNT, config)
+        loaded = store.load_account_config(self.ACCOUNT, create=False)
+        return ForwardEngine(client, loaded, alog, store=store, account=self.ACCOUNT)
+
+    @staticmethod
+    def _two_rules() -> AccountConfig:
+        def rule(rid: str, pattern: str) -> dict:
+            return {
+                "id": rid,
+                "name": rid,
+                "sources": [SRC],
+                "targets": [DST],
+                "match": {"mode": "regex", "patterns": [pattern]},
+            }
+
+        return AccountConfig.model_validate(
+            {"forward": {"enabled": True, "rules": [rule("r1", r"关键词(\d+)"), rule("r2", r"新规则")]}}
+        )
+
+    def test_reload_picks_up_new_rule(self, store, client, alog):
+        engine = self._make(store, client, alog, build_config())
+        assert [p.id for p in engine.rules] == ["r1"]
+
+        store.save_account_config(self.ACCOUNT, self._two_rules())
+
+        assert engine.reload_rules() is True
+        assert [p.id for p in engine.rules] == ["r1", "r2"]
+
+    def test_reload_is_noop_when_content_unchanged(self, store, client, alog):
+        """面板原样保存一次（mtime 变了、内容没变）不该白重建一遍 handler。"""
+        engine = self._make(store, client, alog, build_config())
+        store.save_account_config(self.ACCOUNT, build_config())
+
+        assert engine.reload_rules() is False
+
+    def test_reload_refreshes_handler_filter(self, store, client, alog):
+        """**关键**：``sources`` 从「指定群」改成 ``[]``（监听全部）时，
+        handler 的过滤器也必须跟着换 —— 否则新群的消息根本进不来。
+        """
+        engine = self._make(store, client, alog, build_config())
+        engine.register()
+        assert len(client.handlers) == 1
+        before = client.handlers[0][0].filters
+
+        store.save_account_config(self.ACCOUNT, build_config(sources=[]))
+        assert engine.reload_rules() is True
+
+        assert len(client.handlers) == 1, "旧 handler 必须先注销，否则一条消息会被处理两次"
+        assert client.handlers[0][0].filters is not before
+
+    def test_reload_keeps_old_rules_when_config_is_broken(self, store, client, alog):
+        """配置被写坏时保留旧规则继续跑，不能让转发整个停摆。"""
+        engine = self._make(store, client, alog, build_config())
+        store.paths.account(self.ACCOUNT).config_file.write_text("{ 这不是合法 JSON", encoding="utf-8")
+
+        assert engine.reload_rules() is False
+        assert [p.id for p in engine.rules] == ["r1"]
+
+    def test_maybe_reload_uses_mtime(self, store, client, alog):
+        engine = self._make(store, client, alog, build_config())
+        engine.RELOAD_CHECK_INTERVAL = 0.0  # 关掉节流，测试里不需要等
+
+        engine._maybe_reload()
+        assert [p.id for p in engine.rules] == ["r1"], "磁盘没动不该重载"
+
+        store.save_account_config(self.ACCOUNT, self._two_rules())
+        path = store.paths.account(self.ACCOUNT).config_file
+        stat = path.stat()
+        os.utime(path, (stat.st_atime, stat.st_mtime + 10))  # 保证 mtime 确实变了
+
+        engine._maybe_reload()
+        assert [p.id for p in engine.rules] == ["r1", "r2"]
+
+    def test_no_store_means_hot_reload_disabled(self, client, alog):
+        """不传 store 时（单测 / 离线场景）行为与从前完全一致：永不读盘。"""
+        engine = ForwardEngine(client, build_config(), alog)
+
+        assert engine._config_file is None
+        assert engine.reload_rules() is False

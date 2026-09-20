@@ -592,7 +592,17 @@ class AccountRunner:
             self.notifier = BotNotifier(self.config.notify, self.alog, proxy)
             await self.notifier.start()
 
-        self.forwarder = ForwardEngine(self.client, self.config, self.alog, self.notifier)
+        # store + account 一并交给引擎，开启**规则热重载**：面板改完规则
+        # （写的是同一个 config.json）最迟 RELOAD_CHECK_INTERVAL 秒后自动生效，
+        # 不需要再重启账号。
+        self.forwarder = ForwardEngine(
+            self.client,
+            self.config,
+            self.alog,
+            self.notifier,
+            store=self.store,
+            account=self.name,
+        )
         self.forwarder.register()
 
         self.hunter = RedPacketHunter(self.client, self.config, self.alog, self.notifier)
