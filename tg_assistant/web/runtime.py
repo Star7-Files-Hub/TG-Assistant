@@ -82,6 +82,9 @@ class RuntimeManager:
         #: CLI 预建、待接管的 runner 与其账号列表（``--web`` 模式）。
         self._adopted_runner: Any = runner
         self._adopted_accounts: Optional[list[str]] = list(initial_accounts) if initial_accounts else None
+        #: 跨账号去重表：**整个 web 进程共用一张**。面板点「启动」会重建 MultiRunner，
+        #: 把这张表传进去才不会让去重窗口被重置（``None`` 时 MultiRunner 会自建一张）。
+        self._dedupe: Any = None
         #: 透传给 ``MultiRunner.run()`` 的参数（heartbeat / restart_delay / max_restarts）。
         #: 刻意**不**在这里补 heartbeat：``cli.py`` 是在 ``create_app()`` 返回之后
         #: 才把真正的 WebSettings 换进 ``app.state`` 的，此刻读会拿到默认值。
@@ -120,6 +123,10 @@ class RuntimeManager:
         self._adopted_runner = None
         if runner is None:
             return
+
+        # 接管 runner 的同时接管它的跨账号去重表 —— 否则面板之后新起的账号会拿到
+        # 另一张表，两个账号各去各的，等于没去重。
+        self._dedupe = getattr(runner, "dedupe", None)
 
         names = self._adopted_accounts
         if not names:
@@ -395,6 +402,7 @@ class RuntimeManager:
             if not names:
                 return {"ok": False, "message": "没有可运行的账号。先 login 并用 accounts enable 启用。"}
 
+            from tg_assistant.forwarder import CrossAccountDedupe
             from tg_assistant.runner import MultiRunner
 
             # 先确认有账号、再建 runner：原来是无条件建好之后才发现没账号就返回，
@@ -403,7 +411,14 @@ class RuntimeManager:
             # 把 runner 显式交给 _launch：它原来是回头读 self._runner，
             # 于是「start() 之后立刻 stop()」这种时序下，任务还没开始跑
             # self._runner 就已经被摘成 None 了，任务一启动就撞 assert。
-            await self._launch(MultiRunner(self.store, self.settings), names)
+            #
+            # 去重表复用同一个实例：这个方法每被点一次「启动」就会重建 MultiRunner，
+            # 每次都换新表的话，去重窗口会被清空 —— 刚发过的消息又能重发一遍。
+            if self._dedupe is None:
+                self._dedupe = CrossAccountDedupe()
+            await self._launch(
+                MultiRunner(self.store, self.settings, dedupe=self._dedupe), names
+            )
             return {"ok": True, "accounts": names}
 
     async def stop(self) -> dict[str, Any]:

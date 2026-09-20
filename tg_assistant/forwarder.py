@@ -9,7 +9,11 @@
 3. **正则预编译**：配置加载时编译一次。
 4. **相册聚合**：同一 ``media_group_id`` 的多条消息在 ``media_group_window`` 内攒齐后
    一次性 ``forward_messages(message_ids=[...])``，避免拆成多条丢失排版。
-5. **去重**：``(chat_id, message_id)`` + TTL，防止编辑事件或重复更新造成二次转发。
+5. **去重**：两层 —— 账号内 ``(规则 id, chat_id, message_id)`` + TTL，防止编辑事件或
+   重复更新造成二次转发；**跨账号** ``(chat_id, message_id, 目标)`` 共享表，防止多个账号
+   都在同一个源群里时把同一条消息各发一遍。
+6. **forward 失败自动降级 copy**：源会话受保护时 Telegram 会拒 forward，此时自动改用
+   复制（``drop_author``）再发一次，而不是直接失败。
 
 每条转发都会记录 ``pipeline_ms``（消息在 Telegram 的时间戳到发送完成的总耗时）和
 ``handler_ms``（本进程内耗时），日志里直接能看出慢在哪一段。
@@ -26,10 +30,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from pyrogram import Client, filters
+from pyrogram.errors import ChatForwardsRestricted
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import LinkPreviewOptions
 
-from .client import SessionInvalid, add_dedupe, check_dedupe, with_flood_retry
+from .client import SessionInvalid, with_flood_retry
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
@@ -86,6 +91,70 @@ class DedupeCache:
 
     def __len__(self) -> int:
         return len(self._seen)
+
+
+class CrossAccountDedupe:
+    """跨账号去重：同一条源消息发往**同一个目标**，只允许一个账号发出去。
+
+    为什么需要它：多个账号可能都在同一个源群里（规则也一样），于是同一条消息
+    会被每个账号各转发一次，目标频道里就出现重复。账号内的 :class:`DedupeCache`
+    是 **per-engine** 的，挡不住这种重复。
+
+    键是 ``(源会话, 消息 id, 目标会话)`` 三元组，**必须带目标**：只按
+    ``(源会话, 消息 id)`` 去重的话，「账号 A 发到 T1、账号 B 发到 T2」会被误判成
+    重复，后一个账号**丢消息**（项目里早先那版 Postgres 去重就是两元组键）。
+
+    为什么用进程内共享而不是数据库：单进程里所有账号的 handler 都跑在**同一个
+    事件循环**上，而 :meth:`claim` 是**纯同步、无 await** 的 —— 在 handler 里天然
+    原子，不可能出现两个账号同时抢到同一个名额。这比「每条消息连一次库」既快又准
+    （那版实现是同步阻塞的，会把转发延迟从毫秒级推到几百毫秒）。
+
+    TTL 按次传入、不在构造时固定：``dedupe_window`` 是**账号级**配置，多个账号
+    可以配不同的值，共享表不能只有一个 TTL。
+    """
+
+    __slots__ = ("_seen", "_ops", "claimed", "rejected")
+
+    def __init__(self) -> None:
+        #: 键 -> 过期时刻（``time.monotonic()`` 基准）。
+        self._seen: dict[tuple[Any, ...], float] = {}
+        self._ops = 0
+        #: 占用成功（= 由本账号发出）的次数。
+        self.claimed = 0
+        #: 因「别的账号已经发过」而跳过的次数。
+        self.rejected = 0
+
+    def claim(self, source_chat_id: Any, message_id: Any, target: Any, ttl: float) -> bool:
+        """尝试占用「这条源消息发往这个目标」的名额。
+
+        首次（或 TTL 过后）返回 ``True``，表示由本账号发送；TTL 内已被占用返回
+        ``False``，调用方应当跳过。``ttl <= 0`` 表示关闭去重，恒返回 ``True``。
+        """
+        if ttl <= 0:
+            self.claimed += 1
+            return True
+        now = time.monotonic()
+        self._ops += 1
+        if self._ops % 256 == 0:
+            self._purge(now)
+        key = (source_chat_id, message_id, str(target))
+        deadline = self._seen.get(key)
+        if deadline is not None and deadline > now:
+            self.rejected += 1
+            return False
+        self._seen[key] = now + ttl
+        self.claimed += 1
+        return True
+
+    def _purge(self, now: float) -> None:
+        for key in [k for k, deadline in self._seen.items() if deadline <= now]:
+            self._seen.pop(key, None)
+
+    def __len__(self) -> int:
+        return len(self._seen)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"size": len(self._seen), "claimed": self.claimed, "rejected": self.rejected}
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +289,7 @@ class ForwardEngine:
         *,
         store: Optional[Any] = None,
         account: Optional[str] = None,
+        shared_dedupe: Optional[CrossAccountDedupe] = None,
     ) -> None:
         self.client = client
         self.config = config
@@ -231,6 +301,10 @@ class ForwardEngine:
         #: 账号级全局排除：这些会话任何规则都不监听（与每条规则的 exclude_sources 互补）。
         self._exclude_chats = RefSet(config.forward.exclude_chats)
         self.dedupe = DedupeCache(config.forward.dedupe_window)
+        #: 跨账号去重表（同一条消息发往同一个目标只允许一个账号发）。
+        #: 由 ``MultiRunner`` 创建、多个账号**共享同一个实例**；不传（单测 / 离线场景）
+        #: 即关闭跨账号去重，行为与从前一致。
+        self._shared_dedupe = shared_dedupe
 
         # ---- 规则热重载 ----
         #: 只有同时给了 ``store`` 与 ``account`` 才开启；单测 / 离线场景不传，
@@ -252,6 +326,10 @@ class ForwardEngine:
             "forwarded": 0,
             "failed": 0,
             "deduped": 0,
+            #: 因**别的账号**已经把这条消息发往同一目标而跳过的次数。
+            "cross_deduped": 0,
+            #: 源会话禁止转发、自动改用复制的次数。
+            "downgraded": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -504,21 +582,10 @@ class ForwardEngine:
                 self.alog.info("命中但被最小间隔限制", rule=prepared.label, reason=reason)
                 continue
 
-            # 跨账号去重：同一条消息可能被多个账号同时监听到，只允许第一个转发。
-            # 未配置 TGA_POSTGRES_DSN 时 check_dedupe 恒返回 False，等于该功能关闭。
-            dedupe_ttl = int(self.config.forward.dedupe_window)
-            if check_dedupe(chat_id, message_id, dedupe_ttl):
-                self.stats["deduped"] += 1
-                self.alog.debug(
-                    "跨账号去重：消息已转发",
-                    rule=prepared.label,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                )
-                continue
-
             # 账号内去重键必须带上规则 id：同一条消息可以合法地命中多条规则、
             # 转发到不同频道；只用 (chat_id, message_id) 会让第二条规则被误判为重复。
+            # ⚠️ **跨账号去重不在这里** —— 它的键要带目标，而一条规则可以有多个目标，
+            #    放在这里会「一条规则的多个目标共用一个名额」。见 ``_forward_one``。
             dedupe_key = (prepared.id, chat_id, message_id)
             if not self.dedupe.check_and_add(dedupe_key):
                 self.stats["deduped"] += 1
@@ -526,10 +593,6 @@ class ForwardEngine:
                     "重复消息已忽略", rule=prepared.label, chat_id=chat_id, message_id=message_id
                 )
                 continue
-
-            # 登记到跨账号去重表，让其它账号跳过这条（无 PG 时是空操作）。
-            # 用 getattr 取账号名：测试里的 client 替身没有 name 属性。
-            add_dedupe(chat_id, message_id, getattr(self.client, "name", ""))
 
             prepared.last_fired = now
             prepared.stats["matched"] += 1
@@ -648,9 +711,29 @@ class ForwardEngine:
         variables["rule_id"] = rule.id
 
         delivered: list[tuple[ChatRef, int]] = []
+        #: 跨账号去重窗口。与账号内去重同源（账号级 ``dedupe_window``）。
+        dedupe_ttl = float(self.config.forward.dedupe_window)
         for target in rule.targets:
+            # 跨账号去重：同一条源消息发往**同一个目标**，只允许一个账号发出去。
+            # 键里带目标 ⇒ 必须放在 target 循环里（放 ``_handle`` 会让多个目标共用名额）。
+            # ``claim`` 是同步的、无 await，在事件循环里天然原子 —— 两个账号的 handler
+            # 不可能同时抢到同一个名额。不传共享表时整段跳过（单测 / 离线场景）。
+            if self._shared_dedupe is not None and not self._shared_dedupe.claim(
+                chat_id, ids[0], target, dedupe_ttl
+            ):
+                self.stats["cross_deduped"] += 1
+                self.alog.debug(
+                    "跨账号去重：该消息已由其它账号发往同一目标",
+                    rule=rule.label,
+                    source_chat=chat_title or chat_id,
+                    message_id=ids[0],
+                    target=target,
+                )
+                continue
             try:
-                sent_ids = await self._send_to_target(prepared, message, ids, target, variables)
+                sent_ids, degraded = await self._send_to_target(
+                    prepared, message, ids, target, variables
+                )
             except SessionInvalid:
                 raise
             except Exception as exc:
@@ -676,7 +759,8 @@ class ForwardEngine:
             self.alog.info(
                 "转发成功",
                 rule=rule.label,
-                mode=rule.mode,
+                # 源会话受保护时 forward 会失败并自动降级成复制，这里显示**实际生效**的模式。
+                mode="copy(降级)" if degraded else rule.mode,
                 source_chat=chat_title or chat_id,
                 target=target,
                 message_ids=",".join(map(str, ids)),
@@ -695,27 +779,41 @@ class ForwardEngine:
         ids: list[int],
         target: ChatRef,
         variables: dict[str, Any],
-    ) -> list[int]:
+    ) -> tuple[list[int], bool]:
+        """把消息发到 ``target``。
+
+        返回 ``(已发送的消息 id, 是否发生了 forward→copy 降级)``。
+
+        ``mode="forward"`` 遇到受保护源会话（Telegram 回 400 ``CHAT_FORWARDS_RESTRICTED``）
+        时**自动改用复制**再发一次 —— 这就是「copy 做备选」。复制是服务端另一次
+        ``forwardMessages``（只是带上 ``drop_author``），不需要下载再上传。
+        """
         rule = prepared.rule
-        chat_id, _, _ = chat_identity(message)
+        chat_id, _, chat_title = chat_identity(message)
         kwargs: dict[str, Any] = {}
         if rule.target_thread_id is not None:
             kwargs["message_thread_id"] = rule.target_thread_id
         if rule.silent:
             kwargs["disable_notification"] = True
 
+        async def _server_forward(hide_sender: bool) -> list[int]:
+            """服务端转发 / 复制。
+
+            单次 RPC 完成：天然保留相册分组与媒体，不需要下载再上传。
+            ``hide_sender=True``（= raw ``drop_author``）去掉「转发自」抬头，即 copy 模式。
+            """
+            sent = await self.client.forward_messages(
+                chat_id=target,
+                from_chat_id=chat_id,
+                message_ids=ids if len(ids) > 1 else ids[0],
+                hide_sender_name=True if hide_sender else None,
+                **kwargs,
+            )
+            return _sent_ids(sent)
+
         async def _do() -> list[int]:
             if rule.mode in {"forward", "copy"}:
-                # 单次 RPC 完成：服务端转发，天然保留相册分组与媒体，不需要下载再上传。
-                # copy 模式用 hide_sender_name(=raw drop_author) 去掉「转发自」抬头。
-                sent = await self.client.forward_messages(
-                    chat_id=target,
-                    from_chat_id=chat_id,
-                    message_ids=ids if len(ids) > 1 else ids[0],
-                    hide_sender_name=True if rule.mode == "copy" else None,
-                    **kwargs,
-                )
-                return _sent_ids(sent)
+                return await _server_forward(rule.mode == "copy")
 
             # text 模式：按模板重发纯文本
             text = render_template(rule.template or "{text}", variables)
@@ -735,16 +833,44 @@ class ForwardEngine:
             return _sent_ids(sent)
 
         try:
-            return await with_flood_retry(
-                _do,
-                alog=self.alog,
-                action=f"转发到 {target}",
-                retries=2,
-                max_flood_wait=60.0,
+            return (
+                await with_flood_retry(
+                    _do,
+                    alog=self.alog,
+                    action=f"转发到 {target}",
+                    retries=2,
+                    max_flood_wait=60.0,
+                ),
+                False,
             )
         except SessionInvalid:
             raise
         except Exception as exc:
+            # ① 源会话禁止转发（受保护群/频道）⇒ 自动降级为复制。
+            #    Telegram 对受保护内容回 400 CHAT_FORWARDS_RESTRICTED，而「复制」是允许的
+            #    —— 这是唯一能靠换模式绕过去的错误，所以单独识别。
+            #    代价：该源会话的每条消息都要先撞一次失败。受保护与否是**源会话的属性**，
+            #    按 (规则, 源会话) 记忆能省掉这次 RPC，但源会话可能取消保护，
+            #    所以这里选择每次都真试一遍 —— 正确性优先。
+            if rule.mode == "forward" and _is_forwards_restricted(exc):
+                self.alog.warning(
+                    "源会话禁止转发，自动降级为复制",
+                    rule=rule.label,
+                    target=target,
+                    source_chat=chat_title or chat_id,
+                    message_ids=",".join(map(str, ids)),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                sent = await with_flood_retry(
+                    lambda: _server_forward(True),
+                    alog=self.alog,
+                    action=f"复制到 {target}",
+                    retries=2,
+                    max_flood_wait=60.0,
+                )
+                self.stats["downgraded"] += 1
+                return sent, True
+
             if rule.mode != "copy" or len(ids) > 1:
                 raise
             # 少数会话不允许 drop_author，退化为客户端复制（会多一次上传，但能发出去）
@@ -760,7 +886,7 @@ class ForwardEngine:
                 retries=1,
                 max_flood_wait=30.0,
             )
-            return _sent_ids(sent)
+            return _sent_ids(sent), False
 
     def _submit_notify(
         self,
@@ -788,13 +914,17 @@ class ForwardEngine:
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict[str, Any]:
         """运行状态快照，供 ``status`` 命令与周期性日志使用。"""
-        return {
+        data: dict[str, Any] = {
             **self.stats,
             "dedupe_size": len(self.dedupe),
             "pending_tasks": len(self._tasks),
             "media_group_buffers": len(self._media_groups),
             "rules": {prepared.id: dict(prepared.stats) for prepared in self.rules},
         }
+        if self._shared_dedupe is not None:
+            # ⚠️ 这是**跨账号共享表**的数字（所有账号合计），不是本账号的。
+            data["cross_dedupe"] = self._shared_dedupe.snapshot()
+        return data
 
 
 # --------------------------------------------------------------------------- #
@@ -821,6 +951,20 @@ def _pipeline_ms(message: Any) -> Optional[float]:
     return (_dt.datetime.now(_dt.timezone.utc) - date).total_seconds() * 1000
 
 
+def _is_forwards_restricted(exc: Exception) -> bool:
+    """是不是「源会话禁止转发」（受保护群 / 频道）。
+
+    这是**唯一**能靠「改用复制」绕过去的错误：它说明**源**会话受保护，而复制
+    （``drop_author``）是允许的，所以 ``mode="forward"`` 的规则遇到它要自动降级。
+
+    以异常类型为主、错误文本兜底 —— pyrogram 各版本类名一致，但代理层或包装层
+    可能把它换成别的类型，而文本里一定带 ``CHAT_FORWARDS_RESTRICTED``。
+    """
+    if isinstance(exc, ChatForwardsRestricted):
+        return True
+    return "forwards_restricted" in f"{type(exc).__name__}: {exc}".lower()
+
+
 def _forward_hint(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}".lower()
     if "peer_id_invalid" in text or "peer id invalid" in text:
@@ -831,8 +975,11 @@ def _forward_hint(exc: Exception) -> str:
         return "需要管理员权限才能发送"
     if "channel_private" in text:
         return "目标频道私有且本账号未加入"
-    if "forbidden" in text and "forward" in text:
-        return "源频道禁止转发内容（受保护内容），请把规则改成 mode=\"text\""
+    if "forwards_restricted" in text or ("forbidden" in text and "forward" in text):
+        return (
+            "源会话是受保护内容，Telegram 不允许转发；已自动改用复制仍失败 ⇒ "
+            "把规则改成 mode=\"copy\" 再试，或换一个源会话"
+        )
     if "media_empty" in text:
         return "媒体已失效，可能源消息被删除"
     if "slowmode" in text:
@@ -846,4 +993,11 @@ def random_jitter(base: float, jitter: float) -> float:
     return base + random.uniform(0, jitter)
 
 
-__all__ = ["DedupeCache", "ForwardEngine", "MediaGroupBuffer", "PreparedRule", "random_jitter"]
+__all__ = [
+    "CrossAccountDedupe",
+    "DedupeCache",
+    "ForwardEngine",
+    "MediaGroupBuffer",
+    "PreparedRule",
+    "random_jitter",
+]

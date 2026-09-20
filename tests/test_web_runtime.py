@@ -34,9 +34,12 @@ class _FakeMultiRunner:
 
     instances: list["_FakeMultiRunner"] = []
 
-    def __init__(self, store: Any, settings: Any) -> None:
+    def __init__(self, store: Any, settings: Any, dedupe: Any = None) -> None:
         self.store = store
         self.settings = settings
+        #: 跨账号去重表。真实 MultiRunner 会自建一张；这里只记录传进来的那个，
+        #: 供「面板重建 runner 时去重表必须延续」的断言使用。
+        self.dedupe = dedupe
         self.names: list[str] = []
         self.run_kwargs: dict[str, Any] = {}
         self.started = asyncio.Event()
@@ -84,6 +87,23 @@ async def _started(manager: RuntimeManager, names: list[str]) -> _FakeMultiRunne
     runner = _FakeMultiRunner.instances[-1]
     await asyncio.wait_for(runner.started.wait(), DEADLOCK_GUARD)
     return runner
+
+
+async def test_restart_reuses_the_same_dedupe_table(manager: RuntimeManager) -> None:
+    """面板每点一次「启动」都会重建 MultiRunner —— 跨账号去重表必须延续。
+
+    每次都换新表的话，去重窗口会被清空：刚被账号 A 转发过的消息，
+    账号 B 又能重发一遍 —— 跨账号去重等于白做。
+    """
+    first = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    second = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    assert first is not second, "这个用例的前提就是 runner 确实被重建了"
+    assert first.dedupe is not None
+    assert second.dedupe is first.dedupe, "重建 runner 时去重表必须复用同一个实例"
 
 
 async def test_stop_account_does_not_deadlock(manager: RuntimeManager) -> None:

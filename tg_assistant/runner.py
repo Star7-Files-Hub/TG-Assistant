@@ -43,7 +43,7 @@ from .config import (
     mask_phone,
     utc_now_iso,
 )
-from .forwarder import ForwardEngine
+from .forwarder import CrossAccountDedupe, ForwardEngine
 from .logging_setup import get_logger
 from .notify import BotNotifier, NotifyTask
 from .paths import Paths
@@ -526,12 +526,15 @@ class AccountRunner:
         settings: Settings,
         paths: Paths,
         store: Optional[Any] = None,
+        shared_dedupe: Optional[Any] = None,
     ) -> None:
         self.record = record
         self.config = config
         self.settings = settings
         self.paths = paths
         self.store = store
+        #: 跨账号去重表（多账号共享同一个实例）。``None`` = 关闭跨账号去重。
+        self.shared_dedupe = shared_dedupe
         self.alog = make_account_logger(record.name, "runner")
         self.client: Optional[Client] = None
         self.notifier: Optional[BotNotifier] = None
@@ -602,6 +605,9 @@ class AccountRunner:
             self.notifier,
             store=self.store,
             account=self.name,
+            # 跨账号去重表由 MultiRunner 持有并注入 —— 多个账号共用**同一个实例**，
+            # 否则两个账号都在同一个源群里时会把同一条消息各发一遍。
+            shared_dedupe=self.shared_dedupe,
         )
         self.forwarder.register()
 
@@ -705,9 +711,18 @@ class AccountRunner:
 class MultiRunner:
     """并发运行多个账号，单账号故障不影响其它账号。"""
 
-    def __init__(self, store: Store, settings: Settings) -> None:
+    def __init__(
+        self,
+        store: Store,
+        settings: Settings,
+        dedupe: Optional[CrossAccountDedupe] = None,
+    ) -> None:
         self.store = store
         self.settings = settings
+        #: 跨账号去重表：本实例下**所有账号共享同一个**。
+        #: 允许外部传入，是因为面板点「启动」会重建 MultiRunner —— 由 RuntimeManager
+        #: 拿着同一张表传进来，去重窗口才不会因为一次重启而被清空。
+        self.dedupe = dedupe if dedupe is not None else CrossAccountDedupe()
         self.runners: dict[str, AccountRunner] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._shutdown = asyncio.Event()
@@ -790,7 +805,14 @@ class MultiRunner:
                     alog.warning("账号已被禁用，跳过", hint="用 accounts enable 重新启用")
                     return
                 config = self.store.load_account_config(name)
-                runner = AccountRunner(record, config, self.settings, self.store.paths, store=self.store)
+                runner = AccountRunner(
+                    record,
+                    config,
+                    self.settings,
+                    self.store.paths,
+                    store=self.store,
+                    shared_dedupe=self.dedupe,
+                )
                 self.runners[name] = runner
                 await runner.start()
                 await runner.run_forever(heartbeat=heartbeat)

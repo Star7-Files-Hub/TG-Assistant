@@ -5,14 +5,16 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import os
+import time
 
 import pytest
-from pyrogram.errors import ChatWriteForbidden, FloodWait
+from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
 
-from tg_assistant.config import AccountConfig
-from tg_assistant.forwarder import DedupeCache, ForwardEngine, PreparedRule
+from tg_assistant.config import AccountConfig, AccountRecord
+from tg_assistant.forwarder import CrossAccountDedupe, DedupeCache, ForwardEngine, PreparedRule
+from tg_assistant.runner import AccountRunner, MultiRunner
 
-from .conftest import FakeChat, FakeUser, make_message
+from .conftest import FakeChat, FakeClient, FakeUser, make_message
 
 SRC = -1001111111111
 DST = -1002222222222
@@ -659,3 +661,230 @@ class TestRulesHotReload:
 
         assert engine._config_file is None
         assert engine.reload_rules() is False
+
+
+RESTRICTED = (
+    "[400 CHAT_FORWARDS_RESTRICTED] - You can't forward messages from a protected chat"
+)
+
+
+class TestForwardFallsBackToCopy:
+    """``mode="forward"`` 撞上受保护源会话时**自动降级为复制**。
+
+    小白 2026-09-20 的需求：「copy 做备选，如果没办法直接 forward 就 copy」。
+    线上背景：规则 1 的源群「抽象思维的研究与实践」是受保护群，
+    累计 4 次 ``CHAT_FORWARDS_RESTRICTED`` 全部直接失败。
+
+    ⚠️ ``ForwardRule.mode`` 的**默认值是 ``copy``**，所以这里必须显式写
+    ``mode="forward"`` —— 用默认值测的是 copy 路径，降级分支根本不会进。
+    """
+
+    @pytest.mark.asyncio
+    async def test_restricted_forward_retries_as_copy(self, alog):
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("这是关键词123的消息"), edited=False)
+        await drain(engine)
+
+        assert client.forward_calls == 2, "应当先真转发失败一次，再以复制重试一次"
+        assert len(client.forwarded) == 1, "失败的调用不进 forwarded"
+        assert client.forwarded[0]["hide_sender_name"] is True, "第二次必须去掉「转发自」"
+        assert engine.stats["forwarded"] == 1
+        assert engine.stats["failed"] == 0
+        assert engine.stats["downgraded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_only_restricted_errors_are_downgraded(self, alog):
+        """别的错误（例如没发言权限）照样失败 —— 不能拿复制去掩盖真问题。"""
+        client = FakeClient(forward_error=ChatWriteForbidden(value="[403 CHAT_WRITE_FORBIDDEN]"))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["failed"] == 1
+        assert engine.stats["downgraded"] == 0
+
+    @pytest.mark.asyncio
+    async def test_downgrade_failure_is_still_reported_as_failed(self, alog):
+        """降级也失败时不能假装成功。"""
+        client = FakeClient(forward_error=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["forwarded"] == 0
+        assert engine.stats["failed"] == 1
+        assert engine.stats["downgraded"] == 0
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_is_unaffected(self, alog):
+        """本来就是 copy 的规则一次就带 ``hide_sender_name``，不会「先失败再降级」。"""
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert client.forwarded[0]["hide_sender_name"] is True
+        assert engine.stats["downgraded"] == 0
+
+    @pytest.mark.asyncio
+    async def test_downgrade_covers_media_group_ids(self, alog):
+        """相册（一次多条 id）也要能降级 —— 早先的实现遇到多条 id 就直接放弃。"""
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        message = src_message("关键词123")
+        prepared = engine.rules[0]
+        result = prepared.matcher.match(message)
+        assert result is not None
+
+        await engine._forward_one(
+            prepared, message, result, time.perf_counter(), message_ids=[100, 101]
+        )
+
+        assert client.forward_calls == 2
+        assert len(client.forwarded) == 1
+        assert client.forwarded[0]["message_ids"] == [100, 101]
+        assert client.forwarded[0]["hide_sender_name"] is True
+        assert engine.stats["forwarded"] == 1
+
+
+class TestCrossAccountDedupe:
+    """跨账号去重：两个账号都监听到同一条消息时，发往**同一目标**只发一次。
+
+    小白 2026-09-20 的需求：「需要做跨账号去重，因为两个账号的群可能重复」。
+
+    线上背景：项目里早先那版跨账号去重挂在 Postgres 上（``TGA_POSTGRES_DSN``），
+    而线上**根本没配 DSN** ⇒ ``check_dedupe`` 恒返回 False，功能等于关闭。
+    """
+
+    # ---------------------------------------------------------------- #
+    # 单元语义
+    # ---------------------------------------------------------------- #
+    def test_first_claim_wins(self):
+        dedupe = CrossAccountDedupe()
+        assert dedupe.claim(SRC, 1, DST, 300) is True
+        assert dedupe.claim(SRC, 1, DST, 300) is False
+        assert (dedupe.claimed, dedupe.rejected) == (1, 1)
+
+    def test_different_targets_are_independent(self):
+        """🔴 键必须带目标：否则「A 发 T1、B 发 T2」会被误判成重复而**丢消息**。"""
+        dedupe = CrossAccountDedupe()
+        assert dedupe.claim(SRC, 1, DST, 300) is True
+        assert dedupe.claim(SRC, 1, -1009999999999, 300) is True
+        assert len(dedupe) == 2
+
+    def test_zero_ttl_disables(self):
+        dedupe = CrossAccountDedupe()
+        assert dedupe.claim(SRC, 1, DST, 0) is True
+        assert dedupe.claim(SRC, 1, DST, 0) is True
+
+    def test_claim_expires_after_ttl(self, monkeypatch):
+        dedupe = CrossAccountDedupe()
+        now = [1000.0]
+        monkeypatch.setattr("tg_assistant.forwarder.time.monotonic", lambda: now[0])
+
+        assert dedupe.claim(SRC, 1, DST, 10) is True
+        now[0] += 5
+        assert dedupe.claim(SRC, 1, DST, 10) is False
+        now[0] += 6  # 超过 TTL
+        assert dedupe.claim(SRC, 1, DST, 10) is True
+
+    # ---------------------------------------------------------------- #
+    # 两个引擎共享一张表（真实场景）
+    # ---------------------------------------------------------------- #
+    @pytest.mark.asyncio
+    async def test_second_account_skips_same_message(self, alog):
+        shared = CrossAccountDedupe()
+        first, second = FakeClient(), FakeClient()
+        engine_a = ForwardEngine(first, build_config(), alog, shared_dedupe=shared)
+        engine_b = ForwardEngine(second, build_config(), alog, shared_dedupe=shared)
+
+        message = src_message("关键词123")
+        engine_a._handle(message, edited=False)
+        await drain(engine_a)
+        engine_b._handle(message, edited=False)
+        await drain(engine_b)
+
+        assert len(first.forwarded) == 1
+        assert second.forwarded == [], "第二个账号不该把同一条消息再发一遍"
+        assert engine_b.stats["cross_deduped"] == 1
+        assert engine_b.stats["forwarded"] == 0
+        assert shared.rejected == 1
+
+    @pytest.mark.asyncio
+    async def test_different_targets_both_send(self, alog):
+        """两个账号的目标不同时都要发出去 —— 去重不能把消息吃掉。"""
+        shared = CrossAccountDedupe()
+        first, second = FakeClient(), FakeClient()
+        engine_a = ForwardEngine(first, build_config(), alog, shared_dedupe=shared)
+        engine_b = ForwardEngine(
+            second, build_config(targets=[-1009999999999]), alog, shared_dedupe=shared
+        )
+
+        message = src_message("关键词123")
+        engine_a._handle(message, edited=False)
+        await drain(engine_a)
+        engine_b._handle(message, edited=False)
+        await drain(engine_b)
+
+        assert len(first.forwarded) == 1
+        assert len(second.forwarded) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_shared_table_means_disabled(self, alog):
+        """不传共享表（单测 / 离线场景）时行为与从前完全一致：两个账号都发。"""
+        first, second = FakeClient(), FakeClient()
+        engine_a = ForwardEngine(first, build_config(), alog)
+        engine_b = ForwardEngine(second, build_config(), alog)
+
+        message = src_message("关键词123")
+        engine_a._handle(message, edited=False)
+        await drain(engine_a)
+        engine_b._handle(message, edited=False)
+        await drain(engine_b)
+
+        assert len(first.forwarded) == 1
+        assert len(second.forwarded) == 1
+        assert engine_b.stats["cross_deduped"] == 0
+
+
+class TestDedupeWiring:
+    """把共享表从 RuntimeManager 一路接到 ForwardEngine 的接线。
+
+    去重表**必须是同一个实例**：面板每点一次「启动」就会重建 MultiRunner，
+    每次都换新表的话，去重窗口会被清空 —— 刚发过的消息又能重发一遍。
+    """
+
+    def test_multi_runner_reuses_injected_table(self):
+        # MultiRunner.__init__ 只保存引用、不碰 store/settings，所以这里可以传 None。
+        shared = CrossAccountDedupe()
+        assert MultiRunner(None, None, dedupe=shared).dedupe is shared
+
+    def test_multi_runner_creates_table_by_default(self):
+        assert isinstance(MultiRunner(None, None).dedupe, CrossAccountDedupe)
+
+    def test_account_runner_stores_shared_table(self, paths):
+        """AccountRunner 必须把表存下来 —— ``start()`` 里构造 ForwardEngine 要读它。
+
+        ``start()`` 会真的去连 Telegram，所以这里只构造、不启动。
+        """
+        shared = CrossAccountDedupe()
+        runner = AccountRunner(
+            AccountRecord(name="acc-a"),
+            build_config(),
+            None,
+            paths,
+            shared_dedupe=shared,
+        )
+        assert runner.shared_dedupe is shared
+
+    def test_account_runner_defaults_to_disabled(self, paths):
+        runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
+        assert runner.shared_dedupe is None

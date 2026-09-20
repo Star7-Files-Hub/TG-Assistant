@@ -112,13 +112,13 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `enabled` | bool | 总开关 |
-| `dedupe_window` | number | 去重窗口（秒），同一消息在此时间内不重复转发 |
+| `dedupe_window` | number | 去重窗口（秒）。**两层生效**：账号内同一条消息不重复触发；**跨账号**同一条消息发往**同一个目标**也只发一次（多个账号共享一张表，键里带目标，所以目标不同时互不影响） |
 | `exclude_chats` | array | **账号级**排除的会话，写一次全部规则都不监听；格式同 sources |
 | `rules[].id` | string | 唯一标识 |
 | `rules[].sources` | array | 来源会话：`@username`、`chat_id`、`t.me/...` 链接。**空数组 = 监听全部** |
 | `rules[].exclude_sources` | array | 只对**这一条规则**生效的排除来源 |
 | `rules[].targets` | array | 目标会话，格式同 sources |
-| `rules[].mode` | string | `forward`（带转发抬头）/ `copy`（无抬头）/ `text`（按模板重发） |
+| `rules[].mode` | string | `forward`（带转发抬头）/ `copy`（无抬头）/ `text`（按模板重发）。⚠️ **`forward` 遇到受保护源会话时（Telegram 回 `CHAT_FORWARDS_RESTRICTED`）会自动改用复制**再发一次，不用手动改成 `copy`；那条消息的日志会显示 `mode=copy(降级)` |
 | `rules[].match.mode` | string | `regex` / `contains` / `exact` / `all` |
 | `rules[].match.patterns` | array | 匹配模式（正则或关键词） |
 | `rules[].match.exclude_patterns` | array | 排除模式 |

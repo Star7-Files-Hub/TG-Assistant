@@ -169,14 +169,20 @@ class FakeClient:
         callback_error: Optional[BaseException] = None,
         send_error: Optional[BaseException] = None,
         forward_error: Optional[BaseException] = None,
+        forward_error_once: Optional[BaseException] = None,
     ) -> None:
         self.me = FakeUser(1, username="me", is_self=True)
         self.callback_answer = callback_answer
         self.callback_error = callback_error
         self.send_error = send_error
         self.forward_error = forward_error
+        #: 只抛**第一次**的错误，之后恢复正常 —— 用来测「失败后自动降级重试」。
+        self.forward_error_once = forward_error_once
         self.sent: list[dict[str, Any]] = []
         self.forwarded: list[dict[str, Any]] = []
+        #: ``forward_messages`` 的**调用次数**（含抛错的那些）。
+        #: ``forwarded`` 只记成功的调用，测「先失败再重试」时必须看这个。
+        self.forward_calls = 0
         self.callbacks: list[dict[str, Any]] = []
         self.handlers: list[tuple[Any, int]] = []
         self.next_message_id = 9000
@@ -198,8 +204,12 @@ class FakeClient:
         return types.SimpleNamespace(id=self.next_message_id)
 
     async def forward_messages(self, **kwargs: Any) -> Any:
+        self.forward_calls += 1
         if self.forward_error is not None:
             raise self.forward_error
+        if self.forward_error_once is not None:
+            error, self.forward_error_once = self.forward_error_once, None
+            raise error
         self.forwarded.append(kwargs)
         ids = kwargs.get("message_ids")
         if isinstance(ids, (list, tuple)):
