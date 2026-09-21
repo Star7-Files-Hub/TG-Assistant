@@ -37,7 +37,7 @@ ChatRef = Union[int, str]
 
 MatchMode = Literal["regex", "contains", "exact", "all"]
 ForwardMode = Literal["forward", "copy", "text"]
-NotifyMode = Literal["copy", "text"]
+NotifyMode = Literal["forward", "copy", "text"]
 RedPacketStrategy = Literal["auto", "button", "keyword"]
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -350,6 +350,15 @@ class ForwardConfig(StrictModel):
     rules: list[ForwardRule] = Field(default_factory=list)
     #: 消息去重窗口（秒）。同一 (chat_id, message_id) 在窗口内只处理一次。
     dedupe_window: float = Field(default=300.0, ge=0.0)
+    #: **同内容去重**：命中新消息后，先和目标里**最近已转发的内容**比一比，
+    #: 一样就跳过（小白原话：「命中新消息要跟前 5 条对比，不一致才进行转发，
+    #: 或者一天内而不是前 x 条」）。
+    #:
+    #: 两个条件取**并集** —— 既看最近 ``recent_dedupe_limit`` 条，也看
+    #: ``recent_dedupe_window`` 秒内的全部（先到哪个算哪个，谁更宽算谁）。
+    #: 0 = 关掉这一层。
+    recent_dedupe_limit: int = Field(default=5, ge=0)
+    recent_dedupe_window: float = Field(default=86400.0, ge=0.0)
     #: 全局排除的会话：**所有规则**都不监听这些会话，写一次管全部。
     #:
     #: 与每条规则自己的 ``exclude_sources`` 的区别：这里是账号级的，
@@ -389,11 +398,14 @@ class NotifyConfig(StrictModel):
 
     自己的频道不会给自己推送通知，因此用一个 bot 把同样的内容再发给你（或指定群）。
 
-    - ``mode="copy"``：让 bot 用 Bot API ``copyMessage`` 从转发目标频道复制同一条消息，
-      内容与频道里**完全一致**（需要把 bot 拉进目标频道并给「发消息」权限）。
+    - ``mode="forward"``（**默认**）：让 bot 用 ``forwardMessage`` 转发目标频道里那条消息，
+      通知里的样子**和频道里那条一模一样**（带「转发自」抬头）。源会话禁止转发 /
+      内容受保护时自动降级 ``copyMessage``。
+    - ``mode="copy"``：只用 ``copyMessage`` 复制（不带「转发自」抬头）。
+      适合源会话一律禁止转发、不想每次都试一次 forward 的场景。
     - ``mode="text"``：bot 直接按模板发文本，不依赖频道权限，媒体退化为文字说明。
 
-    ``copy`` 模式失败时会自动回退到 ``text``，保证通知不丢。
+    ``forward``/``copy`` 都失败时会自动回退到 ``text``，保证通知不丢。
     """
 
     enabled: bool = False
@@ -405,7 +417,9 @@ class NotifyConfig(StrictModel):
     #: 与 ``chat_id`` 是**并集**关系（``chat_id`` 排在最前）。
     chat_ids: list[ChatRef] = Field(default_factory=list)
     message_thread_id: Optional[int] = None
-    mode: NotifyMode = "copy"
+    #: 默认 ``forward``：通知要**和频道里那条长得一样**（小白原话：「频道什么样机器人
+    #: 就什么样，能使用 forward 就 forward，不能才用 copy 兜底」）。
+    mode: NotifyMode = "forward"
     #: 通知里附带原始来源链接。
     include_source_link: bool = True
     #: 文本模式模板；None 表示使用内置模板。

@@ -528,6 +528,7 @@ class AccountRunner:
         store: Optional[Any] = None,
         shared_dedupe: Optional[Any] = None,
         pair_dedupe: Optional[Any] = None,
+        recent_dedupe: Optional[Any] = None,
     ) -> None:
         self.record = record
         self.config = config
@@ -538,6 +539,8 @@ class AccountRunner:
         self.shared_dedupe = shared_dedupe
         #: 「频道 ↔ 群组 同内容」去重表（同样多账号共享）。``None`` = 关闭这一层。
         self.pair_dedupe = pair_dedupe
+        #: 「最近已转发的内容」去重表（同样多账号共享）。``None`` = 引擎按账号配置自建。
+        self.recent_dedupe = recent_dedupe
         self.alog = make_account_logger(record.name, "runner")
         self.client: Optional[Client] = None
         self.notifier: Optional[BotNotifier] = None
@@ -614,6 +617,7 @@ class AccountRunner:
             # 同理：「频道 ↔ 群组 同内容」去重表也要共享 —— 频道那条由账号 A 发出去、
             # 群组那条由账号 B 收到时，B 得能撤回 A 发的那条。
             pair_dedupe=self.pair_dedupe,
+            recent_dedupe=self.recent_dedupe,
         )
         self.forwarder.register()
 
@@ -691,6 +695,8 @@ class AccountRunner:
                     # 后到、把已发出的频道消息撤回掉的次数。
                     "pair_deduped": snapshot["pair_deduped"],
                     "pair_superseded": snapshot["pair_superseded"],
+                    # 目标里**最近已经转发过相同内容**而被跳过的次数。
+                    "recent_deduped": snapshot["recent_deduped"],
                     "downgraded": snapshot["downgraded"],
                 }
             )
@@ -732,6 +738,7 @@ class MultiRunner:
         settings: Settings,
         dedupe: Optional[CrossAccountDedupe] = None,
         pair_dedupe: Optional[Any] = None,
+        recent_dedupe: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -741,6 +748,8 @@ class MultiRunner:
         self.dedupe = dedupe if dedupe is not None else CrossAccountDedupe()
         #: 「频道 ↔ 群组 同内容」去重表，同样是所有账号共享同一个实例、同样要跨面板重建复用。
         self.pair_dedupe = pair_dedupe
+        #: 「最近已转发的内容」去重表，同样是所有账号共享同一个实例。
+        self.recent_dedupe = recent_dedupe
         self.runners: dict[str, AccountRunner] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._shutdown = asyncio.Event()
@@ -831,6 +840,7 @@ class MultiRunner:
                     store=self.store,
                     shared_dedupe=self.dedupe,
                     pair_dedupe=self.pair_dedupe,
+                    recent_dedupe=self.recent_dedupe,
                 )
                 self.runners[name] = runner
                 await runner.start()

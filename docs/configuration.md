@@ -69,6 +69,8 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
   "forward": {
     "enabled": true,
     "dedupe_window": 300,
+    "recent_dedupe_limit": 5,
+    "recent_dedupe_window": 86400,
     "exclude_chats": [],
     "rules": [
       {
@@ -128,6 +130,8 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | `rules[].media_group` | bool | 是否聚合相册（攒齐后一次转发） |
 | `rules[].delay` | number | 命中后延迟多少秒再发 |
 | `rules[].min_interval` | number | 同一规则两次触发的最小间隔 |
+| `recent_dedupe_limit` | int | 「最近已转发的内容」按**条数**保留多少条（默认 5）。命中新消息时先跟这些比，一致就跳过 |
+| `recent_dedupe_window` | number | 同一层按**时间**保留多久（秒，默认 86400 = 一天）。与上面那条**取并集**，哪个更宽算哪个；两个都设 0 = 关掉这一层 |
 | `rules[].notify` | bool | 转发后是否推 bot 通知 |
 
 > ⚠️ **转发目标不能同时是监听来源。**
@@ -173,7 +177,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
     "bot_token": "${TGA_BOT_TOKEN}",
     "chat_id": 123456789,
     "message_thread_id": null,
-    "mode": "copy",
+    "mode": "forward",
     "include_source_link": true,
     "template": "<b>{chat_title}</b>\\n{text}",
     "rate_limit_per_minute": 18,
@@ -193,7 +197,7 @@ Web 界面包含：仪表盘、扫码登录、账号管理、配置编辑、实�
 | --- | --- | --- |
 | `bot_token` | string | Bot token，支持 `${ENV_VAR}` 引用环境变量 |
 | `chat_id` | number/string | 通知目标：你的私聊 id、频道 id、或话题 id |
-| `mode` | string | `copy`（服务端复制，内容一致）/ `text`（纯文本） |
+| `mode` | string | **`forward`**（默认：用 `forwardMessage` 转发目标频道里那条消息 —— **通知和频道里那条一模一样**，带「转发自」抬头；源会话禁止转发 / 内容受保护时自动降级 `copyMessage`）/ `copy`（只用 `copyMessage`，不带抬头）/ `text`（纯文本，媒体退化为文字说明） |
 | `events` | array | 订阅事件：`forward` / `red_packet` / `error` |
 | `rate_limit_per_minute` | number | 限流（默认 18，留余量给 Telegram 30/min 限制） |
 | `use_proxy` | bool | 是否通过代理访问 Bot API |

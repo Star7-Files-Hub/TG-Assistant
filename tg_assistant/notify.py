@@ -51,6 +51,13 @@ class NotifyTask:
     silent: bool = False
     created_at: float = field(default_factory=time.time)
     context: dict[str, Any] = field(default_factory=dict)
+    #: 「撤回键」。给了的话，这条通知发出后会把 ``(chat_id, message_id)`` 记在该键下，
+    #: 供 :meth:`BotNotifier.withdraw` 事后删除。
+    #:
+    #: 为什么要它：频道那条先发出去、随后被群组那条顶替时，引擎会**删掉**目标里那条消息，
+    #: 但通知是 bot 复制到另一个会话里的 —— 它既不会被删、又指向一条已经不存在的消息，
+    #: 用户会看到「两条通知，其中一条点了是空的」。所以撤回时必须连带撤通知。
+    key: Optional[str] = None
 
     @property
     def age_ms(self) -> float:
@@ -84,7 +91,12 @@ class BotNotifier:
         self._transport = _transport
         self._send_times: list[float] = []
         self._stopping = False
-        self.stats = {"sent": 0, "failed": 0, "dropped": 0, "fallback": 0}
+        self.stats = {"sent": 0, "failed": 0, "dropped": 0, "fallback": 0, "withdrawn": 0}
+        #: 撤回键 -> (记录时间, [(chat_id, message_id), ...])。只给**可能被撤回**的通知用，
+        #: 所以量很小；仍然按时间裁剪，避免长时间运行后无限增长。
+        self._sent_by_key: dict[str, tuple[float, list[tuple[Any, int]]]] = {}
+        #: 记录保留多久（秒）。远大于「频道↔群组」的去重窗口（默认 300s）即可。
+        self.sent_key_ttl = 900.0
 
     # ------------------------------------------------------------------ #
     @property
@@ -256,12 +268,18 @@ class BotNotifier:
 
     async def _deliver(self, task: NotifyTask) -> None:
         started = time.perf_counter()
-        use_copy = self.config.mode == "copy" and (task.copy_from or task.copy_from_ids)
+        # ``forward`` 与 ``copy`` 都要「把目标里那条消息照样发一份」，区别只是用哪个 API。
+        use_copy = self.config.mode in ("copy", "forward") and (
+            task.copy_from or task.copy_from_ids
+        )
+        #: 这次发出去的消息。带 ``key`` 时要记下来，供事后撤回。
+        sent_out: list[tuple[Any, int]] = []
 
         if use_copy:
-            ok = await self._send_copies(task)
+            ok = await self._send_copies(task, sent_out)
             if ok:
                 self.stats["sent"] += 1
+                self._remember(task, sent_out)
                 self.alog.info(
                     "通知已发送（复制原消息，内容与频道一致）",
                     event=task.event,
@@ -277,9 +295,10 @@ class BotNotifier:
                 hint="确认 bot 已加入目标频道且有读取/发送权限",
             )
 
-        ok = await self._send_text(task)
+        ok = await self._send_text(task, sent_out)
         if ok:
             self.stats["sent"] += 1
+            self._remember(task, sent_out)
             self.alog.info(
                 "通知已发送（文本模式）",
                 event=task.event,
@@ -290,7 +309,60 @@ class BotNotifier:
         else:
             self.stats["failed"] += 1
 
-    async def _send_copies(self, task: NotifyTask) -> bool:
+    def _remember(self, task: NotifyTask, sent_out: list[tuple[Any, int]]) -> None:
+        """把这次发出的消息记在 ``task.key`` 下（没给 key 就不记）。"""
+        if not task.key or not sent_out:
+            return
+        self._prune_sent_keys()
+        self._sent_by_key[task.key] = (time.monotonic(), list(sent_out))
+
+    def _prune_sent_keys(self) -> None:
+        """丢掉过期的记录 —— 长时间运行下这张表不能无限长。"""
+        now = time.monotonic()
+        expired = [k for k, (ts, _) in self._sent_by_key.items() if now - ts > self.sent_key_ttl]
+        for key in expired:
+            self._sent_by_key.pop(key, None)
+
+    async def withdraw(self, key: Optional[str]) -> int:
+        """撤回**某条已经被删掉的目标消息**对应的通知。
+
+        频道那条先发出去、随后被群组那条顶替时，引擎会把目标里那条消息删掉；
+        而通知是 bot 复制到**另一个会话**里的，删不掉也感知不到 ⇒ 用户会看到
+        「两条通知，第一条点进去是空的」。所以撤回目标消息之后要连带撤通知。
+
+        返回成功删除的通知条数。**尽力而为**：bot 没有删除权限、或消息已超过
+        48 小时（Telegram 的硬限制）都会失败 —— 那只打 WARNING，绝不影响主流程。
+        """
+        if not key or not self.enabled:
+            return 0
+        entry = self._sent_by_key.pop(key, None)
+        if entry is None:
+            # 通知还没发出去（在队列里排队）、或压根没开通知 —— 都算「没什么可撤的」
+            self.alog.debug("没有可撤回的通知", key=key)
+            return 0
+        removed = 0
+        for chat_id, message_id in entry[1]:
+            if message_id is None:
+                continue
+            ok, description, _ = await self._call(
+                "deleteMessage", {"chat_id": chat_id, "message_id": message_id}
+            )
+            if ok:
+                removed += 1
+                self.stats["withdrawn"] += 1
+            else:
+                self.alog.warning(
+                    "撤回失效的通知失败（用户会看到一条指向已删消息的通知）",
+                    key=key,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    description=description,
+                )
+        if removed:
+            self.alog.info("已撤回失效的通知", key=key, removed=removed)
+        return removed
+
+    async def _send_copies(self, task: NotifyTask, sent_out: list[tuple[Any, int]]) -> bool:
         pairs = task.copy_from_ids or ([task.copy_from] if task.copy_from else [])
         if not pairs:
             return False
@@ -305,13 +377,36 @@ class BotNotifier:
                 }
                 if self.config.message_thread_id is not None:
                     payload["message_thread_id"] = self.config.message_thread_id
-                ok, _ = await self._call("copyMessage", payload)
+                ok, description, result = await self._send_one_copy(payload)
+                if ok and result:
+                    sent_out.append((chat_id, result.get("message_id")))
                 all_ok = all_ok and ok
                 if not ok:
                     break
         return all_ok
 
-    async def _send_text(self, task: NotifyTask) -> bool:
+    async def _send_one_copy(self, payload: dict[str, Any]) -> tuple[bool, Optional[str], Optional[dict]]:
+        """发一条「和频道里那条一样」的通知。
+
+        ``forward`` 模式先试 ``forwardMessage`` —— 这样通知**带着「转发自」抬头，
+        和频道里那条一模一样**（小白要的就是这个）；源会话禁止转发、内容受保护时
+        Telegram 会直接拒绝 ⇒ 自动降级 ``copyMessage``（内容一致，但没有抬头）。
+        """
+        if self.config.mode != "forward":
+            return await self._call("copyMessage", payload)
+
+        ok, description, result = await self._call("forwardMessage", payload)
+        if ok:
+            return ok, description, result
+        self.stats["fallback"] += 1
+        self.alog.warning(
+            "通知无法转发，降级为复制（通知里会少掉「转发自」抬头）",
+            description=description,
+            hint="源会话禁止转发 / 内容受保护时 Telegram 会拒绝 forwardMessage",
+        )
+        return await self._call("copyMessage", payload)
+
+    async def _send_text(self, task: NotifyTask, sent_out: list[tuple[Any, int]]) -> bool:
         text = truncate(task.text, SAFE_TEXT_LENGTH)
         all_ok = True
         for chat_id in self._all_chat_ids:
@@ -326,12 +421,14 @@ class BotNotifier:
             if self.config.message_thread_id is not None:
                 payload["message_thread_id"] = self.config.message_thread_id
 
-            ok, description = await self._call("sendMessage", payload)
+            ok, description, result = await self._call("sendMessage", payload)
             if not ok and description and "can't parse entities" in description.lower():
                 # 模板里混入了裸 < > &，去掉 parse_mode 再发一次，宁可少格式也别丢消息
                 payload.pop("parse_mode", None)
                 self.alog.warning("HTML 解析失败，改用纯文本重发", description=description)
-                ok, description = await self._call("sendMessage", payload)
+                ok, description, result = await self._call("sendMessage", payload)
+            if ok and result:
+                sent_out.append((chat_id, result.get("message_id")))
             all_ok = all_ok and ok
         return all_ok
 
@@ -341,8 +438,13 @@ class BotNotifier:
         payload: dict[str, Any],
         *,
         attempts: int = 3,
-    ) -> tuple[bool, Optional[str]]:
-        """调用 Bot API，处理 429 与网络抖动。"""
+    ) -> tuple[bool, Optional[str], Optional[dict]]:
+        """调用 Bot API，处理 429 与网络抖动。
+
+        返回 ``(是否成功, 错误描述, result)``。``result`` 是 API 的返回值
+        （``copyMessage`` 是 ``MessageId``、``sendMessage`` 是 ``Message``），
+        **撤回通知**需要里面的 ``message_id``。
+        """
         assert self._http is not None
         url = f"{self._base_url}/{method}"
         for attempt in range(1, attempts + 1):
@@ -356,7 +458,7 @@ class BotNotifier:
                         attempt=attempt,
                         hint="检查代理是否可用（notify.use_proxy）",
                     )
-                    return False, str(exc)
+                    return False, str(exc), None
                 await asyncio.sleep(0.5 * attempt)
                 continue
 
@@ -368,10 +470,11 @@ class BotNotifier:
                     status=response.status_code,
                     body=response.text[:200],
                 )
-                return False, response.text[:200]
+                return False, response.text[:200], None
 
             if data.get("ok"):
-                return True, None
+                result = data.get("result")
+                return True, None, result if isinstance(result, dict) else None
 
             description = str(data.get("description") or "")
             if response.status_code == 429:
@@ -395,8 +498,8 @@ class BotNotifier:
                 hint=level_hint,
                 attempt=attempt,
             )
-            return False, description
-        return False, "重试次数用尽"
+            return False, description, None
+        return False, "重试次数用尽", None
 
 
 def _hint_for(description: str) -> str:

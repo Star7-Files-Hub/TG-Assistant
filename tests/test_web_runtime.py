@@ -40,6 +40,7 @@ class _FakeMultiRunner:
         settings: Any,
         dedupe: Any = None,
         pair_dedupe: Any = None,
+        recent_dedupe: Any = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -48,6 +49,8 @@ class _FakeMultiRunner:
         self.dedupe = dedupe
         #: 「频道 ↔ 群组 同内容」去重表，同样要跨面板重建延续（理由同上）。
         self.pair_dedupe = pair_dedupe
+        #: 「最近已转发的内容」去重表，同样要跨面板重建延续（换表 = 记录全清空）。
+        self.recent_dedupe = recent_dedupe
         self.names: list[str] = []
         self.run_kwargs: dict[str, Any] = {}
         self.started = asyncio.Event()

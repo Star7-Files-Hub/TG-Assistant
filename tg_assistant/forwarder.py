@@ -9,11 +9,13 @@
 3. **正则预编译**：配置加载时编译一次。
 4. **相册聚合**：同一 ``media_group_id`` 的多条消息在 ``media_group_window`` 内攒齐后
    一次性 ``forward_messages(message_ids=[...])``，避免拆成多条丢失排版。
-5. **去重**：三层 —— 账号内 ``(规则 id, chat_id, message_id)`` + TTL，防止编辑事件或
+5. **去重**：四层 —— 账号内 ``(规则 id, chat_id, message_id)`` + TTL，防止编辑事件或
    重复更新造成二次转发；**跨账号** ``(chat_id, message_id, 目标)`` 共享表，防止多个账号
    都在同一个源群里时把同一条消息各发一遍；**「频道 ↔ 群组 同内容」**（见
    :class:`ChannelGroupDedupe`）共享表，同一个运营方把同一条推广分别发到频道和它的群组时
-   只留群组那条 —— 这两张共享表都跨面板重建复用，否则窗口会被清空。
+   只留群组那条；**「最近已转发的内容」**（见 :class:`RecentContentDedupe`）共享表，
+   按目标记下最近 N 条 / 时间窗内已转发的内容指纹，同内容再来一遍直接跳过 ——
+   这三张共享表都跨面板重建复用，否则窗口会被清空。
 6. **forward 失败自动降级 copy**：源会话受保护时 Telegram 会拒 forward，此时自动改用
    复制再发一次，而不是直接失败。
 7. **日志里的 ``mode=`` 是「实际生效」的模式**，不是配置值。取值见
@@ -42,6 +44,7 @@ import contextlib
 import hashlib
 import random
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
@@ -255,6 +258,15 @@ def content_fingerprint(message: Any) -> Optional[str]:
     return f"media:{media}" if media else None
 
 
+def _pair_notify_key(fingerprint: str, target: Any) -> str:
+    """「这条内容发到这个目标」对应的通知撤回键。
+
+    频道那条与随后顶替它的群组那条**指纹相同、目标相同** ⇒ 两边算出来的键一致，
+    群组那条才能找到并撤掉频道那条已经发出的通知。
+    """
+    return f"pair:{fingerprint}:{target}"
+
+
 def _is_channel_group_pair(kind_a: Optional[str], kind_b: Optional[str]) -> bool:
     """是不是「一边频道、一边群组」这一对。
 
@@ -427,6 +439,97 @@ class ChannelGroupDedupe:
         }
 
 
+class RecentContentDedupe:
+    """「目标里**最近已经转发过**的内容」—— 命中新消息后先跟它比一比。
+
+    为什么需要它：前面两层去重都只认**消息 id**（``(chat_id, message_id)``），
+    以及「频道↔群组」这一特定组合。现实里的重复远不止这两种 —— 同一个运营方把
+    同一段广告发到好几个群、隔几小时又发一遍、或者转发关系压根不存在，
+    这些情况下 ``message_id`` 全都不同 ⇒ 目标里就会出现一堆一模一样的消息。
+
+    小白原话：「命中新消息要跟前 5 条对比，不一致才进行转发，或者一天内而不是前 x 条」。
+
+    ⇒ 两个条件取**并集**：既看最近 ``limit`` 条，也看 ``ttl`` 秒内的全部
+    （哪个更宽算哪个）。``limit=0`` ⇒ 只看时间窗；``ttl=0`` ⇒ 只看条数；
+    两个都是 0 ⇒ 关掉这一层。
+
+    ⚠️ 分桶键是**目标**：同一个内容发到不同目标互不影响，不会互相吃掉。
+    """
+
+    def __init__(self, limit: int = 5, ttl: float = 86400.0) -> None:
+        self.limit = max(0, int(limit))
+        self.ttl = float(ttl)
+        #: 目标 -> deque[(时间戳, 指纹)]，左旧右新。
+        self._by_target: dict[str, deque] = {}
+        self.hits = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit > 0 or self.ttl > 0
+
+    def _bucket(self, target: Any) -> deque:
+        return self._by_target.setdefault(str(target), deque())
+
+    def _prune(self, bucket: deque) -> None:
+        """丢弃**同时**超出条数上限**且**已过期的项 —— 这就是「取并集」的实现。"""
+        now = time.time()
+        while bucket and len(bucket) > self.limit and (now - bucket[0][0]) > self.ttl:
+            bucket.popleft()
+
+    def contains(self, fingerprint: Optional[str], target: Any) -> bool:
+        """这条内容是不是**刚刚**就往这个目标发过。"""
+        if fingerprint is None or not self.enabled:
+            return False
+        bucket = self._by_target.get(str(target))
+        if not bucket:
+            return False
+        self._prune(bucket)
+        hit = any(fp == fingerprint for _, fp in bucket)
+        if hit:
+            self.hits += 1
+        return hit
+
+    def add(self, fingerprint: Optional[str], target: Any) -> None:
+        """记下「这条内容刚发到这个目标」。同一个指纹只留最新一条。"""
+        if fingerprint is None or not self.enabled:
+            return
+        bucket = self._bucket(target)
+        for item in list(bucket):
+            if item[1] == fingerprint:
+                bucket.remove(item)
+        bucket.append((time.time(), fingerprint))
+        self._prune(bucket)
+
+    def remove(self, fingerprint: Optional[str], target: Any) -> None:
+        """撤回一条已发消息时把它摘掉。
+
+        🔴 不摘的后果很严重：频道那条先发出去（已记进本表）→ 群组那条后到、把它撤回
+        ⇒ 目标里其实**没有**这条内容了，但本表还记着 ⇒ 群组那条会被判成「重复」而跳过
+        ⇒ 目标里一条都不剩，消息彻底丢失。
+        """
+        if fingerprint is None:
+            return
+        bucket = self._by_target.get(str(target))
+        if not bucket:
+            return
+        for item in list(bucket):
+            if item[1] == fingerprint:
+                bucket.remove(item)
+                break
+
+    def __len__(self) -> int:
+        return sum(len(b) for b in self._by_target.values())
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "size": len(self),
+            "targets": len(self._by_target),
+            "hits": self.hits,
+            "limit": self.limit,
+            "ttl": self.ttl,
+        }
+
+
 # --------------------------------------------------------------------------- #
 # 预编译规则
 # --------------------------------------------------------------------------- #
@@ -571,6 +674,7 @@ class ForwardEngine:
         account: Optional[str] = None,
         shared_dedupe: Optional[CrossAccountDedupe] = None,
         pair_dedupe: Optional[ChannelGroupDedupe] = None,
+        recent_dedupe: Optional[RecentContentDedupe] = None,
     ) -> None:
         self.client = client
         self.config = config
@@ -589,6 +693,15 @@ class ForwardEngine:
         #: 「频道 ↔ 群组 同内容」去重表（同样是多账号共享同一个实例）。
         #: 不传（单测 / 离线场景）即关闭这一层，行为与从前一致。
         self._pair_dedupe = pair_dedupe
+        #: 「最近已转发的内容」表（同样是多账号共享同一个实例）。
+        #: 不传时按本账号配置自建一张（单账号场景下效果一样）。
+        self._recent = recent_dedupe
+        if self._recent is None:
+            fwd = config.forward
+            self._recent = RecentContentDedupe(
+                limit=getattr(fwd, "recent_dedupe_limit", 5),
+                ttl=getattr(fwd, "recent_dedupe_window", 86400.0),
+            )
 
         # ---- 规则热重载 ----
         #: 只有同时给了 ``store`` 与 ``account`` 才开启；单测 / 离线场景不传，
@@ -616,6 +729,8 @@ class ForwardEngine:
             "pair_deduped": 0,
             #: 群组那条后到，把先前发出去的**频道**那条撤回掉的次数。
             "pair_superseded": 0,
+            #: 目标里**最近已经转发过相同内容**，因而直接跳过的次数。
+            "recent_deduped": 0,
             #: 源会话禁止转发、自动改用复制的次数。
             "downgraded": 0,
         }
@@ -1008,6 +1123,8 @@ class ForwardEngine:
         #: 去重判断用。指纹为 ``None``（既没正文也没媒体）时这一层直接放行。
         kind = chat_kind(message)
         fingerprint = content_fingerprint(message)
+        #: 相册 id。非空表示这条属于某个相册（一组消息是一个整体）。
+        album_id = getattr(message, "media_group_id", None)
 
         if rule.delay > 0:
             await asyncio.sleep(rule.delay)
@@ -1058,8 +1175,38 @@ class ForwardEngine:
                     continue
                 if decision.withdraw:
                     await self._withdraw_superseded(
-                        target, decision.withdraw, rule, chat_title or chat_id, ids[0]
+                        target,
+                        decision.withdraw,
+                        rule,
+                        chat_title or chat_id,
+                        ids[0],
+                        fingerprint=fingerprint,
                     )
+
+            # 「最近已转发过的内容」。
+            # ⚠️ 两个例外：
+            # ① 上面那种「群组顶替频道」：那时先前的频道消息**已被撤回**，目标里其实没有
+            #    这条内容 —— 再拦一道会导致群组那条也被跳过 ⇒ 一条都不剩。
+            # ② **相册**：同一组里的多条本来就是一个整体，caption 常常一模一样，
+            #    按内容比会把整组砍成一条（剩下的图全丢）。整组只在发送后记一次。
+            if (
+                not decision.withdraw
+                and album_id is None
+                and self._recent.contains(fingerprint, target)
+            ):
+                self.stats["recent_deduped"] += 1
+                # ⚠️ 两层名额都要退，否则这条在该目标上会被占死一整个 TTL。
+                self._release_pair(fingerprint, target)
+                self._release_claim(chat_id, ids[0], target)
+                self.alog.info(
+                    "最近已转发过相同内容，跳过",
+                    rule=rule.label,
+                    source_chat=chat_title or chat_id,
+                    message_id=ids[0],
+                    target=target,
+                    fingerprint=fingerprint,
+                )
+                continue
             try:
                 sent_ids, actual_mode = await self._send_to_target(
                     prepared, message, ids, target, variables
@@ -1095,11 +1242,18 @@ class ForwardEngine:
                 fingerprint, target, kind, sent_ids
             ):
                 await self._withdraw_superseded(
-                    target, sent_ids, rule, chat_title or chat_id, ids[0]
+                    target,
+                    sent_ids,
+                    rule,
+                    chat_title or chat_id,
+                    ids[0],
+                    fingerprint=fingerprint,
                 )
 
             prepared.stats["sent"] += 1
             self.stats["forwarded"] += 1
+            # 记进「最近已转发的内容」—— 之后同样内容的消息直接跳过。
+            self._recent.add(fingerprint, target)
             for sent_id in sent_ids:
                 delivered.append((target, sent_id))
 
@@ -1120,7 +1274,13 @@ class ForwardEngine:
             )
 
         if rule.notify and self.notifier is not None and delivered:
-            self._submit_notify(prepared, variables, delivered)
+            # 🔴 频道这条**有可能随后被群组那条顶替**，所以给它一个撤回键：
+            # 真被顶替时（下面 `_withdraw_superseded`）连带把这条通知也撤掉，
+            # 否则用户会收到两条通知、第一条还指向一条已经删掉的消息。
+            notify_key = None
+            if fingerprint is not None and kind == "channel":
+                notify_key = _pair_notify_key(fingerprint, delivered[0][0])
+            self._submit_notify(prepared, variables, delivered, key=notify_key)
 
     def _release_claim(self, source_chat_id: Any, message_id: Any, target: ChatRef) -> None:
         """把跨账号去重名额退回去（发送失败时用）。没配共享表时是空操作。"""
@@ -1139,6 +1299,7 @@ class ForwardEngine:
         rule: ForwardRule,
         source_chat: Any,
         source_message_id: int,
+        fingerprint: Optional[str] = None,
     ) -> None:
         """群组那条**后到**时，把先前发出去的频道那条从目标里撤回。
 
@@ -1162,6 +1323,9 @@ class ForwardEngine:
                 error=f"{type(exc).__name__}: {exc}",
             )
             return
+        # 目标里已经没有这条内容了 ⇒ 从「最近已转发」里摘掉，
+        # 否则随后到达的群组那条会被当成重复而跳过 ⇒ 一条都不剩。
+        self._recent.remove(fingerprint, target)
         self.stats["pair_superseded"] += 1
         self.alog.info(
             "群组那条后到：已撤回先前发出的频道消息",
@@ -1171,6 +1335,10 @@ class ForwardEngine:
             message_id=source_message_id,
             withdraw_ids=",".join(map(str, message_ids)),
         )
+        # 目标里那条删掉了 ⇒ 它对应的**通知**也失效了，连带撤回
+        # （否则用户收到两条通知，第一条点进去是空的）。
+        if fingerprint is not None and self.notifier is not None:
+            await self.notifier.withdraw(_pair_notify_key(fingerprint, target))
 
     async def _send_to_target(
         self,
@@ -1457,6 +1625,7 @@ class ForwardEngine:
         prepared: PreparedRule,
         variables: dict[str, Any],
         delivered: list[tuple[ChatRef, int]],
+        key: Optional[str] = None,
     ) -> None:
         assert self.notifier is not None
         config = self.notifier.config
@@ -1471,6 +1640,7 @@ class ForwardEngine:
                 "rule": prepared.label,
                 "source_chat": variables.get("chat_title"),
             },
+            key=key,
         )
         if self.notifier.submit(task):
             self.alog.debug("已提交 bot 通知", rule=prepared.label, copy_from=str(delivered[0]))
@@ -1491,6 +1661,9 @@ class ForwardEngine:
         if self._pair_dedupe is not None:
             #: 同样是跨账号共享表（「频道 ↔ 群组 同内容」那一层）。
             data["pair_dedupe"] = self._pair_dedupe.snapshot()
+        if self._recent is not None:
+            #: 同样是跨账号共享表（「最近已转发的内容」那一层）。
+            data["recent_dedupe"] = self._recent.snapshot()
         return data
 
 
@@ -1584,6 +1757,7 @@ __all__ = [
     "MediaGroupBuffer",
     "PairDecision",
     "PreparedRule",
+    "RecentContentDedupe",
     "content_fingerprint",
     "random_jitter",
 ]

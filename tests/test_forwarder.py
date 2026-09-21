@@ -7,19 +7,20 @@ import datetime as dt
 import os
 import time
 import types
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 from pyrogram.enums import ParseMode
 from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
 
-from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule
+from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule, NotifyConfig
 from tg_assistant.forwarder import (
     ChannelGroupDedupe,
     CrossAccountDedupe,
     DedupeCache,
     ForwardEngine,
     PreparedRule,
+    RecentContentDedupe,
     _pipeline_ms,
     content_fingerprint,
 )
@@ -69,6 +70,29 @@ def channel_message(text: str, **kwargs):
     """频道来源的消息。"""
     kwargs.setdefault("chat", FakeChat(CH_SRC, title="来源频道", chat_type="channel"))
     return make_message(text, **kwargs)
+
+
+class FakeNotifier:
+    """通知器替身：记录提交了什么、撤回了什么。
+
+    只实现引擎真正用到的那三个东西（``config`` / ``submit`` / ``withdraw``）——
+    真实 ``BotNotifier`` 要起 worker + 打 HTTP，这里都不需要。
+    """
+
+    def __init__(self) -> None:
+        self.config = NotifyConfig.model_validate(
+            {"enabled": True, "bot_token": "123:abc", "chat_id": -1001234567890, "mode": "copy"}
+        )
+        self.submitted: list[Any] = []
+        self.withdrawn: list[str] = []
+
+    def submit(self, task: Any) -> bool:
+        self.submitted.append(task)
+        return True
+
+    async def withdraw(self, key: Optional[str]) -> int:
+        self.withdrawn.append(key or "")
+        return 1
 
 
 async def drain(engine: ForwardEngine) -> None:
@@ -2022,6 +2046,231 @@ class TestChannelGroupDedupe:
         }
 
 
+class TestRecentContentDedupe:
+    """「最近已转发的内容」表：条数上限与时间窗**取并集**（哪个更宽算哪个）。"""
+
+    def test_recent_hit(self):
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        dedupe.add("fp1", DST)
+        assert dedupe.contains("fp1", DST) is True
+        assert dedupe.hits == 1
+
+    def test_beyond_limit_but_within_ttl_still_counts(self):
+        """超出「前 5 条」但还在时间窗内 ⇒ 仍然算最近（这就是「一天内」那一半）。"""
+        dedupe = RecentContentDedupe(limit=2, ttl=3600)
+        for i in range(5):
+            dedupe.add(f"fp{i}", DST)
+        assert dedupe.contains("fp0", DST) is True, "时间窗内 ⇒ 即便超出条数上限也要拦住"
+
+    def test_beyond_limit_and_expired_is_dropped(self):
+        """既超出条数上限、又过了时间窗 ⇒ 不再算最近。"""
+        dedupe = RecentContentDedupe(limit=2, ttl=0.01)
+        dedupe.add("old", DST)
+        dedupe.add("new1", DST)
+        time.sleep(0.02)
+        dedupe.add("new2", DST)
+        assert dedupe.contains("old", DST) is False
+
+    def test_limit_zero_means_time_window_only(self):
+        dedupe = RecentContentDedupe(limit=0, ttl=3600)
+        for i in range(10):
+            dedupe.add(f"fp{i}", DST)
+        assert dedupe.contains("fp0", DST) is True, "limit=0 ⇒ 只看时间窗，条数不限"
+
+    def test_ttl_zero_means_count_only(self):
+        dedupe = RecentContentDedupe(limit=3, ttl=0)
+        for i in range(5):
+            dedupe.add(f"fp{i}", DST)
+        assert dedupe.contains("fp0", DST) is False, "ttl=0 ⇒ 只看最近 3 条"
+        assert dedupe.contains("fp4", DST) is True
+
+    def test_both_zero_means_disabled(self):
+        dedupe = RecentContentDedupe(0, 0)
+        dedupe.add("fp", DST)
+        assert dedupe.enabled is False
+        assert dedupe.contains("fp", DST) is False
+        assert len(dedupe) == 0
+
+    def test_same_fingerprint_keeps_only_latest(self):
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        dedupe.add("fp", DST)
+        dedupe.add("fp", DST)
+        assert len(dedupe) == 1, "同一个指纹只留一条 —— 否则表会被重复项撑爆"
+
+    def test_remove_makes_it_forwardable_again(self):
+        """🔴 撤回一条已发消息后必须把它摘掉。
+
+        否则：频道那条先发出（已记表）→ 群组那条后到、撤回频道那条 ⇒
+        目标里其实没内容了，但表还记着 ⇒ 群组那条被当成重复跳过 ⇒ 一条都不剩。
+        """
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        dedupe.add("fp", DST)
+        assert dedupe.contains("fp", DST) is True
+        dedupe.remove("fp", DST)
+        assert dedupe.contains("fp", DST) is False
+
+    def test_targets_are_isolated(self):
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        dedupe.add("fp", DST)
+        assert dedupe.contains("fp", DST) is True
+        assert dedupe.contains("fp", SRC) is False, "同内容发到不同目标互不影响"
+
+    def test_none_fingerprint_never_hits(self):
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        assert dedupe.contains(None, DST) is False
+        dedupe.add(None, DST)
+        assert len(dedupe) == 0, "没有指纹（既无正文也无媒体）不参与这一层"
+
+    def test_snapshot(self):
+        dedupe = RecentContentDedupe(limit=5, ttl=3600)
+        dedupe.add("fp", DST)
+        snap = dedupe.snapshot()
+        assert snap["size"] == 1 and snap["limit"] == 5 and snap["ttl"] == 3600
+
+
+class TestRecentContentDedupeInEngine:
+    """引擎层：目标里最近发过的内容，再来一遍就不发。"""
+
+    @pytest.mark.asyncio
+    async def test_same_content_from_two_groups_only_sends_once(self, alog):
+        """两个群发同一段广告 ⇒ 第二条跳过（2026-09-21 小白要的效果）。"""
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        other_group = FakeChat(-1007777777777, title="另一个群", chat_type="supergroup")
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(make_message("关键词123", message_id=200, chat=other_group), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1, "同样的内容不该在目标里出现两遍"
+        assert engine.stats["recent_deduped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_different_content_still_goes_through(self, alog):
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(group_message("关键词456", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2
+        assert engine.stats["recent_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_album_is_not_trimmed_to_one(self, alog):
+        """🔴 相册不能被当成重复砍成一条。
+
+        同一组里的多条 caption 常常一模一样（甚至整组只有第一条有 caption、其余走
+        媒体指纹），按内容比会把剩下的图全丢掉。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[], match={"mode": "all"}, media_group=False),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        engine.register()
+        for index in range(3):
+            engine._handle(
+                src_message("相册", message_id=300 + index, media_group_id="mg-9"), edited=False
+            )
+        await drain(engine)
+
+        assert len(client.forwarded) == 3, "同一相册的三条都要发 —— 它们是一个整体"
+        assert engine.stats["recent_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_superseded_channel_does_not_block_the_group_copy(self, alog):
+        """🔴🔴 频道那条先发出、随后被群组那条顶替时，**群组那条必须发出去**。
+
+        顺序：频道发（记进本表）→ 群组到 → 撤回频道那条（从本表摘掉）→ 发群组那条。
+        只要这个环里任何一步把「摘掉」漏了，群组那条就会被判成重复而跳过
+        ⇒ 目标里一条都不剩，消息彻底丢失。
+        """
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            pair_dedupe=pair,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "前提：频道那条已经发出去了"
+
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2, "群组那条必须发出去"
+        assert [c["message_ids"] for c in client.deleted], "频道那条必须被撤回"
+        assert engine.stats["pair_superseded"] == 1
+        assert engine.stats["recent_deduped"] == 0
+
+    @pytest.mark.asyncio
+    async def test_withdraw_clears_the_record(self, alog):
+        """🔴 撤回一条已发消息 ⇒ 它在「最近已转发」里的记录必须一起摘掉。
+
+        不摘的后果：频道那条被撤回后，目标里**其实没有**这条内容，但表里还记着 ⇒
+        万一群组那条也发失败了，这条内容一整天都补不回来（消息彻底丢失）。
+        （上面那条用例测的是正常路径 —— 顶替时本来就绕过本层，所以它**测不到**这里，
+        必须单独钉。）
+        """
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        engine._recent.add("fp", DST)
+        assert engine._recent.contains("fp", DST) is True, "前提：先记进去"
+
+        await engine._withdraw_superseded(DST, [11], engine.rules[0].rule, "来源", 1, fingerprint="fp")
+
+        assert engine._recent.contains("fp", DST) is False, (
+            "撤回之后目标里没这条内容了 ⇒ 记录必须摘掉，否则再也补发不了"
+        )
+
+    @pytest.mark.asyncio
+    async def test_content_can_be_sent_again_after_withdraw(self, alog):
+        """撤回之后目标里没这条内容了 ⇒ 同内容再来一次应当放行。"""
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            pair_dedupe=pair,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+        # 目标里现在只剩群组那条；同样的内容**换一条新消息**再来 ⇒ 仍属重复，跳过
+        engine._handle(group_message("关键词123", message_id=300), edited=False)
+        await drain(engine)
+
+        assert engine.stats["recent_deduped"] == 1, "目标里已经有一模一样的内容了"
+
+
 class TestChannelGroupSameContentInEngine:
     """引擎层：同一条内容由频道和群组各发一遍，目标里只留群组那条。"""
 
@@ -2101,6 +2350,55 @@ class TestChannelGroupSameContentInEngine:
         assert engine.stats["pair_superseded"] == 1
 
     @pytest.mark.asyncio
+    async def test_superseding_also_withdraws_the_stale_notification(self, alog):
+        """🔴 撤回频道那条时，**它那条通知**也必须跟着撤。
+
+        通知是 bot 复制到**另一个会话**里的，引擎删不到它。不撤的后果：
+        用户收到两条通知，第一条指向一条已经被删掉的消息（点了是空的）。
+        """
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        notifier = FakeNotifier()
+        engine = ForwardEngine(
+            client, build_config(sources=[], notify=True), alog,
+            pair_dedupe=pair, notifier=notifier,
+        )
+
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(notifier.submitted) == 1, "前提：频道那条已经发过通知"
+        assert notifier.submitted[0].key is not None, (
+            "频道那条必须带撤回键 —— 否则事后撤不掉那条通知"
+        )
+
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert client.deleted, "前提：目标里那条频道消息确实被撤回了"
+        assert notifier.withdrawn == [notifier.submitted[0].key], (
+            "通知没被连带撤回 ⇒ 用户会看到一条指向已删消息的空通知"
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_first_sends_only_one_notification(self, alog):
+        """群组先到 ⇒ 频道那条压根不发 ⇒ 只该有一条通知（不该有可撤的）。"""
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        notifier = FakeNotifier()
+        engine = ForwardEngine(
+            client, build_config(sources=[], notify=True), alog,
+            pair_dedupe=pair, notifier=notifier,
+        )
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        engine._handle(channel_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(notifier.submitted) == 1, "频道那条被跳过了 ⇒ 不该有第二条通知"
+        assert notifier.withdrawn == []
+
+    @pytest.mark.asyncio
     async def test_withdraw_failure_still_sends_group_copy(self, alog):
         """撤回失败（目标里没有删除权限等）**不能**把群组那条也丢掉。"""
         pair = ChannelGroupDedupe()
@@ -2132,10 +2430,23 @@ class TestChannelGroupSameContentInEngine:
 
     @pytest.mark.asyncio
     async def test_two_groups_same_content_both_sent(self, alog):
-        """两个**群组**发的同内容帖子不能被误杀 —— 只有「频道 ↔ 群组」才算一对。"""
+        """**仅**「频道 ↔ 群组」这一层不会把两个群组的同内容帖子合并。
+
+        ⚠️ 这里刻意把「最近已转发的内容」那层**关掉**（``RecentContentDedupe(0, 0)``）：
+        那一层会按内容去重，两个群发同一段广告时第二条会被跳过 —— 那正是
+        2026-09-21 小白要的效果（「命中新消息要跟前 5 条对比，不一致才转发」），
+        由 :class:`TestRecentContentDedupeInEngine` 单独覆盖。本用例只钉
+        「频道↔群组」这一层的边界：它**只认** ``{channel, group}``。
+        """
         pair = ChannelGroupDedupe()
         client = FakeClient()
-        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            pair_dedupe=pair,
+            recent_dedupe=RecentContentDedupe(0, 0),
+        )
         other_group = FakeChat(-1007777777777, title="另一个群", chat_type="supergroup")
 
         engine._handle(group_message("关键词123"), edited=False)
@@ -2170,9 +2481,18 @@ class TestChannelGroupSameContentInEngine:
 
     @pytest.mark.asyncio
     async def test_no_table_means_disabled(self, alog):
-        """不传表（单测 / 离线场景）时行为与从前完全一致：两条都发。"""
+        """不传**频道↔群组**表时，那一层不生效：两条都发。
+
+        ⚠️ 同样要把「最近已转发的内容」那层关掉，否则它会按内容拦掉第二条
+        （见 :class:`TestRecentContentDedupeInEngine`）。
+        """
         client = FakeClient()
-        engine = ForwardEngine(client, build_config(sources=[]), alog)
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(0, 0),
+        )
 
         engine._handle(group_message("关键词123"), edited=False)
         await drain(engine)

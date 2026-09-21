@@ -87,6 +87,8 @@ class RuntimeManager:
         self._dedupe: Any = None
         #: 「频道 ↔ 群组 同内容」去重表 —— 与 ``_dedupe`` 一样跨面板重建复用。
         self._pair_dedupe: Any = None
+        #: 「最近已转发的内容」去重表 —— 同上，跨面板重建复用。
+        self._recent_dedupe: Any = None
         #: 透传给 ``MultiRunner.run()`` 的参数（heartbeat / restart_delay / max_restarts）。
         #: 刻意**不**在这里补 heartbeat：``cli.py`` 是在 ``create_app()`` 返回之后
         #: 才把真正的 WebSettings 换进 ``app.state`` 的，此刻读会拿到默认值。
@@ -131,6 +133,8 @@ class RuntimeManager:
         self._dedupe = getattr(runner, "dedupe", None)
         # 「频道 ↔ 群组 同内容」去重表同理。
         self._pair_dedupe = getattr(runner, "pair_dedupe", None)
+        # 「最近已转发的内容」去重表同理 —— 换表 = 刚发过的内容又能重发一遍。
+        self._recent_dedupe = getattr(runner, "recent_dedupe", None)
 
         names = self._adopted_accounts
         if not names:
@@ -406,7 +410,11 @@ class RuntimeManager:
             if not names:
                 return {"ok": False, "message": "没有可运行的账号。先 login 并用 accounts enable 启用。"}
 
-            from tg_assistant.forwarder import ChannelGroupDedupe, CrossAccountDedupe
+            from tg_assistant.forwarder import (
+                ChannelGroupDedupe,
+                CrossAccountDedupe,
+                RecentContentDedupe,
+            )
             from tg_assistant.runner import MultiRunner
 
             # 先确认有账号、再建 runner：原来是无条件建好之后才发现没账号就返回，
@@ -424,12 +432,16 @@ class RuntimeManager:
             # 刚发过的频道消息又能重发一遍，群组那条也就无从「顶替」。
             if self._pair_dedupe is None:
                 self._pair_dedupe = ChannelGroupDedupe()
+            # 「最近已转发的内容」去重表同理：换表 = 「前 5 条 / 一天内」的记录全没了。
+            if self._recent_dedupe is None:
+                self._recent_dedupe = RecentContentDedupe()
             await self._launch(
                 MultiRunner(
                     self.store,
                     self.settings,
                     dedupe=self._dedupe,
                     pair_dedupe=self._pair_dedupe,
+                    recent_dedupe=self._recent_dedupe,
                 ),
                 names,
             )
