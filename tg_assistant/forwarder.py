@@ -1171,6 +1171,7 @@ class ForwardEngine:
                         source_kind=kind,
                         message_id=ids[0],
                         target=target,
+                        fingerprint=fingerprint,
                     )
                     continue
                 if decision.withdraw:
@@ -1225,6 +1226,8 @@ class ForwardEngine:
                     target=target,
                     source_chat=chat_title or chat_id,
                     message_ids=",".join(map(str, ids)),
+                    # 同上：失败也要留指纹，否则「这条内容后来补发成功了吗」串不起来。
+                    fingerprint=fingerprint or "-",
                     error=f"{type(exc).__name__}: {exc}",
                     hint=_forward_hint(exc),
                 )
@@ -1268,6 +1271,11 @@ class ForwardEngine:
                 source_chat=chat_title or chat_id,
                 target=target,
                 message_ids=",".join(map(str, ids)),
+                # 🔴 必须打指纹：否则「同一内容到底有没有被发过两次」从日志里**查不了** ——
+                # 2026-09-22 实测，被去重拦下的那 7 个指纹在日志里只出现在「跳过」行里，
+                # 第一次真正转发的那条完全没有痕迹，等于没法自证去重有没有漏。
+                # 有了它，`grep fingerprint=xxx` 数出 >1 次就是漏了。
+                fingerprint=fingerprint or "-",
                 sent_ids=",".join(map(str, sent_ids)) or "-",
                 handler_ms=round((time.perf_counter() - started) * 1000, 1),
                 pipeline_ms=round(pipeline_ms, 1) if pipeline_ms is not None else "-",

@@ -1016,6 +1016,75 @@ class TestDeliveryModeIsHonest:
         assert modes == ["copy(退化为转发·丢链接)"], f"实际: {modes}"
         assert "copy" not in modes, "丢链接还写 copy，等于骗人"
 
+    # --- 日志里那个 fingerprint 字段（2026-09-22 新增） --------------------- #
+
+    @pytest.mark.asyncio
+    async def test_success_log_carries_fingerprint(self, alog, caplog):
+        """``转发成功`` 必须带指纹，否则去重漏没漏**无从审计**。
+
+        2026-09-22 线上实测：被去重拦下的那 7 个指纹，在日志里**只**出现在
+        「最近已转发过相同内容」这一行 —— 第一次真正转发的那条完全没有痕迹，
+        于是「同一内容到底发出去过几次」根本查不出来。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        msg = src_message("关键词123")
+        with caplog.at_level("INFO"):
+            engine._handle(msg, edited=False)
+            await drain(engine)
+
+        fields = [
+            r.extra_fields
+            for r in caplog.records
+            if getattr(r, "extra_fields", None) and r.getMessage() == "转发成功"
+        ]
+        assert len(fields) == 1, f"转发成功日志条数不对: {len(fields)}"
+        assert fields[0].get("fingerprint") == content_fingerprint(msg), (
+            f"转发成功日志的指纹不对: {fields[0].get('fingerprint')!r}"
+        )
+        assert fields[0]["fingerprint"] != "-", "指纹为空还硬写 '-'，等于没记"
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_ties_success_and_skip_together(self, alog, caplog):
+        """同内容发两遍：一条 ``转发成功`` + 一条 ``跳过``，**指纹必须一致**。
+
+        这才是「拿 grep 数指纹就能判有没有重复」的前提 —— 两边指纹对不上，
+        审计出来的结果是假的。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        other_group = FakeChat(-1007777777777, title="另一个群", chat_type="supergroup")
+
+        with caplog.at_level("INFO"):
+            engine._handle(group_message("关键词123"), edited=False)
+            await drain(engine)
+            engine._handle(
+                make_message("关键词123", message_id=200, chat=other_group), edited=False
+            )
+            await drain(engine)
+
+        assert len(client.forwarded) == 1, "同样的内容不该在目标里出现两遍"
+        by_msg = {}
+        for r in caplog.records:
+            extra = getattr(r, "extra_fields", None)
+            if extra and r.getMessage() in ("转发成功", "最近已转发过相同内容，跳过"):
+                by_msg.setdefault(r.getMessage(), []).append(extra.get("fingerprint"))
+
+        assert len(by_msg.get("转发成功", [])) == 1, by_msg
+        assert len(by_msg.get("最近已转发过相同内容，跳过", [])) == 1, by_msg
+        sent_fp = by_msg["转发成功"][0]
+        skipped_fp = by_msg["最近已转发过相同内容，跳过"][0]
+        assert sent_fp == skipped_fp, (
+            f"成功那条与跳过那条的指纹对不上（{sent_fp!r} vs {skipped_fp!r}）—— "
+            "按指纹审计重复会得出假结论"
+        )
+
 
 class TestLinkSurvivesTruncation:
     """长正文 + 附带来源链接时，**链接不能被截断吃掉**。
