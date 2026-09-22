@@ -134,7 +134,28 @@ class MinLevelFilter(logging.Filter):
         return record.levelno >= self.min_level
 
 
-def _render_extra(fields: Mapping[str, Any]) -> str:
+def _one_line(text: str) -> str:
+    """把字段值压成单行。
+
+    日志是「一行一条」，值里的换行会把这条记录冲断。实测转发规则的
+    ``keyword`` 是用户写的正则，常常带真换行（例如 ``\\n\\n🎁 奖品内容``），
+    渲染后一条日志断成三行 —— 既读不懂，也没法用 grep/awk 解析。
+
+    只转义真正的控制字符，**不动反斜杠本身**：正则里的 ``\\d``、``\\n``
+    是语义的一部分，双重转义反而更难读。
+    """
+    return text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def render_extra(fields: Mapping[str, Any]) -> str:
+    """把结构化字段渲染成一行 `` key=value key=value``（带前导空格）。
+
+    返回带前导空格是给格式化器直接拼接用的（``base += render_extra(...)``）。
+    对外公开是因为 **Web 面板必须复用同一套渲染**：``runtime._emit_log``
+    原来只把 ``msg`` 推给前端，于是「命中转发规则」看不到 rule/keyword、
+    「Bot API xxx 被拒绝」看不到 description/hint，
+    整个面板只剩半截没法排查的日志。
+    """
     if not fields:
         return ""
     parts = []
@@ -143,6 +164,7 @@ def _render_extra(fields: Mapping[str, Any]) -> str:
             rendered = f"{value:.1f}"
         else:
             rendered = str(value)
+        rendered = _one_line(rendered)
         if len(rendered) > 200:
             rendered = rendered[:200] + "…"
         parts.append(f"{key}={rendered}")
@@ -163,7 +185,7 @@ class PlainFormatter(logging.Formatter):
             f"{record.name}:{record.lineno} "
             f"{record.getMessage()}"
         )
-        base += _render_extra(getattr(record, "extra_fields", {}))
+        base += render_extra(getattr(record, "extra_fields", {}))
         if record.exc_info:
             base += "\n" + self.formatException(record.exc_info)
         if record.stack_info:
@@ -181,7 +203,7 @@ class ColorFormatter(PlainFormatter):
     def format(self, record: logging.LogRecord) -> str:
         account = getattr(record, "account", "-")
         level = record.levelname
-        extra = _render_extra(getattr(record, "extra_fields", {}))
+        extra = render_extra(getattr(record, "extra_fields", {}))
         head = f"{self.formatTime(record)}"
         body = f"[{account}] {record.getMessage()}"
         location = f"{record.name}:{record.lineno}"
@@ -457,5 +479,6 @@ __all__ = [
     "account_logger",
     "configure_logging",
     "get_logger",
+    "render_extra",
     "scrub",
 ]

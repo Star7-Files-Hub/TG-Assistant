@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from tg_assistant.logging_setup import get_logger
+from tg_assistant.logging_setup import get_logger, render_extra
 
 log = get_logger("web.runtime")
 
@@ -605,6 +605,13 @@ class RuntimeManager:
             "logger": record.name,
             "account": getattr(record, "account", None) or "-",
             "msg": record.getMessage(),
+            #: 结构化字段渲染成一行文本，前端直接追加。
+            #: ⚠️ 必须带上：以前只推 ``msg``，于是面板上「命中转发规则」看不到
+            #: rule/keyword、「Bot API xxx 被拒绝」看不到 description/hint ——
+            #: 用户看到的就是一句没有任何线索的「命中转发规则」，
+            #: 排查只能去服务器上翻文件日志。这里复用文件日志的同一套渲染，
+            #: 保证两个界面看到的东西完全一致。
+            "extra": render_extra(getattr(record, "extra_fields", {})).strip(),
         }
         # 保留最近 N 行
         self._recent_logs.append(entry)

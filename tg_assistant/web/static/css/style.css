@@ -1974,3 +1974,7 @@ tr:hover td { background: var(--bg-hover); }
 .cf-isp-threshold { flex: 0 0 auto; color: var(--text-muted); font-size: 12px; }
 .cf-isp-row .badge { margin-left: auto; }
 .cf-isp-reason { padding: 0 10px 4px 70px; color: var(--text-muted); font-size: 12px; }
+
+/* 日志行里的结构化字段（rule / keyword / description / hint 等）。
+   单独降饱和度，让主消息和排查线索一眼可分。 */
+.log-meta { color: var(--text-muted); }

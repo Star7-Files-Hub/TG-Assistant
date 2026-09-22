@@ -31,6 +31,16 @@
         const div = document.createElement('div');
         div.className = 'log-line log-' + (log.level || 'info').toLowerCase();
         div.textContent = `[${log.time}] [${log.account || '-'}] [${log.level}] ${log.msg}`;
+        // 结构化字段单独用一个 span 追加，便于 CSS 调成暗色、
+        // 一眼从「命中转发规则」里扫出 rule 和 keyword。
+        // ⚠️ 必须用 textContent：keyword 是用户写的正则、preview/description
+        //    来自第三方消息与上游 API，拼 innerHTML 就是存储型 XSS。
+        if (log.extra) {
+            const meta = document.createElement('span');
+            meta.className = 'log-meta';
+            meta.textContent = ' ' + log.extra;
+            div.appendChild(meta);
+        }
         logBox.appendChild(div);
         if (logBox.children.length > 1000) logBox.removeChild(logBox.firstChild);
         if (document.getElementById('autoscroll').checked) {
