@@ -399,6 +399,7 @@ def run_cmd(
     web_password: Optional[str],
 ) -> None:
     """启动转发与抢红包（前台运行，Ctrl-C 优雅退出）。"""
+    from .forwarder import ChannelGroupDedupe, CrossAccountDedupe, RecentContentDedupe
     from .runner import MultiRunner
 
     registry = ctx.store.load_registry()
@@ -447,7 +448,21 @@ def run_cmd(
     # runner 提前建好：Web 模式下它会被 create_app 交给 RuntimeManager **接管**
     # （见 RuntimeManager._adopt_external_runner），所以必须早于 create_app 存在。
     # MultiRunner 的构造函数不碰网络、不读 session，提前建没有副作用。
-    runner = MultiRunner(ctx.store, ctx.settings)
+    #
+    # 🔴 三张去重表必须**显式建好交进去**。原来这里只 `MultiRunner(store, settings)`，
+    # pair/recent 两张表默认 None ⇒ ChannelGroupDedupe / RecentContentDedupe
+    # 这两层跨账号去重**整个不生效**，每个 ForwardEngine 只能各自 new 一张
+    # RecentContentDedupe（见 ForwardEngine.__init__ 的 `if self._recent is None`）。
+    # 后果实测：小白 与 SevenStar 都监听「Wakk 研究所 / 鲨鱼影视」，同一条抽奖
+    # 先由 SevenStar 发到目标频道、又由小白发一遍 —— 目标里两条一模一样的重复。
+    # 只有 Web 面板那条路径（RuntimeManager）建了这三张表，CLI 直跑就漏了。
+    runner = MultiRunner(
+        ctx.store,
+        ctx.settings,
+        dedupe=CrossAccountDedupe(),
+        pair_dedupe=ChannelGroupDedupe(),
+        recent_dedupe=RecentContentDedupe(),
+    )
     run_options = {
         "heartbeat": heartbeat,
         "restart_delay": restart_delay,
