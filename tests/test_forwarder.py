@@ -1906,6 +1906,24 @@ class TestHeartbeatSurfacesNewCounters:
         assert captured["pair_deduped"] == 5
         assert captured["pair_superseded"] == 1
 
+    def test_heartbeat_includes_gate_counter(self, paths, client, alog):
+        """「同内容 + 同目标」串行闸门挡下的次数也必须进心跳。
+
+        这个数字 ``>0`` 是**唯一**能证明「并发抢跑真的发生过、而且确实被拦住了」的口径
+        —— 闸门本身不逐条打日志，而它修的正是 2026-09-23 那 6 个重复指纹的根因。
+        """
+        runner = AccountRunner(AccountRecord(name="acc-a"), build_config(), None, paths)
+        runner.started_at = time.time()
+        runner.forwarder = ForwardEngine(client, build_config(), alog)
+        runner.forwarder._recent.gated = 4
+
+        captured: dict[str, Any] = {}
+        runner.alog = types.SimpleNamespace(info=lambda msg, **kw: captured.update(kw))
+
+        runner._log_heartbeat()
+
+        assert captured["gated"] == 4
+
 
 class TestContentFingerprint:
     """跨会话比对「是不是同一条内容」的指纹。"""

@@ -697,6 +697,10 @@ class AccountRunner:
                     "pair_superseded": snapshot["pair_superseded"],
                     # 目标里**最近已经转发过相同内容**而被跳过的次数。
                     "recent_deduped": snapshot["recent_deduped"],
+                    # 「同内容发往同目标」的**串行闸门**挡下的次数（累计、跨账号共享）。
+                    # 这个数字 >0 就说明确实有过并发抢跑、而且被拦住了 —— 否则
+                    # 「去重到底有没有挡住并发」在日志里没有任何可直接观察的口径。
+                    "gated": (snapshot.get("recent_dedupe") or {}).get("gated", 0),
                     "downgraded": snapshot["downgraded"],
                 }
             )
