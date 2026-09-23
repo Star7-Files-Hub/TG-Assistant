@@ -462,10 +462,61 @@ class RecentContentDedupe:
         #: 目标 -> deque[(时间戳, 指纹)]，左旧右新。
         self._by_target: dict[str, deque] = {}
         self.hits = 0
+        #: 串行闸门：``(指纹, 目标)`` -> ``[asyncio.Lock, 待用计数]``。见 :meth:`gate`。
+        self._gates: dict[tuple[str, str], list] = {}
+        #: 因为闸门串行而**省下来**的重复发送次数（诊断用）。
+        self.gated = 0
 
     @property
     def enabled(self) -> bool:
         return self.limit > 0 or self.ttl > 0
+
+    @contextlib.asynccontextmanager
+    async def gate(self, fingerprint: Optional[str], target: Any):
+        """「同一条内容发往同一个目标」的串行闸门。
+
+        🔴 **为什么必须有它** —— 这是线上实测出来的真 bug，不是理论情况：
+
+        三层去重全是「**先判断、后发送**」，而发送要 ``await``（线上 ``pipeline_ms``
+        实测到过 4.2 秒）。判断和落表之间隔着一个 await，于是两个并发的 handler
+        完全可能**都在对方落表之前通过了判断**：
+
+        - 同一个账号的频道那条与群组那条（两个聊天各起一个 handler，并发跑）；
+        - 两个账号的同内容消息（源消息 id 不同 ⇒ 跨账号去重那颗键不同 ⇒ 都放行）。
+
+        2026-09-23 线上取证（26 小时）实测到 6 个指纹被重复转发，其中
+        ``text:b6fe2d70…`` 是 小白 11:19:37.045、SevenStar 11:19:37.358，
+        两条相距 **0.3 秒** —— 就是这种竞态。
+
+        闸门让「同一内容 + 同一目标」的 handler **排队**执行：先到的发完并落表，
+        后到的再判断时就一定能看到，于是被正常跳过。竞态从根上消失，
+        而不是靠「把窗口调小」。
+
+        ⚠️ 闸门只串行**同内容同目标**：不同指纹、不同目标互不阻塞。
+        没有指纹（既无正文也无媒体）时无从比对，直接放行、不加锁。
+        本表在多账号之间是**共享实例**，所以闸门天然也是跨账号的。
+        """
+        if fingerprint is None:
+            yield
+            return
+        key = (fingerprint, str(target))
+        entry = self._gates.get(key)
+        if entry is None:
+            entry = [asyncio.Lock(), 0]
+            self._gates[key] = entry
+        entry[1] += 1
+        #: 到达时锁已被别人持有 ⇒ 本条曾排队等待，极可能就是「本来会重复」的那条。
+        waited = entry[0].locked()
+        try:
+            async with entry[0]:
+                if waited:
+                    self.gated += 1
+                yield
+        finally:
+            entry[1] -= 1
+            # 没人持有、也没人排队 ⇒ 收掉，别让字典无限长。
+            if entry[1] <= 0 and not entry[0].locked():
+                self._gates.pop(key, None)
 
     def _bucket(self, target: Any) -> deque:
         return self._by_target.setdefault(str(target), deque())
@@ -527,6 +578,8 @@ class RecentContentDedupe:
             "hits": self.hits,
             "limit": self.limit,
             "ttl": self.ttl,
+            #: 曾因闸门排队等待的条数（≈ 本来会重复发送的条数）。
+            "gated": self.gated,
         }
 
 
@@ -1137,43 +1190,133 @@ class ForwardEngine:
         #: 去重窗口。账号内 / 跨账号 / 频道↔群组 三层同源（账号级 ``dedupe_window``）。
         dedupe_ttl = float(self.config.forward.dedupe_window)
         for target in rule.targets:
-            # 跨账号去重：同一条源消息发往**同一个目标**，只允许一个账号发出去。
-            # 键里带目标 ⇒ 必须放在 target 循环里（放 ``_handle`` 会让多个目标共用名额）。
-            # ``claim`` 是同步的、无 await，在事件循环里天然原子 —— 两个账号的 handler
-            # 不可能同时抢到同一个名额。不传共享表时整段跳过（单测 / 离线场景）。
-            if self._shared_dedupe is not None and not self._shared_dedupe.claim(
-                chat_id, ids[0], target, dedupe_ttl
-            ):
-                self.stats["cross_deduped"] += 1
-                self.alog.debug(
-                    "跨账号去重：该消息已由其它账号发往同一目标",
-                    rule=rule.label,
-                    source_chat=chat_title or chat_id,
-                    message_id=ids[0],
-                    target=target,
-                )
-                continue
-
-            # 频道 ↔ 群组 同内容去重。放在跨账号去重**之后**是刻意的：
-            # 顺序反过来的话，一条「因别的账号已发而被跳过」的消息也会在本表留下记录，
-            # 于是随后到达的群组那条会被当成「频道已发过」而顶替掉 —— 消息白丢。
-            decision = _SEND
-            if self._pair_dedupe is not None and fingerprint is not None:
-                decision = self._pair_dedupe.claim(fingerprint, target, kind, dedupe_ttl)
-                if not decision.send:
-                    self.stats["pair_deduped"] += 1
-                    # ⚠️ 名额要退：本账号不发这条，别把跨账号名额也一起占死。
-                    self._release_claim(chat_id, ids[0], target)
-                    self.alog.info(
-                        "同内容去重：该内容已由群组发往同一目标，跳过频道这条",
+            # 🔴 串行闸门：同一条内容发往同一个目标，同一时刻只允许一个 handler 在跑。
+            # 三层去重都是「先判断、后发送」，而发送要 await；判断与落表之间的那个
+            # 窗口足以让并发的两条（同账号的频道+群组、或两个账号的同内容消息）
+            # **都通过判断**。线上实测 6 个指纹被重复转发，最近的一对只差 0.3 秒。
+            # 进闸门后先到的发完并落表，后到的再判断就一定看得见 ⇒ 竞态从根上消失。
+            async with self._recent.gate(fingerprint, target):
+                # 跨账号去重：同一条源消息发往**同一个目标**，只允许一个账号发出去。
+                # 键里带目标 ⇒ 必须放在 target 循环里（放 ``_handle`` 会让多个目标共用名额）。
+                # ``claim`` 是同步的、无 await，在事件循环里天然原子 —— 两个账号的 handler
+                # 不可能同时抢到同一个名额。不传共享表时整段跳过（单测 / 离线场景）。
+                if self._shared_dedupe is not None and not self._shared_dedupe.claim(
+                    chat_id, ids[0], target, dedupe_ttl
+                ):
+                    self.stats["cross_deduped"] += 1
+                    self.alog.debug(
+                        "跨账号去重：该消息已由其它账号发往同一目标",
                         rule=rule.label,
                         source_chat=chat_title or chat_id,
-                        source_kind=kind,
+                        message_id=ids[0],
+                        target=target,
+                    )
+                    continue
+
+                # 频道 ↔ 群组 同内容去重。放在跨账号去重**之后**是刻意的：
+                # 顺序反过来的话，一条「因别的账号已发而被跳过」的消息也会在本表留下记录，
+                # 于是随后到达的群组那条会被当成「频道已发过」而顶替掉 —— 消息白丢。
+                decision = _SEND
+                if self._pair_dedupe is not None and fingerprint is not None:
+                    decision = self._pair_dedupe.claim(fingerprint, target, kind, dedupe_ttl)
+                    if not decision.send:
+                        self.stats["pair_deduped"] += 1
+                        # ⚠️ 名额要退：本账号不发这条，别把跨账号名额也一起占死。
+                        self._release_claim(chat_id, ids[0], target)
+                        self.alog.info(
+                            "同内容去重：该内容已由群组发往同一目标，跳过频道这条",
+                            rule=rule.label,
+                            source_chat=chat_title or chat_id,
+                            source_kind=kind,
+                            message_id=ids[0],
+                            target=target,
+                            fingerprint=fingerprint,
+                        )
+                        continue
+                    # 🔴 「群组顶替频道」要撤的那条**故意推迟到发送成功之后**去撤
+                    # （见下面「发送成功」那段）。原来是在这里先撤回、再发群组那条，
+                    # 线上实测踩了坑：群里那条把频道那条撤掉之后**自己发送失败**
+                    # （09-22 20:09:19「转发到 -1002626018568 被 Telegram 拒绝」）
+                    # ⇒ 目标里一条都不剩，而 `_withdraw_superseded` 顺手把「最近发过」
+                    # 记录也摘了 ⇒ 下一条同内容的消息又被当成新的发了一遍（20:09:27 重复）。
+                    # 改成「先发成功、再撤旧的」之后：新的发失败就什么都不撤，目标里始终
+                    # 留着旧那条 —— 既不丢、也不重。
+
+                # 「最近已转发过的内容」。
+                # ⚠️ 两个例外：
+                # ① 「群组顶替频道」那一对：旧的频道那条**随后会被撤回**，目标里那一刻
+                #    确实留着内容，但那是**待撤的旧条**，不能拿它把群组这条拦掉
+                #    ⇒ 有 withdraw 时这一层让路（撤回推迟到发送成功后，失败了就保留旧条）。
+                # ② **相册**：同一组里的多条本来就是一个整体，caption 常常一模一样，
+                #    按内容比会把整组砍成一条（剩下的图全丢）。整组只在发送后记一次。
+                if (
+                    not decision.withdraw
+                    and album_id is None
+                    and self._recent.contains(fingerprint, target)
+                ):
+                    self.stats["recent_deduped"] += 1
+                    # ⚠️ 两层名额都要退，否则这条在该目标上会被占死一整个 TTL。
+                    self._release_pair(fingerprint, target)
+                    self._release_claim(chat_id, ids[0], target)
+                    self.alog.info(
+                        "最近已转发过相同内容，跳过",
+                        rule=rule.label,
+                        source_chat=chat_title or chat_id,
                         message_id=ids[0],
                         target=target,
                         fingerprint=fingerprint,
                     )
                     continue
+                try:
+                    sent_ids, actual_mode = await self._send_to_target(
+                        prepared, message, ids, target, variables
+                    )
+                except SessionInvalid:
+                    # 会话已失效 ⇒ 本账号发不出去了，把名额让给别的账号再试。
+                    self._release_pair(fingerprint, target)
+                    self._release_claim(chat_id, ids[0], target)
+                    raise
+                except Exception as exc:
+                    prepared.stats["failed"] += 1
+                    self.stats["failed"] += 1
+                    self.alog.error(
+                        "转发失败",
+                        rule=rule.label,
+                        target=target,
+                        source_chat=chat_title or chat_id,
+                        message_ids=",".join(map(str, ids)),
+                        # 同上：失败也要留指纹，否则「这条内容后来补发成功了吗」串不起来。
+                        fingerprint=fingerprint or "-",
+                        error=f"{type(exc).__name__}: {exc}",
+                        hint=_forward_hint(exc),
+                    )
+                    # ⚠️ **必须退还名额**：`claim` 是先占位后发送，不退的话这个键会在整个 TTL
+                    # （默认 300s）里保持被占 ⇒ 另一个账号也补发不了，这条消息对该目标彻底丢失。
+                    self._release_pair(fingerprint, target)
+                    self._release_claim(chat_id, ids[0], target)
+                    continue
+
+                # 记下这一条发出去生成了哪些消息 id —— 群组那条后到时靠它把频道这条撤回。
+                # 🔴 返回值是「**发送期间**被群组顶替了」：`claim` 与发送之间隔着一个 await
+                # （线上 pipeline_ms 到过 4223ms），群组那条可能就在这个窗口里到达、读不到
+                # 我们的 sent ⇒ 撤不掉。那就由**我们自己**把刚发出去的这条撤回。
+                if self._pair_dedupe is not None and fingerprint is not None and self._pair_dedupe.mark_sent(
+                    fingerprint, target, kind, sent_ids
+                ):
+                    await self._withdraw_superseded(
+                        target,
+                        sent_ids,
+                        rule,
+                        chat_title or chat_id,
+                        ids[0],
+                        fingerprint=fingerprint,
+                    )
+
+                # 🔴 现在才撤回被顶替的**旧**那条（通常是频道那条）：新的一条已经确认
+                # 发出去了，此时撤旧的是安全的 —— 撤失败也还有新的在；撤成功则目标里
+                # 只剩新的那条。顺序上放在 `_recent.add` **之前**：
+                # `_withdraw_superseded` 会把指纹从「最近发过」里摘掉（旧消息没了），
+                # 紧接着的 `add` 又把它记回来（新的在）⇒ 净结果仍是「目标里有这条内容」。
                 if decision.withdraw:
                     await self._withdraw_superseded(
                         target,
@@ -1184,102 +1327,33 @@ class ForwardEngine:
                         fingerprint=fingerprint,
                     )
 
-            # 「最近已转发过的内容」。
-            # ⚠️ 两个例外：
-            # ① 上面那种「群组顶替频道」：那时先前的频道消息**已被撤回**，目标里其实没有
-            #    这条内容 —— 再拦一道会导致群组那条也被跳过 ⇒ 一条都不剩。
-            # ② **相册**：同一组里的多条本来就是一个整体，caption 常常一模一样，
-            #    按内容比会把整组砍成一条（剩下的图全丢）。整组只在发送后记一次。
-            if (
-                not decision.withdraw
-                and album_id is None
-                and self._recent.contains(fingerprint, target)
-            ):
-                self.stats["recent_deduped"] += 1
-                # ⚠️ 两层名额都要退，否则这条在该目标上会被占死一整个 TTL。
-                self._release_pair(fingerprint, target)
-                self._release_claim(chat_id, ids[0], target)
+                prepared.stats["sent"] += 1
+                self.stats["forwarded"] += 1
+                # 记进「最近已转发的内容」—— 之后同样内容的消息直接跳过。
+                self._recent.add(fingerprint, target)
+                for sent_id in sent_ids:
+                    delivered.append((target, sent_id))
+
+                pipeline_ms = _pipeline_ms(message)
                 self.alog.info(
-                    "最近已转发过相同内容，跳过",
+                    "转发成功",
                     rule=rule.label,
+                    # **实际生效**的模式（不是配置里的 `rule.mode`）：源会话受保护时 forward 会
+                    # 降级成复制；复制又失败时还会退成 drop_author 转发（那种情况下**链接是丢的**）。
+                    # 小白靠这一行判断「链接有没有加上」，所以这里必须说真话，不能一律写 copy。
+                    mode=actual_mode,
                     source_chat=chat_title or chat_id,
-                    message_id=ids[0],
                     target=target,
-                    fingerprint=fingerprint,
-                )
-                continue
-            try:
-                sent_ids, actual_mode = await self._send_to_target(
-                    prepared, message, ids, target, variables
-                )
-            except SessionInvalid:
-                # 会话已失效 ⇒ 本账号发不出去了，把名额让给别的账号再试。
-                self._release_pair(fingerprint, target)
-                self._release_claim(chat_id, ids[0], target)
-                raise
-            except Exception as exc:
-                prepared.stats["failed"] += 1
-                self.stats["failed"] += 1
-                self.alog.error(
-                    "转发失败",
-                    rule=rule.label,
-                    target=target,
-                    source_chat=chat_title or chat_id,
                     message_ids=",".join(map(str, ids)),
-                    # 同上：失败也要留指纹，否则「这条内容后来补发成功了吗」串不起来。
+                    # 🔴 必须打指纹：否则「同一内容到底有没有被发过两次」从日志里**查不了** ——
+                    # 2026-09-22 实测，被去重拦下的那 7 个指纹在日志里只出现在「跳过」行里，
+                    # 第一次真正转发的那条完全没有痕迹，等于没法自证去重有没有漏。
+                    # 有了它，`grep fingerprint=xxx` 数出 >1 次就是漏了。
                     fingerprint=fingerprint or "-",
-                    error=f"{type(exc).__name__}: {exc}",
-                    hint=_forward_hint(exc),
+                    sent_ids=",".join(map(str, sent_ids)) or "-",
+                    handler_ms=round((time.perf_counter() - started) * 1000, 1),
+                    pipeline_ms=round(pipeline_ms, 1) if pipeline_ms is not None else "-",
                 )
-                # ⚠️ **必须退还名额**：`claim` 是先占位后发送，不退的话这个键会在整个 TTL
-                # （默认 300s）里保持被占 ⇒ 另一个账号也补发不了，这条消息对该目标彻底丢失。
-                self._release_pair(fingerprint, target)
-                self._release_claim(chat_id, ids[0], target)
-                continue
-
-            # 记下这一条发出去生成了哪些消息 id —— 群组那条后到时靠它把频道这条撤回。
-            # 🔴 返回值是「**发送期间**被群组顶替了」：`claim` 与发送之间隔着一个 await
-            # （线上 pipeline_ms 到过 4223ms），群组那条可能就在这个窗口里到达、读不到
-            # 我们的 sent ⇒ 撤不掉。那就由**我们自己**把刚发出去的这条撤回。
-            if self._pair_dedupe is not None and fingerprint is not None and self._pair_dedupe.mark_sent(
-                fingerprint, target, kind, sent_ids
-            ):
-                await self._withdraw_superseded(
-                    target,
-                    sent_ids,
-                    rule,
-                    chat_title or chat_id,
-                    ids[0],
-                    fingerprint=fingerprint,
-                )
-
-            prepared.stats["sent"] += 1
-            self.stats["forwarded"] += 1
-            # 记进「最近已转发的内容」—— 之后同样内容的消息直接跳过。
-            self._recent.add(fingerprint, target)
-            for sent_id in sent_ids:
-                delivered.append((target, sent_id))
-
-            pipeline_ms = _pipeline_ms(message)
-            self.alog.info(
-                "转发成功",
-                rule=rule.label,
-                # **实际生效**的模式（不是配置里的 `rule.mode`）：源会话受保护时 forward 会
-                # 降级成复制；复制又失败时还会退成 drop_author 转发（那种情况下**链接是丢的**）。
-                # 小白靠这一行判断「链接有没有加上」，所以这里必须说真话，不能一律写 copy。
-                mode=actual_mode,
-                source_chat=chat_title or chat_id,
-                target=target,
-                message_ids=",".join(map(str, ids)),
-                # 🔴 必须打指纹：否则「同一内容到底有没有被发过两次」从日志里**查不了** ——
-                # 2026-09-22 实测，被去重拦下的那 7 个指纹在日志里只出现在「跳过」行里，
-                # 第一次真正转发的那条完全没有痕迹，等于没法自证去重有没有漏。
-                # 有了它，`grep fingerprint=xxx` 数出 >1 次就是漏了。
-                fingerprint=fingerprint or "-",
-                sent_ids=",".join(map(str, sent_ids)) or "-",
-                handler_ms=round((time.perf_counter() - started) * 1000, 1),
-                pipeline_ms=round(pipeline_ms, 1) if pipeline_ms is not None else "-",
-            )
 
         if rule.notify and self.notifier is not None and delivered:
             # 🔴 频道这条**有可能随后被群组那条顶替**，所以给它一个撤回键：
