@@ -1627,8 +1627,13 @@ class ForwardEngine:
                     retries=2,
                     max_flood_wait=60.0,
                 )
-                return _sent_ids(sent), False
-            return _sent_ids(sent), True
+                # ⚠️ **不要**再套一层 ``_sent_ids``：``_server_copy`` 与 ``_server_forward``
+                # **本身就已经返回 ``list[int]``**（它们内部各自提取过一次）。
+                # 对整数列表再取一次 ``.id`` 会得到**空列表** —— 2026-09-24 实测：
+                # ``sent_ids`` 恒为空 ⇒ ① ``delivered`` 空 ⇒ 通知被**静默跳过**
+                # ② ``mark_sent`` 记不下消息 id ⇒ 群组那条后到时撤不掉频道那条。
+                return sent, False
+            return sent, True
 
         try:
             if rule.mode == "forward":
@@ -1761,9 +1766,21 @@ CAPTION_LIMIT = 1024
 
 
 def _sent_ids(sent: Any) -> list[int]:
+    """从 pyrogram 的返回值里取出「发出去生成了哪些消息 id」。
+
+    对**已经是 id 列表**的输入**幂等透传**：上游 helper（``_server_copy`` /
+    ``_server_forward`` / ``_forward_link_note``）返回的就是 ``list[int]``，
+    再取一次 ``.id`` 会得到**空列表** —— 2026-09-24 那个 bug 正是这么发生的
+    （``sent_ids`` 静默变空 ⇒ 通知不推送 + 频道那条撤不掉）。幂等化之后，
+    这类「二次提取」不会再悄悄把 id 吞掉。
+    """
     if sent is None:
         return []
     if isinstance(sent, (list, tuple)):
+        # 空列表 ``all(...)`` 为真 ⇒ 返回 ``[]``，语义一致。
+        # 排除 ``bool``：``isinstance(True, int)`` 为真，但布尔不是消息 id。
+        if all(isinstance(item, int) and not isinstance(item, bool) for item in sent):
+            return list(sent)
         return [item.id for item in sent if getattr(item, "id", None) is not None]
     message_id = getattr(sent, "id", None)
     return [message_id] if message_id is not None else []

@@ -22,6 +22,7 @@ from tg_assistant.forwarder import (
     PreparedRule,
     RecentContentDedupe,
     _pipeline_ms,
+    _sent_ids,
     content_fingerprint,
 )
 from tg_assistant.runner import AccountRunner, MultiRunner
@@ -1084,6 +1085,132 @@ class TestDeliveryModeIsHonest:
             f"成功那条与跳过那条的指纹对不上（{sent_fp!r} vs {skipped_fp!r}）—— "
             "按指纹审计重复会得出假结论"
         )
+
+
+class TestCopyPathReportsSentIds:
+    """🔴 2026-09-24：copy 路径的 ``sent_ids`` 恒为空 ⇒ 通知被**静默跳过**。
+
+    ``_copy_with_fallback`` 曾对**已经是 ``list[int]``** 的返回值再套一次
+    :func:`_sent_ids`，而它对整数列表取 ``.id`` 会得到 ``[]``。后果有两层：
+
+    1. ``delivered`` 为空 ⇒ ``if rule.notify and ... and delivered`` 不成立
+       ⇒ **通知不推送**。线上实测：09-24 15:14:19 那条 ``copy(降级)`` 转发成功，
+       同一秒却没有任何通知日志。
+    2. ``mark_sent(..., sent_ids=[])`` 记不下消息 id ⇒ 群组那条后到时
+       **撤不掉频道那条** ⇒ 目标里留下两条重复内容。
+
+    触发条件是「源会话禁止转发」⇒ ``forward`` 撞 ``CHAT_FORWARDS_RESTRICTED``
+    ⇒ 自动降级复制。当时所有规则都是 ``forward``，所以只有降级路径会中招；
+    但任何 ``mode="copy"`` 的规则会**每条**都掉进去。
+
+    为什么原测试没抓到：``_deliver`` 一直把 ``sent_ids`` 用 ``_`` 丢掉，
+    **从没断言过它的内容**。
+    """
+
+    LINK = "https://t.me/c/1111111111/100"
+
+    async def _deliver(self, alog, client, *, mode: str, notify: bool = False):
+        engine = ForwardEngine(client, build_config(mode=mode, notify=notify), alog)
+        engine.register()
+        message = src_message("关键词123")
+        prepared = engine.rules[0]
+        return await engine._send_to_target(
+            prepared, message, [message.id], DST, {"link": self.LINK}
+        )
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_returns_the_sent_message_id(self, alog):
+        client = FakeClient()
+        before = client.next_message_id
+        sent_ids, actual = await self._deliver(alog, client, mode="copy")
+
+        assert actual == "copy"
+        assert sent_ids == [before + 1], (
+            f"copy 成功必须回传新消息 id，实际 {sent_ids!r} —— "
+            "空列表会让通知被跳过、频道那条撤不掉"
+        )
+
+    @pytest.mark.asyncio
+    async def test_downgraded_copy_returns_the_sent_message_id(self, alog):
+        """``forward`` 撞受保护源会话 ⇒ 降级复制，id 同样必须传出来。"""
+        client = FakeClient(forward_error_once=ChatForwardsRestricted(value=RESTRICTED))
+        before = client.next_message_id
+        sent_ids, actual = await self._deliver(alog, client, mode="forward")
+
+        assert actual == "copy(降级)"
+        assert len(client.sent) == 1
+        assert sent_ids == [before + 1], (
+            f"降级复制同样必须回传 id，实际 {sent_ids!r} —— "
+            "线上 09-24 15:14 那条就是这里空掉、通知跟着没了"
+        )
+
+    @pytest.mark.asyncio
+    async def test_copy_mode_still_submits_a_notification(self, alog):
+        """copy 模式也必须推送 —— ``delivered`` 空掉时通知被**静默**跳过。"""
+        client = FakeClient()
+        notifier = FakeNotifier()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[], mode="copy", notify=True),
+            alog,
+            notifier=notifier,
+        )
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.sent) == 1, "前提：copy 模式确实发出去了一条"
+        assert len(notifier.submitted) == 1, (
+            "copy 模式没有提交通知 ⇒ sent_ids 为空导致 delivered 为空"
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_copy_is_withdrawn_when_the_group_version_arrives(self, alog):
+        """copy 出去的频道那条，被群组那条顶替时**必须撤得掉**。
+
+        撤不掉就留下两条重复内容 —— 这是 copy 路径 ``sent_ids`` 空掉的第二个后果。
+        """
+        pair = ChannelGroupDedupe()
+        client = FakeClient()
+        engine = ForwardEngine(
+            client, build_config(sources=[], mode="copy"), alog, pair_dedupe=pair
+        )
+
+        before = client.next_message_id
+        engine._handle(channel_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.sent) == 1, "copy 模式：重发一条新消息（链接写在正文里）"
+        channel_sent = [before + 1]
+
+        engine._handle(group_message("关键词123", message_id=200), edited=False)
+        await drain(engine)
+
+        assert len(client.sent) == 2, "群组那条也要发出去"
+        assert [call["message_ids"] for call in client.deleted] == [channel_sent], (
+            "copy 路径的 sent_ids 为空 ⇒ 记不下频道那条的 id ⇒ 群组后到时撤不掉它 "
+            "⇒ 目标里留下两条重复内容"
+        )
+        assert engine.stats["pair_superseded"] == 1
+
+
+class TestSentIdsExtraction:
+    """``_sent_ids`` 对**已经是 id 列表**的输入必须幂等。"""
+
+    def test_id_list_passes_through(self):
+        assert _sent_ids([4447, 4448]) == [4447, 4448], "已是 id 列表 ⇒ 原样透传"
+
+    def test_empty_and_none(self):
+        assert _sent_ids([]) == []
+        assert _sent_ids(None) == []
+
+    def test_objects_are_unwrapped(self):
+        assert _sent_ids(types.SimpleNamespace(id=7)) == [7]
+        assert _sent_ids(
+            [types.SimpleNamespace(id=1), types.SimpleNamespace(id=2)]
+        ) == [1, 2]
+
+    def test_objects_without_id_are_skipped(self):
+        assert _sent_ids([types.SimpleNamespace(id=1), types.SimpleNamespace(id=None)]) == [1]
 
 
 class TestLinkSurvivesTruncation:
