@@ -761,6 +761,18 @@ class RegGrabDetect(StrictModel):
     code_pattern: Optional[str] = None
     #: 正文预筛正则：命中任意一条才去提取（为空表示不预筛，直接试提取）。
     text_patterns: list[str] = Field(default_factory=list)
+    #: 「注册码已被使用」通知的正则，**第一个捕获组**是被遮罩的码。
+    #:
+    #: 形如 ``🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░``：
+    #: 尾部被遮罩，只有前几位可见。用它反查「这个码是不是已经被人用了」——
+    #: 已经被用掉的码再抢就是白跑一趟，还会在群里留下脚本痕迹。
+    #:
+    #: ⚠️ 捕获组必须以字母数字开头（``[A-Za-z0-9]``）：这句通知里 ``使用`` 出现两次，
+    #: 标题里的「注册码使用 - jf」会先被匹配上，用 ``\S+`` 就会把那个 ``-`` 当成码。
+    used_pattern: Optional[str] = r"使用[了]?\s*([A-Za-z0-9][^\s，。、]*)"
+    #: 使用通知里可见部分至少要有这么多位才拿来做比对。
+    #: 只露出 1~2 位时几乎任何码都能「对得上」，宁可放过也不能误杀。
+    used_min_len: int = Field(default=3, ge=1, le=32)
     #: 忽略自己发的消息。
     ignore_self: bool = True
     #: 只处理机器人发的消息。
@@ -775,7 +787,7 @@ class RegGrabDetect(StrictModel):
             return [value]
         return value
 
-    @field_validator("code_pattern", mode="before")
+    @field_validator("code_pattern", "used_pattern", mode="before")
     @classmethod
     def _blank(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
@@ -788,6 +800,8 @@ class RegGrabDetect(StrictModel):
             _check_regex(pattern, "reg_grab.detect.text_patterns")
         if self.code_pattern:
             _check_regex(self.code_pattern, "reg_grab.detect.code_pattern")
+        if self.used_pattern:
+            _check_regex(self.used_pattern, "reg_grab.detect.used_pattern")
         return self
 
 
@@ -811,9 +825,14 @@ class RegGrabConfig(StrictModel):
     #: 步骤链，按顺序执行。
     steps: list[RegGrabStep] = Field(default_factory=list)
     #: 动手前的固定延迟（秒）。
-    delay: float = Field(default=0.0, ge=0.0, le=60.0)
-    #: 附加随机抖动（秒），躲避「整齐一致」的机器人特征。
-    jitter: float = Field(default=0.0, ge=0.0, le=10.0)
+    delay: float = Field(default=0.5, ge=0.0, le=60.0)
+    #: 附加随机抖动（秒）：实际延迟 = ``delay`` + ``random(0, jitter)``。
+    #:
+    #: 默认给一点（0.5~2 秒），原因有两个：
+    #: 1. 秒回是最显眼的脚本特征，随机延迟能把它磨掉；
+    #: 2. 这段等待正好是「使用通知」的检测窗口 —— 真被别人抢了，
+    #:    通知会在这期间冒出来，链还没开始就能刹车（见 ``_is_used``）。
+    jitter: float = Field(default=1.5, ge=0.0, le=10.0)
     #: 同一个注册码在这个时间窗内只处理一次（秒）。同一条码被多个群转发出来时，
     #: 靠它避免重复抢。
     code_ttl: float = Field(default=3600.0, ge=0.0, le=86400.0)

@@ -595,6 +595,16 @@ class RuntimeManager:
             return set()
         return {snapshot.get("account") for snapshot in self._runner.snapshot()}
 
+    def running_runner(self, name: str) -> Any:
+        """某个账号**当前运行中**的 runner；没在跑就返回 ``None``。
+
+        给「试发通知」这类需要复用已登录实例的接口用 —— 自己去建一个 client
+        会跟正在跑的那个抢同一个 ``.session`` 文件。
+        """
+        if self._runner is None:
+            return None
+        return getattr(self._runner, "runners", {}).get(name)
+
     # ------------------------------------------------------------------ #
     # 日志广播
     def _emit_log(self, record: logging.LogRecord) -> None:

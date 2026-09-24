@@ -15,6 +15,11 @@
 4. 同一条注册码在 ``code_ttl`` 内只处理一次 —— 同一条码经常被多个群同时转发出来，
    不去重就会把同一个码抢好几遍。
 
+5. 「使用通知」反查：群里常有人用掉码之后由机器人播报
+   ``🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░``。
+   尾部被遮罩、只有前几位可见，但足够把**已经用掉的码**认出来 —— 命中的码直接剔除，
+   不跑步骤链，也不发通知（见 :func:`_is_used`）。
+
 关于「目标会话」的默认值：链上维护一个 ``chain_target``，初始是**注册码所在的会话**；
 ``send`` 执行完会把它更新成刚刚发送到的会话。这样「发 /bind 给机器人 → 等机器人回执」
 这种最常见的链，只有第一步需要写会话，后面的 ``wait_reply`` / ``click`` 自动跟着走。
@@ -155,6 +160,38 @@ def step_label(step: RegGrabStep) -> str:
     return step.name.strip() or REG_GRAB_STEP_LABELS.get(step.type, step.type)
 
 
+#: 遮罩字符：使用通知里的码尾部会被 ``░▒▓*•`` 之类盖掉。
+#: 只剥**结尾**那一段（遮罩都在尾部），不碰中间 —— 免得把
+#: ``..._f1t░░░abc`` 这种奇怪格式硬拼成一个不存在的码。
+_MASK_TAIL = re.compile(r"[^A-Za-z0-9]+$")
+
+
+def visible_code_part(token: str) -> str:
+    """从使用通知里那个被遮罩的码中取出**可见部分**。
+
+    ``MSKY-30-Register_f1t░░░░░░░`` → ``MSKY-30-Register_f1t``
+
+    没有遮罩时原样返回（通知偶尔会印完整码）。
+    """
+    return _MASK_TAIL.sub("", (token or "").strip())
+
+
+def code_value_of(token: str) -> str:
+    """取码的**值**部分 —— 最后一个 ``_`` 之后那一段（统一小写）。
+
+    两边必须按同一口径切，否则永远比不上：
+
+    * 通知里是 ``MSKY-30-Register_f1t``，值是 ``f1t``；
+    * 配置里的 ``code_pattern`` 通常只抓 ``f1tAbCdEfGh``，值就是它本身；
+      没写捕获组时抓到 ``Register_f1tAbCdEfGh``，切完同样是 ``f1tAbCdEfGh``。
+
+    这个口径假设「码的值里不含 ``_``」（``MSKY-30-Register_<10位字母数字>``
+    这种格式成立）。若某天码里真的带下划线，``used_pattern`` 换成能直接圈出
+    值部分的正则即可。
+    """
+    return (token or "").rsplit("_", 1)[-1].strip().lower()
+
+
 # --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
@@ -196,6 +233,12 @@ class RegGrabHunter:
             re.compile(step.pattern) if step.type == "wait_reply" and step.pattern else None
             for step in self._steps
         ]
+        #: 「注册码已被使用」通知的正则（``None`` = 不做这项判定）。
+        self._used_pattern: Optional[re.Pattern[str]] = (
+            re.compile(self.config.detect.used_pattern)
+            if self.config.detect.used_pattern
+            else None
+        )
 
         self._bus = ChatEventBus()
         self._handlers: list[tuple[Any, int]] = []
@@ -203,6 +246,9 @@ class RegGrabHunter:
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
         #: 注册码 → 最近一次处理时间，用来避免同一条码被重复抢。
         self._seen_codes: dict[str, float] = {}
+        #: 「已被使用的码值」→ 记录时间。使用通知里只有前几位可见，
+        #: 所以存的是可见前缀；判重时按前缀比对（见 ``_is_used``）。
+        self._used: dict[str, float] = {}
         #: 每个会话最近一条消息，供 ``click`` 在没有 ``wait_reply`` 时兜底找按钮。
         self._recent: dict[int, Any] = {}
         #: ``@username`` → chat_id 的缓存（``wait_reply`` 需要数字 id 才能订阅）。
@@ -217,6 +263,8 @@ class RegGrabHunter:
             "failed": 0,
             "skipped": 0,
             "duplicate_code": 0,
+            "usage_notices": 0,
+            "used_skipped": 0,
             "steps_ok": 0,
             "steps_failed": 0,
         }
@@ -293,10 +341,13 @@ class RegGrabHunter:
             handler_chats=len(chats) or "全部",
             code_pattern=self.config.detect.code_pattern,
             text_patterns=len(self._text_patterns),
+            used_pattern=self.config.detect.used_pattern or "（未启用使用通知判定）",
+            used_min_len=self.config.detect.used_min_len,
             steps=len(self._steps),
             step_chain=" → ".join(step_label(step) for step in self._steps),
             delay_s=self.config.delay,
             jitter_s=self.config.jitter,
+            delay_range_s=f"{self.config.delay:.1f}~{self.config.delay + self.config.jitter:.1f}",
             code_ttl_s=self.config.code_ttl,
             max_concurrency=self.config.max_concurrency,
         )
@@ -332,9 +383,29 @@ class RegGrabHunter:
             self._recent.pop(next(iter(self._recent)), None)
         self._bus.feed(chat_id, message)
 
+        # 「使用通知」要先记下来：它自己提不出码（尾部被遮罩），
+        # 但它决定了**后面出现的码还要不要抢**。
+        self._note_usage(message)
+
         started = time.perf_counter()
         code = self._should_grab(message, chat_id)
         if code is None:
+            return
+
+        _, _, chat_title = chat_identity(message)
+
+        # 群里已经播报过「这个码被用掉了」—— 再抢就是白跑一趟，
+        # 还会在群里多留一次脚本痕迹，直接剔除。
+        used = self._is_used(code)
+        if used is not None:
+            self.stats["used_skipped"] += 1
+            self.alog.info(
+                "该注册码群里已有使用通知，剔除",
+                code=code,
+                used_visible=used,
+                chat=chat_title or chat_id,
+                message_id=getattr(message, "id", None),
+            )
             return
 
         now = time.monotonic()
@@ -355,7 +426,6 @@ class RegGrabHunter:
             self._seen_codes = {k: v for k, v in self._seen_codes.items() if v > cutoff}
 
         self.stats["detected"] += 1
-        _, _, chat_title = chat_identity(message)
         message_id = getattr(message, "id", None)
         self.alog.info(
             "发现注册码",
@@ -409,6 +479,75 @@ class RegGrabHunter:
         return found.group(0)
 
     # ------------------------------------------------------------------ #
+    def _note_usage(self, message: Any) -> None:
+        """记下「注册码已被使用」通知里露出的那几位。
+
+        通知形如 ``🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░``：
+        尾部被遮罩，只留前几位。存进 ``_used`` 供后面的码比对。
+        """
+        if self._used_pattern is None:
+            return
+        text = message_text(message)
+        if not text:
+            return
+
+        min_len = self.config.detect.used_min_len
+        now = time.monotonic()
+        for found in self._used_pattern.finditer(text):
+            token = next((group for group in found.groups() if group), None) or found.group(0)
+            visible = visible_code_part(token)
+            value = code_value_of(visible)
+            if len(value) < min_len:
+                # 只露一两位时几乎任何码都能「对得上」，宁可不记。
+                self.alog.debug(
+                    "使用通知可见位数太少，忽略",
+                    token=visible,
+                    visible=value,
+                    min_len=min_len,
+                )
+                continue
+            is_new = value not in self._used
+            self._used[value] = now
+            self.stats["usage_notices"] += 1
+            if is_new:
+                chat_id, _, chat_title = chat_identity(message)
+                self.alog.info(
+                    "记录注册码使用通知",
+                    visible=visible,
+                    code_prefix=value,
+                    chat=chat_title or chat_id,
+                    message_id=getattr(message, "id", None),
+                )
+
+    def _is_used(self, code: str) -> Optional[str]:
+        """这个码是不是已经出现在使用通知里了？是的话返回匹配到的可见前缀。
+
+        通知里只有前几位可见，所以按**前缀**比对（``code`` 以可见部分开头，
+        或者反过来 —— 通知印了完整码而配置只抓了前几位）。
+        """
+        if not self._used:
+            return None
+
+        min_len = self.config.detect.used_min_len
+        probe = code_value_of(code)
+        if len(probe) < min_len:
+            return None
+
+        now = time.monotonic()
+        ttl = self.config.code_ttl
+        if ttl > 0:
+            cutoff = now - ttl
+            for key in [k for k, seen in self._used.items() if seen < cutoff]:
+                del self._used[key]
+
+        for value in self._used:
+            if len(value) < min_len:
+                continue
+            if probe.startswith(value) or value.startswith(probe):
+                return value
+        return None
+
+    # ------------------------------------------------------------------ #
     async def _run(self, message: Any, code: str, started: float) -> ChainOutcome:
         """执行一条注册码的完整步骤链，返回整条链的结果。"""
         delay = self.config.delay + (
@@ -428,6 +567,18 @@ class RegGrabHunter:
             message_id=getattr(message, "id", None),
         )
         self.stats["started"] += 1
+
+        # 延迟期间群里可能已经冒出使用通知 —— 这段等待正好是个免费的检测窗口：
+        # 真被别人抢了，在这里刹车就行，不必等步骤链跑完才发现白干。
+        used = self._is_used(code)
+        if used is not None:
+            outcome.result = ChainResult.SKIPPED
+            outcome.detail = f"延迟期间群里出现了使用通知（可见 {used}），已放弃"
+            outcome.cost_ms = (time.perf_counter() - started) * 1000
+            self.stats["used_skipped"] += 1
+            self._record(outcome)
+            self._log_outcome(outcome)
+            return outcome
 
         #: 链上的「当前消息」：初始是注册码那条；wait_reply 会把它换成收到的回执。
         current = message
@@ -499,7 +650,8 @@ class RegGrabHunter:
         outcome.detail = self._summarize(outcome)
         self._record(outcome)
         self._log_outcome(outcome)
-        if self.config.notify and self.notifier is not None:
+        # SKIPPED 只记日志不推通知：码已经被别人用掉这种事，推给用户纯属噪音。
+        if self.config.notify and self.notifier is not None and outcome.result is not ChainResult.SKIPPED:
             self._submit_notify(message, outcome)
         return outcome
 
@@ -772,6 +924,9 @@ class RegGrabHunter:
         message = f"抢注{outcome.result.label}：{outcome.result.icon}{outcome.code}"
         if outcome.result is ChainResult.SUCCESS:
             self.alog.info(message, **fields)
+        elif outcome.result is ChainResult.SKIPPED:
+            # 被别人抢先 / 码已被用掉 —— 这是预期内的情况，不是错误。
+            self.alog.info(message, **fields)
         elif outcome.result is ChainResult.PARTIAL:
             self.alog.warning(message, **fields)
         else:
@@ -815,6 +970,7 @@ class RegGrabHunter:
             "pending_tasks": len(self._tasks),
             "watching_chats": self._bus.watching,
             "seen_codes": len(self._seen_codes),
+            "used_codes": len(self._used),
         }
 
 
@@ -825,6 +981,8 @@ __all__ = [
     "StepOutcome",
     "StepResult",
     "button_label",
+    "code_value_of",
     "iter_inline_buttons",
     "step_label",
+    "visible_code_part",
 ]

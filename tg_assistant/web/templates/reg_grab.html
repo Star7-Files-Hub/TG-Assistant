@@ -62,6 +62,21 @@
                     </div>
                 </div>
                 <div class="rg-input-group">
+                    <label>「已被使用」通知正则</label>
+                    <input id="rg-used-pattern" type="text" placeholder="如：使用[了]?\s*([A-Za-z0-9][^\s，。、]*)" />
+                    <p class="rg-hint">
+                        群里播报「<code>🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░</code>」时，
+                        用<b>第一个捕获组</b>圈出那个码。尾部被遮罩没关系 —— 只拿露出来的前几位比对，
+                        对上了就说明这个码已经被用掉，<b>直接剔除、不跑步骤链</b>。
+                        留空 = 不做这项判定。
+                    </p>
+                </div>
+                <div class="rg-input-group">
+                    <label>可见位数至少</label>
+                    <input id="rg-used-min-len" type="number" min="1" max="32" value="3" />
+                    <p class="rg-hint">只露出 1~2 位时几乎任何码都能「对得上」，少于这个位数就不做判定（默认 3 位）。</p>
+                </div>
+                <div class="rg-input-group">
                     <label>拿一条真实消息试试</label>
                     <textarea id="rg-test-text" rows="3" placeholder="把群里那条注册码消息粘进来"></textarea>
                     <div class="rg-test-row">
@@ -107,9 +122,16 @@
             <div class="rg-card-header"><h3>高级设置</h3></div>
             <div class="rg-card-body">
                 <div class="rg-grid">
-                    <div class="rg-input-group"><label>动手前延迟（秒）</label><input id="rg-delay" type="number" value="0" min="0" max="60" step="0.1" /></div>
-                    <div class="rg-input-group"><label>随机抖动（秒）</label><input id="rg-jitter" type="number" value="0" min="0" max="10" step="0.1" /></div>
+                    <div class="rg-input-group">
+                        <label>动手前延迟（秒）</label>
+                        <input id="rg-delay" type="number" value="0.5" min="0" max="60" step="0.1" oninput="renderDelayRange()" />
+                    </div>
+                    <div class="rg-input-group">
+                        <label>随机抖动（秒）</label>
+                        <input id="rg-jitter" type="number" value="1.5" min="0" max="10" step="0.1" oninput="renderDelayRange()" />
+                    </div>
                 </div>
+                <p class="rg-hint" id="rg-delay-range"></p>
                 <div class="rg-grid">
                     <div class="rg-input-group">
                         <label>同码去重窗口（秒）</label>
@@ -121,6 +143,10 @@
                 <div class="rg-grid">
                     <label class="tg-checkbox"><input id="rg-notify" type="checkbox" checked /><span class="tg-checkmark"></span><span>推送通知</span></label>
                     <label class="tg-checkbox"><input id="rg-include-edited" type="checkbox" checked /><span class="tg-checkmark"></span><span>处理编辑事件</span></label>
+                </div>
+                <div class="rg-test-row" style="margin-top:12px;">
+                    <button type="button" class="tg-btn tg-btn-ghost tg-btn-sm" onclick="testNotify()">试发一条抢注通知</button>
+                    <span class="rg-hint" style="margin:0;">按<b>已保存</b>的配置走一遍通知通路，确认机器人收得到</span>
                 </div>
             </div>
         </div>
@@ -239,14 +265,17 @@
         tagFields.forEach(renderTags);
 
         document.getElementById('rg-code-pattern').value = data.detect?.code_pattern || '';
+        document.getElementById('rg-used-pattern').value = data.detect?.used_pattern || '';
+        document.getElementById('rg-used-min-len').value = data.detect?.used_min_len ?? 3;
         document.getElementById('rg-only-bots').value = String(data.detect?.only_from_bots || false);
         document.getElementById('rg-ignore-self').value = String(data.detect?.ignore_self !== false);
-        document.getElementById('rg-delay').value = data.delay || 0;
-        document.getElementById('rg-jitter').value = data.jitter || 0;
+        document.getElementById('rg-delay').value = data.delay ?? 0.5;
+        document.getElementById('rg-jitter').value = data.jitter ?? 1.5;
         document.getElementById('rg-code-ttl').value = data.code_ttl ?? 3600;
         document.getElementById('rg-max-concurrency').value = data.max_concurrency || 1;
         document.getElementById('rg-notify').checked = data.notify !== false;
         document.getElementById('rg-include-edited').checked = data.include_edited !== false;
+        renderDelayRange();
 
         steps = (data.steps || []).map(s => Object.assign({}, s));
         renderSteps();
@@ -429,9 +458,27 @@
         return '';
     }
 
+    // ---- 延迟区间 / 试发通知 ----
+    function renderDelayRange() {
+        const base = num(document.getElementById('rg-delay').value);
+        const jitter = num(document.getElementById('rg-jitter').value);
+        const el = document.getElementById('rg-delay-range');
+        if (base + jitter <= 0) {
+            el.textContent = '⚠️ 当前是「秒回」—— 这是最容易被看出是脚本的特征，建议至少给 0.5~2 秒。';
+            return;
+        }
+        el.textContent = `实际延迟：${base.toFixed(1)} ~ ${(base + jitter).toFixed(1)} 秒随机。`
+            + '这段等待同时也是「已被使用」通知的检测窗口：真被别人抢了，通知会在这期间冒出来，链还没开始就能刹车。';
+    }
+
+    async function testNotify() {
+        const res = await fetch(`/api/config/${currentAccount}/reg_grab/test_notify`, {method: 'POST'});
+        const data = await res.json().catch(() => ({}));
+        toast(res.ok ? (data.detail || '测试通知已提交') : (data.detail || '发送失败'), res.ok);
+    }
+
     // ---- 正则试提取 ----
-    async function testPattern() {
-        const pattern = document.getElementById('rg-code-pattern').value.trim();
+    async function testPattern() {        const pattern = document.getElementById('rg-code-pattern').value.trim();
         const text = document.getElementById('rg-test-text').value;
         const out = document.getElementById('rg-test-result');
         if (!pattern) { out.textContent = '先填提取正则'; return; }
@@ -480,6 +527,8 @@
             detect: {
                 code_pattern: document.getElementById('rg-code-pattern').value.trim() || null,
                 text_patterns: tagInputs.text_patterns,
+                used_pattern: document.getElementById('rg-used-pattern').value.trim() || null,
+                used_min_len: parseInt(document.getElementById('rg-used-min-len').value) || 3,
                 only_from_bots: document.getElementById('rg-only-bots').value === 'true',
                 ignore_self: document.getElementById('rg-ignore-self').value === 'true',
             },

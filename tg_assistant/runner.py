@@ -734,6 +734,10 @@ class AccountRunner:
                     # 同一条码被多个群刷出来时挡下的次数 —— 这个数字能直接说明
                     # code_ttl 去重到底有没有在工作。
                     "rg_dup": snapshot["duplicate_code"],
+                    # 使用通知的判定效果：收到多少条通知、据此剔除了多少个码。
+                    # 「通知收到不少但剔除一直是 0」通常意味着可见位数不够或正则没对上。
+                    "rg_notices": snapshot["usage_notices"],
+                    "rg_used_skip": snapshot["used_skipped"],
                 }
             )
         if self.notifier is not None:

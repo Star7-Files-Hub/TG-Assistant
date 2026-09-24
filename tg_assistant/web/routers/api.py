@@ -874,6 +874,68 @@ async def api_reg_grab_enabled(
     return {"ok": True, "enabled": config.reg_grab.enabled, "ready": config.reg_grab.ready}
 
 
+@router.post("/config/{name}/reg_grab/test_notify")
+async def api_reg_grab_test_notify(
+    name: str,
+    store=Depends(get_store),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """用这个账号配置的机器人发一条测试通知。
+
+    抢注是低频事件，等真抢到一次才知道通知通不通太慢；这里直接把同一条
+    通路（同一个 notifier、同一个 ``reg_grab`` 事件）跑一遍，成没成一目了然。
+    """
+    from tg_assistant.matching import DEFAULT_REG_GRAB_TEMPLATE, render_template
+    from tg_assistant.notify import NotifyTask
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+
+    if not config.notify.enabled:
+        raise HTTPException(
+            status_code=400, detail="通知没启用。请先到「通知设置」里填好机器人 Token 并打开开关。"
+        )
+    if not config.notify.wants("reg_grab"):
+        raise HTTPException(
+            status_code=400,
+            detail="通知事件里没勾「抢注通知」，这类消息不会发出去。请到「通知设置」里勾上。",
+        )
+
+    runner = runtime.running_runner(name)
+    notifier = getattr(runner, "notifier", None) if runner is not None else None
+    if notifier is None:
+        raise HTTPException(
+            status_code=400, detail=f"账号 {name} 当前没在运行，机器人还没起来，发不了测试通知。"
+        )
+
+    variables = {
+        "result_icon": "🧪",
+        "result_text": "测试通知",
+        "code": "TEST-0000-Test_abcdef1234",
+        "cost_ms": 0,
+        "detail": "这是一条测试消息。能看到它，说明抢注结果能通过这个机器人推给你。",
+        "steps": 0,
+        "chain": "-",
+        "chat_title": "测试",
+        "sender": "系统",
+        "text": "试发通知",
+        "link": "",
+    }
+    text = render_template(config.notify.template or DEFAULT_REG_GRAB_TEMPLATE, variables)
+    submitted = notifier.submit(
+        NotifyTask(
+            event="reg_grab",
+            text=text,
+            context={"result": "test", "code": variables["code"], "test": True},
+        )
+    )
+    if not submitted:
+        raise HTTPException(
+            status_code=400, detail="通知没能进队列（可能队列已满或刚被限流），稍后再试。"
+        )
+    return {"ok": True, "detail": "测试通知已提交，去机器人那边看看收到没有。"}
+
+
 # --------------------------------------------------------------------------- #
 # Cloudflare 优选 IP 自动更新
 # --------------------------------------------------------------------------- #

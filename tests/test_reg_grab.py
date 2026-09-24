@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import re
 import time
 
 import pytest
@@ -13,8 +15,10 @@ from tg_assistant.reg_grab import (
     ChainResult,
     RegGrabHunter,
     StepResult,
+    code_value_of,
     iter_inline_buttons,
     step_label,
+    visible_code_part,
 )
 
 from .conftest import (
@@ -117,6 +121,31 @@ class TestConfig:
     def test_invalid_step_button_regex_rejected(self) -> None:
         with pytest.raises(ValidationError, match="正则无效"):
             RegGrabStep(type="click", button="[unclosed")
+
+    def test_used_pattern_must_be_valid_regex(self) -> None:
+        with pytest.raises(ValidationError, match="正则无效"):
+            RegGrabConfig(detect={"code_pattern": PATTERN, "used_pattern": "([unclosed"})
+
+    def test_used_pattern_has_a_default(self) -> None:
+        """开箱即用：不填也能认出「使用了 XXX」这种通知。"""
+        assert RegGrabConfig().detect.used_pattern == r"使用[了]?\s*([A-Za-z0-9][^\s，。、]*)"
+
+    def test_default_used_pattern_skips_the_header_word(self) -> None:
+        """🔴 回归：通知里 ``使用`` 出现两次，标题那个「注册码使用 - jf」不能被抓成码。
+
+        默认正则若写成 ``使用[了]?\\s*(\\S+)``，第一个匹配就是标题里的 ``-``，
+        可见部分为空 —— 虽然会被 ``used_min_len`` 挡掉，但那是撞运气，不是设计。
+        """
+        pattern = re.compile(RegGrabConfig().detect.used_pattern)
+        tokens = [next((g for g in m.groups() if g), m.group(0)) for m in pattern.finditer(USAGE_NOTICE)]
+        assert tokens == ["MSKY-30-Register_f1t░░░░░░░"], tokens
+
+    def test_blank_used_pattern_disables_the_check(self) -> None:
+        assert RegGrabConfig(detect={"used_pattern": "   "}).detect.used_pattern is None
+
+    def test_used_min_len_rejects_zero(self) -> None:
+        with pytest.raises(ValidationError):
+            RegGrabConfig(detect={"used_min_len": 0})
 
     def test_blank_strings_become_none(self) -> None:
         step = RegGrabStep(type="wait", text="   ", button="", pattern="")
@@ -515,6 +544,146 @@ class TestNotify:
 
 
 # --------------------------------------------------------------------------- #
+#: 线上真实形态的使用通知：尾部被遮罩，只露出 3 位。
+USAGE_NOTICE = "🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░"
+
+
+class TestUsageNotice:
+    """「已被使用」通知判定：对得上的码直接剔除。"""
+
+    def test_visible_code_part_strips_trailing_mask(self) -> None:
+        assert visible_code_part("MSKY-30-Register_f1t░░░░░░░") == "MSKY-30-Register_f1t"
+        assert visible_code_part("MSKY-30-Register_f1t。") == "MSKY-30-Register_f1t"
+        # 没有遮罩时原样返回
+        assert visible_code_part("MSKY-30-Register_f1tAbCdEfGh") == "MSKY-30-Register_f1tAbCdEfGh"
+
+    def test_code_value_of_takes_last_segment(self) -> None:
+        """两边必须按同一口径切：通知带前缀、捕获组不带，切完都要落到码值上。"""
+        assert code_value_of("MSKY-30-Register_f1t") == "f1t"
+        assert code_value_of("f1tAbCdEfGh") == "f1tabcdefgh"
+        assert code_value_of("Register_f1tAbCdEfGh") == "f1tabcdefgh"
+
+    def test_notice_is_recorded(self, alog) -> None:
+        hunter = build(rg_config(), alog=alog)
+        hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+
+        assert hunter.stats["usage_notices"] == 1
+        assert hunter._is_used("f1tAbCdEfGh") == "f1t"
+        # 通知本身提不出码（尾部被遮罩），不该被当成一条要抢的码
+        assert hunter.stats["detected"] == 0
+
+    def test_matching_code_is_dropped(self, alog) -> None:
+        client = bot_client()
+        hunter = build(rg_config(), client=client, alog=alog)
+        hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+        hunter._dispatch(rg_message("MSKY-30-Register_f1tAbCdEfGh"), edited=False)
+
+        assert hunter.stats["used_skipped"] == 1
+        assert hunter.stats["detected"] == 0
+        assert client.sent == [], "已经被用掉的码不该再跑步骤链"
+
+    @pytest.mark.asyncio
+    async def test_other_code_still_runs(self, alog) -> None:
+        client = bot_client()
+        hunter = build(rg_config(), client=client, alog=alog)
+        hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+        hunter._dispatch(rg_message("MSKY-30-Register_Ex5I0Fx5Bg"), edited=False)
+        await asyncio.gather(*list(hunter._tasks))
+
+        assert hunter.stats["used_skipped"] == 0
+        assert hunter.stats["success"] == 1
+
+    def test_short_visible_part_is_ignored(self, alog) -> None:
+        """可见位数不够就不判定 —— 只露 1~2 位时几乎任何码都能「对得上」。"""
+        hunter = build(
+            rg_config(detect={"code_pattern": PATTERN, "used_min_len": 5}), alog=alog
+        )
+        hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+
+        assert hunter._is_used("f1tAbCdEfGh") is None
+
+    def test_disabled_when_pattern_blank(self, alog) -> None:
+        hunter = build(rg_config(detect={"code_pattern": PATTERN, "used_pattern": None}), alog=alog)
+        hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+
+        assert hunter.stats["usage_notices"] == 0
+        assert hunter._is_used("f1tAbCdEfGh") is None
+
+    @pytest.mark.asyncio
+    async def test_notice_during_delay_aborts_chain(self, alog) -> None:
+        """反脚本延迟正好是检测窗口：延迟期间冒出通知，链在第一步之前就刹车。"""
+        client = bot_client()
+        hunter = build(rg_config(delay=0.2, jitter=0), client=client, alog=alog)
+
+        async def feed_notice() -> None:
+            await asyncio.sleep(0.05)
+            hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+
+        feeder = asyncio.create_task(feed_notice())
+        outcome = await hunter._run(
+            rg_message("MSKY-30-Register_f1tAbCdEfGh"), "f1tAbCdEfGh", time.perf_counter()
+        )
+        await feeder
+
+        assert outcome.result is ChainResult.SKIPPED
+        assert "使用通知" in outcome.detail
+        assert client.sent == []
+        assert hunter.stats["used_skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_does_not_notify(self, alog) -> None:
+        """码被别人用掉是预期内的事，推给用户纯属噪音。"""
+        notifier = FakeNotifier()
+        client = bot_client()
+        hunter = build(
+            rg_config(delay=0.2, jitter=0), client=client, alog=alog, notifier=notifier
+        )
+
+        async def feed_notice() -> None:
+            await asyncio.sleep(0.05)
+            hunter._dispatch(rg_message(USAGE_NOTICE), edited=False)
+
+        feeder = asyncio.create_task(feed_notice())
+        await hunter._run(
+            rg_message("MSKY-30-Register_f1tAbCdEfGh"), "f1tAbCdEfGh", time.perf_counter()
+        )
+        await feeder
+
+        assert notifier.tasks == []
+
+
+# --------------------------------------------------------------------------- #
+class TestDelay:
+    """反脚本延迟：默认就该有一点，别秒回。"""
+
+    def test_default_delay_is_not_instant(self) -> None:
+        config = RegGrabConfig()
+        assert config.delay >= 0.5
+        assert config.jitter >= 1.0
+        assert config.delay + config.jitter >= 1.5
+
+    def test_jitter_makes_delay_vary(self) -> None:
+        """两次的延迟不能一模一样 —— 整齐一致本身就是机器人特征。"""
+        seen = {
+            round(
+                RegGrabConfig(delay=0.0, jitter=5.0).delay
+                + random.uniform(0, RegGrabConfig(delay=0.0, jitter=5.0).jitter),
+                6,
+            )
+            for _ in range(20)
+        }
+        assert len(seen) > 1
+
+    @pytest.mark.asyncio
+    async def test_delay_is_honoured(self, alog) -> None:
+        client = bot_client()
+        hunter = build(rg_config(delay=0.15, jitter=0), client=client, alog=alog)
+        started = time.perf_counter()
+        await hunter._run(rg_message(), CODE_VALUE, started)
+        assert time.perf_counter() - started >= 0.15
+
+
+# --------------------------------------------------------------------------- #
 class TestRegistration:
     @pytest.mark.asyncio
     async def test_register_adds_handlers(self, alog) -> None:
@@ -571,6 +740,84 @@ class TestEndToEnd:
         snapshot = hunter.snapshot()
         for key in ("detected", "success", "failed", "duplicate_code", "pending_tasks"):
             assert key in snapshot
+
+
+# --------------------------------------------------------------------------- #
+class TestTestNotifyEndpoint:
+    """「试发通知」接口：把用户会踩的坑都翻译成中文原因，而不是静默失败。"""
+
+    @staticmethod
+    def _app_with_account(tmp_path, **notify_overrides):
+        from tg_assistant.config import AccountRecord, utc_now_iso
+        from tg_assistant.web import create_app
+
+        app = create_app(tmp_path / "data")
+        store = app.state.store
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        config = store.load_account_config("acct", create=True)
+        # ⚠️ 顺序不能反：模型开了 validate_assignment，enabled=True 会立刻校验
+        # 「必须有 bot_token」，所以依赖项要先赋值。
+        config.notify.bot_token = "123456:TEST-TOKEN"
+        config.notify.chat_id = 5608153118
+        config.notify.events = ["forward", "red_packet", "reg_grab"]
+        config.notify.enabled = True
+        for key, value in notify_overrides.items():
+            setattr(config.notify, key, value)
+        store.save_account_config("acct", config)
+        return app, store
+
+    def test_disabled_notify_is_rejected(self, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path, enabled=False)
+        with TestClient(app) as client:
+            res = client.post("/api/config/acct/reg_grab/test_notify")
+        assert res.status_code == 400
+        assert "通知没启用" in res.json()["detail"]
+
+    def test_missing_event_is_rejected(self, tmp_path) -> None:
+        """最常见的坑：机器人配好了，但「抢注通知」那个勾没打。"""
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path, events=["forward"])
+        with TestClient(app) as client:
+            res = client.post("/api/config/acct/reg_grab/test_notify")
+        assert res.status_code == 400
+        assert "抢注通知" in res.json()["detail"]
+
+    def test_not_running_is_rejected(self, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path)
+        with TestClient(app) as client:
+            res = client.post("/api/config/acct/reg_grab/test_notify")
+        assert res.status_code == 400
+        assert "没在运行" in res.json()["detail"]
+
+    def test_submits_through_the_running_notifier(self, tmp_path) -> None:
+        """有实例在跑时走的是同一个 notifier、同一个 reg_grab 事件。"""
+        import types
+
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path)
+        submitted: list[object] = []
+
+        class _Notifier:
+            def submit(self, task: object) -> bool:
+                submitted.append(task)
+                return True
+
+        app.state.runtime.running_runner = lambda name: types.SimpleNamespace(
+            notifier=_Notifier()
+        )
+        with TestClient(app) as client:
+            res = client.post("/api/config/acct/reg_grab/test_notify")
+
+        assert res.status_code == 200, res.text
+        assert len(submitted) == 1
+        assert submitted[0].event == "reg_grab"
+        assert "测试" in submitted[0].text
 
 
 # --------------------------------------------------------------------------- #
