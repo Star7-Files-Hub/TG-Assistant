@@ -370,11 +370,12 @@ class RuntimeManager:
             config = self.store.load_account_config(name, create=False)
         except Exception:  # pragma: no cover - 配置坏了不该拖垮账号列表
             log.warning("读取账号 %s 的配置失败，功能标记按全部关闭处理", name, exc_info=True)
-            return {"cloudflare_ip": False, "notify": False, "red_packet": False}
+            return {"cloudflare_ip": False, "notify": False, "red_packet": False, "reg_grab": False}
         return {
             "cloudflare_ip": bool(config.cloudflare_ip.enabled),
             "notify": bool(config.notify.enabled),
             "red_packet": bool(config.red_packet.enabled),
+            "reg_grab": bool(config.reg_grab.enabled),
         }
 
     def get_account(self, name: str) -> Optional[dict[str, Any]]:

@@ -470,11 +470,14 @@ def _manager_with_configs(monkeypatch: pytest.MonkeyPatch, configs: dict[str, An
     return RuntimeManager(state)
 
 
-def _config(*, cf: bool = False, notify: bool = False, red_packet: bool = False):
+def _config(
+    *, cf: bool = False, notify: bool = False, red_packet: bool = False, reg_grab: bool = False
+):
     return types.SimpleNamespace(
         cloudflare_ip=types.SimpleNamespace(enabled=cf),
         notify=types.SimpleNamespace(enabled=notify),
         red_packet=types.SimpleNamespace(enabled=red_packet),
+        reg_grab=types.SimpleNamespace(enabled=reg_grab),
     )
 
 
@@ -529,6 +532,7 @@ def test_account_status_reports_feature_flags(monkeypatch: pytest.MonkeyPatch) -
         "cloudflare_ip": False,
         "notify": False,
         "red_packet": False,
+        "reg_grab": False,
     }
     assert by_name["SevenStar"]["features"]["cloudflare_ip"] is True
 
@@ -553,6 +557,7 @@ def test_broken_config_does_not_break_the_account_list(
         "cloudflare_ip": False,
         "notify": False,
         "red_packet": False,
+        "reg_grab": False,
     }
 
 

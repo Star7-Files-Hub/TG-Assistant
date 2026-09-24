@@ -56,6 +56,7 @@ from .qr_login import (
     QrRenderer,
 )
 from .red_packet import RedPacketHunter
+from .reg_grab import RegGrabHunter
 from .store import ConfigError, Store, clear_session_files
 
 log = get_logger("runner")
@@ -546,6 +547,7 @@ class AccountRunner:
         self.notifier: Optional[BotNotifier] = None
         self.forwarder: Optional[ForwardEngine] = None
         self.hunter: Optional[RedPacketHunter] = None
+        self.reg_grab: Optional[RegGrabHunter] = None
         self.cf_ip_listener: Optional[Any] = None
         self.bundle: Optional[ClientBundle] = None
         self.started_at: Optional[float] = None
@@ -576,6 +578,7 @@ class AccountRunner:
             workers=self.settings.workers,
             forward_rules=len(self.config.forward.active_rules),
             red_packet=self.config.red_packet.enabled,
+            reg_grab=self.config.reg_grab.enabled,
             notify=self.config.notify.enabled,
         )
 
@@ -624,6 +627,9 @@ class AccountRunner:
         self.hunter = RedPacketHunter(self.client, self.config, self.alog, self.notifier)
         await self.hunter.register()
 
+        self.reg_grab = RegGrabHunter(self.client, self.config, self.alog, self.notifier)
+        await self.reg_grab.register()
+
         # Cloudflare 优选 IP 实时监听
         if self.config.cloudflare_ip.enabled and self.config.cloudflare_ip.real_time_listen:
             from tg_assistant.cf_ip_listener import CFIPListener
@@ -642,8 +648,8 @@ class AccountRunner:
         self.started_at = time.time()
         if not needs_updates:
             self.alog.warning(
-                "当前配置没有任何需要实时监听的功能（转发规则为空且未开启抢红包），"
-                "程序会保持在线但不会做任何事"
+                "当前配置没有任何需要实时监听的功能（转发规则为空、未开启抢红包、"
+                "也未开启抢注任务），程序会保持在线但不会做任何事"
             )
 
     async def stop(self) -> None:
@@ -655,6 +661,8 @@ class AccountRunner:
             await self.forwarder.close()
         if self.hunter is not None:
             await self.hunter.close()
+        if self.reg_grab is not None:
+            await self.reg_grab.close()
         if self.notifier is not None:
             await self.notifier.stop()
         if self.client is not None:
@@ -715,6 +723,19 @@ class AccountRunner:
                     "rp_replied": snapshot["replied"],
                 }
             )
+        if self.reg_grab is not None:
+            snapshot = self.reg_grab.snapshot()
+            fields.update(
+                {
+                    "rg_detected": snapshot["detected"],
+                    "rg_success": snapshot["success"],
+                    "rg_partial": snapshot["partial"],
+                    "rg_failed": snapshot["failed"],
+                    # 同一条码被多个群刷出来时挡下的次数 —— 这个数字能直接说明
+                    # code_ttl 去重到底有没有在工作。
+                    "rg_dup": snapshot["duplicate_code"],
+                }
+            )
         if self.notifier is not None:
             fields.update({f"notify_{k}": v for k, v in self.notifier.stats.items()})
         self.alog.info("心跳", **fields)
@@ -726,6 +747,7 @@ class AccountRunner:
             "uptime_s": round(time.time() - self.started_at) if self.started_at else 0,
             "forward": self.forwarder.snapshot() if self.forwarder else None,
             "red_packet": self.hunter.snapshot() if self.hunter else None,
+            "reg_grab": self.reg_grab.snapshot() if self.reg_grab else None,
             "notify": dict(self.notifier.stats) if self.notifier else None,
         }
 

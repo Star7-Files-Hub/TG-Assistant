@@ -212,6 +212,12 @@ class FakeClient:
         self.callbacks: list[dict[str, Any]] = []
         self.handlers: list[tuple[Any, int]] = []
         self.next_message_id = 9000
+        #: ``get_chat`` 的「@username → 会话」登记表（抢注引擎解析目标会话用）。
+        self.chat_map: dict[str, Any] = {}
+        #: ``get_chat`` 的调用记录。
+        self.chat_lookups: list[Any] = []
+        #: 让 ``get_chat`` 抛错用。
+        self.get_chat_error: Optional[BaseException] = None
 
     # --- handler 管理 ---
     def add_handler(self, handler: Any, group: int = 0) -> tuple[Any, int]:
@@ -274,6 +280,23 @@ class FakeClient:
         self.calls.append(("delete_messages", kwargs))
         ids = kwargs.get("message_ids")
         return len(ids) if isinstance(ids, (list, tuple)) else 1
+
+    async def get_chat(self, chat_id: Any) -> Any:
+        """会话解析替身。
+
+        真实客户端里 ``get_chat("@bot")`` 是一次 API 调用，抢注的 ``wait_reply``
+        必须先把 ``@username`` 解析成数字 id 才能订阅它的消息，所以这里也要能解析。
+        ``chat_map`` 用来登记「@username → chat_id」；数字 id 直接原样返回。
+        """
+        self.chat_lookups.append(chat_id)
+        if self.get_chat_error is not None:
+            raise self.get_chat_error
+        key = str(chat_id)
+        if key in self.chat_map:
+            return self.chat_map[key]
+        if isinstance(chat_id, int):
+            return FakeChat(chat_id, title=str(chat_id))
+        raise ValueError(f"chat {chat_id!r} not found")
 
 
 @pytest.fixture

@@ -326,6 +326,15 @@ DEFAULT_RED_PACKET_TEMPLATE = (
     "{detail}"
 )
 
+DEFAULT_REG_GRAB_TEMPLATE = (
+    "🎯 <b>抢注 {result_icon}{result_text}</b>\n"
+    "群组：{chat_title}\n"
+    "注册码：<code>{code}</code>\n"
+    "耗时：{cost_ms}ms\n"
+    "———\n"
+    "{detail}"
+)
+
 
 class SafeDict(dict):
     """``str.format_map`` 用：未知占位符原样保留，不抛 KeyError。"""
@@ -421,6 +430,7 @@ __all__ = [
     "DEFAULT_FORWARD_TEMPLATE",
     "DEFAULT_NOTIFY_TEMPLATE",
     "DEFAULT_RED_PACKET_TEMPLATE",
+    "DEFAULT_REG_GRAB_TEMPLATE",
     "MAX_TEXT_LENGTH",
     "MatchResult",
     "RefSet",

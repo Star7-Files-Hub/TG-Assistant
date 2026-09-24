@@ -58,6 +58,7 @@
                 <div class="nt-events">
                     <label class="nt-event-card"><input type="checkbox" id="nt-event-forward" checked /><div class="nt-event-info"><strong>转发通知</strong><span>消息被成功转发时推送</span></div></label>
                     <label class="nt-event-card"><input type="checkbox" id="nt-event-red_packet" checked /><div class="nt-event-info"><strong>抢红包通知</strong><span>抢到红包时推送</span></div></label>
+                    <label class="nt-event-card"><input type="checkbox" id="nt-event-reg_grab" checked /><div class="nt-event-info"><strong>抢注通知</strong><span>抢注步骤链跑完后推送结果</span></div></label>
                     <label class="nt-event-card"><input type="checkbox" id="nt-event-error" /><div class="nt-event-info"><strong>错误通知</strong><span>发生错误时推送</span></div></label>
                 </div>
             </div>
@@ -149,9 +150,10 @@
         document.getElementById('nt-silent').checked = ntData.silent || false;
         document.getElementById('nt-use-proxy').checked = ntData.use_proxy !== false;
         document.getElementById('nt-template-group').style.display = (ntData.mode || 'copy') === 'text' ? 'flex' : 'none';
-        const events = ntData.events || ['forward', 'red_packet'];
+        const events = ntData.events || ['forward', 'red_packet', 'reg_grab'];
         document.getElementById('nt-event-forward').checked = events.includes('forward');
         document.getElementById('nt-event-red_packet').checked = events.includes('red_packet');
+        document.getElementById('nt-event-reg_grab').checked = events.includes('reg_grab');
         document.getElementById('nt-event-error').checked = events.includes('error');
     }
     async function toggleNotify() {
@@ -162,6 +164,7 @@
         const events = [];
         if (document.getElementById('nt-event-forward').checked) events.push('forward');
         if (document.getElementById('nt-event-red_packet').checked) events.push('red_packet');
+        if (document.getElementById('nt-event-reg_grab').checked) events.push('reg_grab');
         if (document.getElementById('nt-event-error').checked) events.push('error');
         const payload = {
             enabled: document.getElementById('nt-enabled').checked,

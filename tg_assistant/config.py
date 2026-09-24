@@ -431,8 +431,8 @@ class NotifyConfig(StrictModel):
     #: 静音推送（仍会进历史，但不响铃）。
     silent: bool = False
     #: 需要推送的事件类型。
-    events: list[Literal["forward", "red_packet", "error"]] = Field(
-        default_factory=lambda: ["forward", "red_packet"]
+    events: list[Literal["forward", "red_packet", "reg_grab", "error"]] = Field(
+        default_factory=lambda: ["forward", "red_packet", "reg_grab"]
     )
     #: Bot API 基础地址，可指向自建 Bot API server。
     api_base: str = "https://api.telegram.org"
@@ -662,6 +662,184 @@ class RedPacketConfig(StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# 抢注任务（监听注册码 → 按步骤链自动操作）
+# --------------------------------------------------------------------------- #
+#: 步骤链里支持的动作：
+#:
+#: - ``send``：往指定会话发一条消息，模板支持 ``{code}`` 等变量；
+#: - ``click``：点掉某条消息上的内联按钮（按按钮文字正则匹配）；
+#: - ``wait``：空等若干秒（给机器人留出处理时间）；
+#: - ``wait_reply``：等目标会话的下一条消息，命中正则才算成功。
+RegGrabStepType = Literal["send", "click", "wait", "wait_reply"]
+
+#: 步骤类型的中文名。只用于日志与界面提示，落盘一律用英文 key。
+REG_GRAB_STEP_LABELS: dict[str, str] = {
+    "send": "发送消息",
+    "click": "点击按钮",
+    "wait": "等待",
+    "wait_reply": "等待回复",
+}
+
+
+def _check_regex(pattern: str, field: str) -> None:
+    """配置里的正则写错要在加载时报出来，而不是等到跑起来才炸。"""
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"{field} 正则无效 {pattern!r}: {exc}") from exc
+
+
+class RegGrabStep(StrictModel):
+    """抢注步骤链里的一步。
+
+    ``type`` 决定哪些字段有意义，用不到的字段留空即可 —— 校验只针对当前类型
+    真正需要的那几个字段，这样界面里切换类型时不会因为残留字段报错。
+    """
+
+    type: RegGrabStepType
+    #: 备注。只用于界面和日志里辨认这一步，不影响执行。
+    name: str = ""
+    #: 执行这一步之前的固定等待（秒）。
+    delay: float = Field(default=0.0, ge=0.0, le=600.0)
+    #: 这一步失败时是否继续往下走。默认 False = 立即中止整条链。
+    optional: bool = False
+
+    # ---- send ----
+    #: 目标会话；留空 = 注册码所在的那个会话。支持 id / @username / t.me 链接。
+    chat: Optional[ChatRef] = None
+    #: 发送内容模板。可用变量见 :func:`matching.build_variables`，
+    #: 其中 ``{code}`` 是正则提取出来的注册码。
+    text: Optional[str] = None
+
+    # ---- click ----
+    #: 按钮文字正则（忽略大小写）。在「当前消息」上找，找不到再退回目标会话
+    #: 最近一条带按钮的消息。
+    button: Optional[str] = None
+
+    # ---- wait ----
+    #: 等待秒数。
+    seconds: float = Field(default=0.0, ge=0.0, le=600.0)
+
+    # ---- wait_reply ----
+    #: 判定正则；留空表示收到任意新消息就算成功。
+    pattern: Optional[str] = None
+    #: 等待超时（秒）。
+    timeout: float = Field(default=15.0, ge=0.0, le=300.0)
+
+    @field_validator("chat", mode="before")
+    @classmethod
+    def _normalize_chat(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return parse_chat_ref(value)
+        return value
+
+    @field_validator("text", "button", "pattern", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: Any) -> Any:
+        """界面里清空一个输入框会提交空串，这里统一当成「没填」。"""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _check(self) -> "RegGrabStep":
+        if self.type == "send" and not (self.text or "").strip():
+            raise ValueError("send 步骤必须填写发送内容")
+        if self.type == "click":
+            if not (self.button or "").strip():
+                raise ValueError("click 步骤必须填写按钮文字")
+            _check_regex(self.button, "reg_grab.steps[].button")
+        if self.type == "wait_reply" and self.pattern:
+            _check_regex(self.pattern, "reg_grab.steps[].pattern")
+        return self
+
+
+class RegGrabDetect(StrictModel):
+    """注册码识别规则。"""
+
+    #: 提取注册码的正则。**第一个捕获组**作为 ``{code}``；没有捕获组时用整个匹配。
+    code_pattern: Optional[str] = None
+    #: 正文预筛正则：命中任意一条才去提取（为空表示不预筛，直接试提取）。
+    text_patterns: list[str] = Field(default_factory=list)
+    #: 忽略自己发的消息。
+    ignore_self: bool = True
+    #: 只处理机器人发的消息。
+    only_from_bots: bool = False
+
+    @field_validator("text_patterns", mode="before")
+    @classmethod
+    def _as_list(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return value
+
+    @field_validator("code_pattern", mode="before")
+    @classmethod
+    def _blank(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _check(self) -> "RegGrabDetect":
+        for pattern in self.text_patterns:
+            _check_regex(pattern, "reg_grab.detect.text_patterns")
+        if self.code_pattern:
+            _check_regex(self.code_pattern, "reg_grab.detect.code_pattern")
+        return self
+
+
+class RegGrabConfig(StrictModel):
+    """抢注任务：监听到符合正则的注册码后，按**步骤链**自动操作。
+
+    与抢红包的区别：红包是「点一下就完事」，抢注是**多步流程** ——
+    典型用法是把 ``/bind {code}`` 发给某个机器人，再等它的回执。
+
+    ⚠️ 这里**故意不校验**「enabled 时必须配好正则和步骤」：``StrictModel`` 开了
+    ``validate_assignment``，而面板的总开关就是 ``config.reg_grab.enabled = True``
+    这种赋值 —— 写成模型级校验会让「先开开关再填内容」直接 500。
+    完整性交给 :attr:`ready` 判断，由 API 与引擎各自给出提示。
+    """
+
+    enabled: bool = False
+    #: 监听的会话；为空表示所有会话。
+    chats: list[ChatRef] = Field(default_factory=list)
+    exclude_chats: list[ChatRef] = Field(default_factory=list)
+    detect: RegGrabDetect = Field(default_factory=RegGrabDetect)
+    #: 步骤链，按顺序执行。
+    steps: list[RegGrabStep] = Field(default_factory=list)
+    #: 动手前的固定延迟（秒）。
+    delay: float = Field(default=0.0, ge=0.0, le=60.0)
+    #: 附加随机抖动（秒），躲避「整齐一致」的机器人特征。
+    jitter: float = Field(default=0.0, ge=0.0, le=10.0)
+    #: 同一个注册码在这个时间窗内只处理一次（秒）。同一条码被多个群转发出来时，
+    #: 靠它避免重复抢。
+    code_ttl: float = Field(default=3600.0, ge=0.0, le=86400.0)
+    #: 并发上限。同一条码内部的步骤是串行的，这里限制的是「同时处理几条码」。
+    max_concurrency: int = Field(default=1, ge=1, le=20)
+    #: 是否推送通知。
+    notify: bool = True
+    #: 也处理消息编辑事件（有些码是通过编辑消息补上的）。
+    include_edited: bool = True
+
+    @field_validator("chats", "exclude_chats", mode="before")
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, (str, int)):
+            value = [value]
+        return _normalize_refs(value)
+
+    @property
+    def ready(self) -> bool:
+        """配置是否完整到能干活：开了开关、有提取正则、且至少一条步骤。"""
+        return bool(self.enabled and self.detect.code_pattern and self.steps)
+
+
+# --------------------------------------------------------------------------- #
 # Cloudflare 优选 IP 自动更新
 # --------------------------------------------------------------------------- #
 #: 支持的运营商标识。落盘和 API 一律用这几个英文 key，
@@ -813,6 +991,7 @@ class AccountConfig(StrictModel):
     forward: ForwardConfig = Field(default_factory=ForwardConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     red_packet: RedPacketConfig = Field(default_factory=RedPacketConfig)
+    reg_grab: RegGrabConfig = Field(default_factory=RegGrabConfig)
     cloudflare_ip: CloudflareIPConfig = Field(default_factory=CloudflareIPConfig)
 
     @classmethod
@@ -825,6 +1004,7 @@ class AccountConfig(StrictModel):
         return (
             bool(self.forward.active_rules)
             or self.red_packet.enabled
+            or self.reg_grab.enabled
             or self.cloudflare_ip.enabled
         )
 
@@ -839,6 +1019,10 @@ class AccountConfig(StrictModel):
             if not self.red_packet.chats:
                 return []
             chats.extend(self.red_packet.chats)
+        if self.reg_grab.enabled:
+            if not self.reg_grab.chats:
+                return []
+            chats.extend(self.reg_grab.chats)
         deduped: list[ChatRef] = []
         for chat in chats:
             if chat not in deduped:

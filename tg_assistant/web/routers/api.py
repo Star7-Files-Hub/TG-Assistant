@@ -278,7 +278,7 @@ def _example_config() -> Any:
                 "bot_token": "${TGA_BOT_TOKEN}",
                 "chat_id": 0,
                 "mode": "copy",
-                "events": ["forward", "red_packet"],
+                "events": ["forward", "red_packet", "reg_grab"],
             },
             "red_packet": {
                 "enabled": False,
@@ -295,6 +295,30 @@ def _example_config() -> Any:
                     "only_on_success": True,
                     "delay_range": [0.8, 2.5],
                 },
+            },
+            "reg_grab": {
+                "enabled": False,
+                "chats": [],
+                "detect": {
+                    # 示例：MSKY-30-Register_XXXXXXXXXX 这类注册码，捕获组就是要的码
+                    "code_pattern": r"(?:Register|Renew|Whitelist)_([A-Za-z0-9]{10})",
+                    "text_patterns": [],
+                },
+                "steps": [
+                    {
+                        "type": "send",
+                        "name": "把码发给机器人",
+                        "chat": "@example_bot",
+                        "text": "/bind {code}",
+                    },
+                    {"type": "wait", "name": "等它处理", "seconds": 1.5},
+                    {
+                        "type": "wait_reply",
+                        "name": "看回执",
+                        "pattern": "成功|失败|已使用",
+                        "timeout": 15,
+                    },
+                ],
             },
         }
     )
@@ -788,6 +812,66 @@ async def api_red_packet_enabled(
     config.red_packet.enabled = bool(payload.get("enabled", False))
     store.save_account_config(name, config)
     return {"ok": True, "enabled": config.red_packet.enabled}
+
+
+# --------------------------------------------------------------------------- #
+# 抢注任务
+# --------------------------------------------------------------------------- #
+@router.get("/config/{name}/reg_grab")
+async def api_reg_grab_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False).reg_grab
+    data = config.model_dump(mode="json")
+    # 面板要拿它来提示「开关开了但还没配好」，不用自己重复一遍判断逻辑。
+    data["ready"] = config.ready
+    return data
+
+
+@router.put("/config/{name}/reg_grab")
+async def api_reg_grab_put(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    from tg_assistant.config import RegGrabConfig
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    try:
+        config.reg_grab = RegGrabConfig.model_validate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
+    store.save_account_config(name, config)
+    return {"ok": True, "ready": config.reg_grab.ready}
+
+
+@router.put("/config/{name}/reg_grab/enabled")
+async def api_reg_grab_enabled(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """总开关。
+
+    开启时**拒绝**「还没配好」的配置 —— 否则用户打开开关后什么都不发生，
+    日志里也只有一条容易被忽略的警告，很难判断到底哪里没填。
+    """
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+    enabled = bool(payload.get("enabled", False))
+    if enabled and not config.reg_grab.detect.code_pattern:
+        raise HTTPException(
+            status_code=400,
+            detail="还没填「注册码提取正则」，开了也不会执行。请先填好再打开开关。",
+        )
+    if enabled and not config.reg_grab.steps:
+        raise HTTPException(
+            status_code=400,
+            detail="还没有添加任何步骤，开了也不会执行。请先在「步骤链」里加至少一步。",
+        )
+    config.reg_grab.enabled = enabled
+    store.save_account_config(name, config)
+    return {"ok": True, "enabled": config.reg_grab.enabled, "ready": config.reg_grab.ready}
 
 
 # --------------------------------------------------------------------------- #

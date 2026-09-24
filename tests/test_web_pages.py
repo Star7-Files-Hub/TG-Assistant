@@ -89,6 +89,49 @@ def test_nav_group_is_collapsible(client) -> None:
     body = submenu.group(1)
     assert 'href="/rules"' in body, "转发规则挪出子菜单了"
     assert 'href="/red_packet"' in body, "抢红包挪出子菜单了"
+    assert 'href="/reg_grab"' in body, "抢注任务挪出子菜单了"
+
+
+def test_nav_group_title_aligns_with_main_menu(client) -> None:
+    """分组标题的文字必须和主菜单项的**文字对齐**。
+
+    🔴 坑：主菜单项是「18px 图标 + 10px 间距 + 文字」，文字从 ``12+18+10=40px``
+    处开始；而分组标题原先只有一个裸 ``<span>``，文字从 ``12px`` 开始 ——
+    整整左移 28px，肉眼看就是「监听任务没和主菜单对齐」。所以它必须也带一个
+    同尺寸的前导图标，且不能用 ``space-between`` 把三个子元素均匀撑开。
+    """
+    html = client.get("/").text
+    button = re.search(r'<button[^>]*id="nav-group-listen".*?</button>', html, re.S)
+    assert button is not None, "找不到分组标题按钮"
+    body = button.group(0)
+
+    leading = re.search(r'<svg class="nav-group-leading"', body)
+    assert leading is not None, "分组标题没有前导图标 —— 文字会比主菜单左移一个图标宽度"
+    assert leading.start() < body.index("<span>监听任务</span>"), "前导图标必须在文字前面"
+
+    css_path = Path(tg_assistant.__file__).parent / "web" / "static" / "css" / "style.css"
+    css = css_path.read_text(encoding="utf-8")
+
+    def icon_size(selector: str) -> tuple[str, str]:
+        block = re.search(re.escape(selector) + r"\s*\{(.*?)\}", css, re.S)
+        assert block is not None, f"style.css 里找不到 {selector}"
+        width = re.search(r"width:\s*([^;]+);", block.group(1))
+        height = re.search(r"height:\s*([^;]+);", block.group(1))
+        assert width and height, f"{selector} 没写死宽高"
+        return (width.group(1).strip(), height.group(1).strip())
+
+    assert icon_size(".nav-group-leading") == icon_size(".nav-item svg"), (
+        "前导图标尺寸必须和主菜单图标一致，否则文字仍然对不齐"
+    )
+
+    toggle = re.search(r"\.nav-group-toggle\s*\{(.*?)\}", css, re.S)
+    item = re.search(r"\.nav-item\s*\{(.*?)\}", css, re.S)
+    assert toggle and item
+    assert "gap: 10px" in toggle.group(1), "图标与文字的间距要和主菜单一致"
+    assert "gap: 10px" in item.group(1)
+    assert "space-between" not in toggle.group(1), (
+        "space-between 会把文字从 40px 处撑开，改用 chevron 的 margin-left:auto"
+    )
 
 
 def test_nav_collapsed_class_really_hides_submenu() -> None:
@@ -116,7 +159,16 @@ def test_account_pages_redirect_for_unknown_account(client, app, path: str) -> N
 def test_nav_links_are_present(client) -> None:
     """新增页面的导航入口不能漏。"""
     html = client.get("/").text
-    for href in ["/rules", "/red_packet", "/notify", "/login", "/accounts", "/logs", "/proxy"]:
+    for href in [
+        "/rules",
+        "/red_packet",
+        "/reg_grab",
+        "/notify",
+        "/login",
+        "/accounts",
+        "/logs",
+        "/proxy",
+    ]:
         assert f'href="{href}"' in html, f"导航里缺少 {href}"
 
 

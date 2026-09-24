@@ -1,0 +1,509 @@
+{% extends "base.html" %}
+{% block title %}抢注任务 · TG-Assistant{% endblock %}
+
+{% block content %}
+<div class="rg-page">
+    <div class="rg-header">
+        <div class="rg-header-left">
+            <h1>抢注任务</h1>
+            <p class="text-muted">监听注册码，按步骤链自动操作</p>
+        </div>
+        <div class="rg-header-right">
+            <div class="rg-account-select">
+                <label>账号</label>
+                <select id="account-selector" onchange="switchAccount()">
+                    <option value="">选择账号...</option>
+                </select>
+            </div>
+            <label class="rg-master-toggle">
+                <input type="checkbox" id="rg-enabled" onchange="toggleRegGrab()" />
+                <span class="toggle-slider"></span>
+                <span class="toggle-label">抢注总开关</span>
+            </label>
+        </div>
+    </div>
+
+    <div class="rg-content" id="rg-content" style="display:none;">
+        <div class="rg-warn" id="rg-warn" style="display:none;"></div>
+
+        <!-- 监听会话 -->
+        <div class="rg-card">
+            <div class="rg-card-header"><h3>监听会话</h3><p>留空表示监听全部会话</p></div>
+            <div class="rg-card-body">
+                <div class="tag-input" id="rg-chats-input">
+                    <div class="tag-list" id="rg-chats-list"></div>
+                    <input type="text" id="rg-chats-field" placeholder="输入群组 ID 或 @username，按回车添加" />
+                </div>
+                <div class="rg-input-group" style="margin-top:12px;">
+                    <label>排除会话</label>
+                    <div class="tag-input" id="rg-exclude-chats-input">
+                        <div class="tag-list" id="rg-exclude-chats-list"></div>
+                        <input type="text" id="rg-exclude-chats-field" placeholder="排除的会话..." />
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 识别规则 -->
+        <div class="rg-card">
+            <div class="rg-card-header"><h3>识别规则</h3><p>从消息里提取注册码</p></div>
+            <div class="rg-card-body">
+                <div class="rg-input-group">
+                    <label>注册码提取正则</label>
+                    <input id="rg-code-pattern" type="text" placeholder="如：(?:Register|Renew)_([A-Za-z0-9]{10})" />
+                    <p class="rg-hint">第一个捕获组就是 <code>{code}</code>；没有捕获组时用整个匹配。多条码的列表消息也能命中。</p>
+                </div>
+                <div class="rg-input-group">
+                    <label>正文预筛正则</label>
+                    <p class="rg-hint">命中任意一条才去提取（留空表示不预筛）</p>
+                    <div class="tag-input" id="rg-text-patterns-input">
+                        <div class="tag-list" id="rg-text-patterns-list"></div>
+                        <input type="text" id="rg-text-patterns-field" placeholder="输入正则，按回车添加" />
+                    </div>
+                </div>
+                <div class="rg-input-group">
+                    <label>拿一条真实消息试试</label>
+                    <textarea id="rg-test-text" rows="3" placeholder="把群里那条注册码消息粘进来"></textarea>
+                    <div class="rg-test-row">
+                        <button type="button" class="tg-btn tg-btn-ghost tg-btn-sm" onclick="testPattern()">测试提取</button>
+                        <span id="rg-test-result" class="rg-hint"></span>
+                    </div>
+                </div>
+                <div class="rg-grid">
+                    <div class="rg-input-group">
+                        <label>只处理机器人发的</label>
+                        <select id="rg-only-bots"><option value="false">否</option><option value="true">是</option></select>
+                    </div>
+                    <div class="rg-input-group">
+                        <label>忽略自己发的消息</label>
+                        <select id="rg-ignore-self"><option value="true">是（推荐）</option><option value="false">否</option></select>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 步骤链 -->
+        <div class="rg-card">
+            <div class="rg-card-header">
+                <h3>步骤链</h3>
+                <p>提取到注册码后，按下面的顺序一步步执行</p>
+            </div>
+            <div class="rg-card-body">
+                <div class="rg-steps" id="rg-steps"></div>
+                <div class="rg-step-add">
+                    <button type="button" class="tg-btn tg-btn-ghost" onclick="addStep()">+ 添加步骤</button>
+                    <button type="button" class="tg-btn tg-btn-ghost" onclick="fillExample()">插入示例链</button>
+                </div>
+                <p class="rg-hint" style="margin-top:10px;">
+                    典型用法：<b>发送消息</b> 把 <code>/bind {code}</code> 发给机器人 →
+                    <b>等待</b> 1~2 秒 → <b>等待回复</b> 接住机器人的回执。
+                    后面的步骤不填会话时，会自动沿用上一步操作的那个会话。
+                </p>
+            </div>
+        </div>
+
+        <!-- 高级设置 -->
+        <div class="rg-card">
+            <div class="rg-card-header"><h3>高级设置</h3></div>
+            <div class="rg-card-body">
+                <div class="rg-grid">
+                    <div class="rg-input-group"><label>动手前延迟（秒）</label><input id="rg-delay" type="number" value="0" min="0" max="60" step="0.1" /></div>
+                    <div class="rg-input-group"><label>随机抖动（秒）</label><input id="rg-jitter" type="number" value="0" min="0" max="10" step="0.1" /></div>
+                </div>
+                <div class="rg-grid">
+                    <div class="rg-input-group">
+                        <label>同码去重窗口（秒）</label>
+                        <input id="rg-code-ttl" type="number" value="3600" min="0" max="86400" step="60" />
+                        <p class="rg-hint">同一条码在这个时间内只抢一次（同一条码常被多个群转发）</p>
+                    </div>
+                    <div class="rg-input-group"><label>并发上限</label><input id="rg-max-concurrency" type="number" value="1" min="1" max="20" step="1" /></div>
+                </div>
+                <div class="rg-grid">
+                    <label class="tg-checkbox"><input id="rg-notify" type="checkbox" checked /><span class="tg-checkmark"></span><span>推送通知</span></label>
+                    <label class="tg-checkbox"><input id="rg-include-edited" type="checkbox" checked /><span class="tg-checkmark"></span><span>处理编辑事件</span></label>
+                </div>
+            </div>
+        </div>
+
+        <div class="rg-save-bar">
+            <button class="tg-btn tg-btn-primary" onclick="saveRegGrab()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                保存设置
+            </button>
+        </div>
+    </div>
+
+    <div class="rg-empty" id="rg-empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777z"/><path d="M15.5 7.5l3 3L22 7l-3-3"/></svg>
+        <h3>请先选择账号</h3>
+        <p>从上方下拉框选择一个账号来配置抢注任务</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let currentAccount = '';
+    //: 步骤链的本地状态。每次改动都写回这里，保存时整体提交。
+    let steps = [];
+    const tagFields = ['chats', 'exclude_chats', 'text_patterns'];
+    const tagInputs = {};
+
+    const STEP_TYPES = [
+        ['send', '发送消息'],
+        ['click', '点击按钮'],
+        ['wait', '等待'],
+        ['wait_reply', '等待回复'],
+    ];
+
+    function init() {
+        tagFields.forEach(f => { tagInputs[f] = []; initTagInput(f); });
+        loadAccounts();
+    }
+
+    // ---- 标签输入（与抢红包页一致） ----
+    function initTagInput(field) {
+        const input = document.getElementById(`rg-${field}-field`);
+        if (!input) return;
+        input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && this.value.trim()) {
+                e.preventDefault();
+                if (!tagInputs[field].includes(this.value.trim())) {
+                    tagInputs[field].push(this.value.trim());
+                    renderTags(field);
+                }
+                this.value = '';
+            }
+            if (e.key === 'Backspace' && !this.value && tagInputs[field].length > 0) {
+                tagInputs[field].pop();
+                renderTags(field);
+            }
+        });
+    }
+
+    function renderTags(field) {
+        const list = document.getElementById(`rg-${field}-list`);
+        if (!list) return;
+        list.innerHTML = tagInputs[field].map((tag, i) =>
+            `<span class="tag">${escapeHtml(tag)}<button onclick="removeTag('${field}', ${i})">&times;</button></span>`
+        ).join('');
+    }
+
+    function removeTag(field, index) { tagInputs[field].splice(index, 1); renderTags(field); }
+
+    //: 放进 HTML 属性里必须连引号一起转义 —— app.js 的 escapeHtml 不管引号，
+    //: 而备注/正则里出现一个 `"` 就会把整个属性截断，页面直接乱掉。
+    function attr(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function num(value) { const n = parseFloat(value); return isNaN(n) ? 0 : n; }
+
+    // ---- 账号 ----
+    async function loadAccounts() {
+        const res = await fetch('/api/accounts');
+        const data = await res.json();
+        const sel = document.getElementById('account-selector');
+        sel.innerHTML = '<option value="">选择账号...</option>';
+        data.accounts.forEach(a => {
+            sel.innerHTML += `<option value="${attr(a.name)}">${escapeHtml(accountOptionText(a))}</option>`;
+        });
+        if (data.accounts.length > 0) {
+            sel.value = pickDefaultAccount(data.accounts, 'reg_grab');
+            switchAccount();
+        }
+    }
+
+    async function switchAccount() {
+        const sel = document.getElementById('account-selector');
+        currentAccount = sel.value;
+        if (!currentAccount) {
+            document.getElementById('rg-content').style.display = 'none';
+            document.getElementById('rg-empty').style.display = 'flex';
+            return;
+        }
+        document.getElementById('rg-content').style.display = 'block';
+        document.getElementById('rg-empty').style.display = 'none';
+        await loadRegGrab();
+    }
+
+    async function loadRegGrab() {
+        const res = await fetch(`/api/config/${currentAccount}/reg_grab`);
+        if (!res.ok) return;
+        const data = await res.json();
+        document.getElementById('rg-enabled').checked = !!data.enabled;
+        tagInputs.chats = [...(data.chats || [])];
+        tagInputs.exclude_chats = [...(data.exclude_chats || [])];
+        tagInputs.text_patterns = [...(data.detect?.text_patterns || [])];
+        tagFields.forEach(renderTags);
+
+        document.getElementById('rg-code-pattern').value = data.detect?.code_pattern || '';
+        document.getElementById('rg-only-bots').value = String(data.detect?.only_from_bots || false);
+        document.getElementById('rg-ignore-self').value = String(data.detect?.ignore_self !== false);
+        document.getElementById('rg-delay').value = data.delay || 0;
+        document.getElementById('rg-jitter').value = data.jitter || 0;
+        document.getElementById('rg-code-ttl').value = data.code_ttl ?? 3600;
+        document.getElementById('rg-max-concurrency').value = data.max_concurrency || 1;
+        document.getElementById('rg-notify').checked = data.notify !== false;
+        document.getElementById('rg-include-edited').checked = data.include_edited !== false;
+
+        steps = (data.steps || []).map(s => Object.assign({}, s));
+        renderSteps();
+        renderWarn(data);
+    }
+
+    //: 开关开着但配置不全时给一条醒目的提示 —— 否则用户会以为功能坏了。
+    function renderWarn(data) {
+        const box = document.getElementById('rg-warn');
+        if (!data.enabled) { box.style.display = 'none'; return; }
+        const missing = [];
+        if (!data.detect?.code_pattern) missing.push('注册码提取正则');
+        if (!(data.steps || []).length) missing.push('至少一条步骤');
+        if (!missing.length) { box.style.display = 'none'; return; }
+        box.innerHTML = `⚠️ 抢注任务已开启，但还缺少：<b>${escapeHtml(missing.join('、'))}</b> —— 补齐前不会执行任何操作。`;
+        box.style.display = 'block';
+    }
+
+    async function toggleRegGrab() {
+        const box = document.getElementById('rg-enabled');
+        const enabled = box.checked;
+        const res = await fetch(`/api/config/${currentAccount}/reg_grab/enabled`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled}),
+        });
+        if (res.ok) {
+            toast(enabled ? '抢注任务已开启' : '抢注任务已关闭', true);
+            await loadRegGrab();
+            return;
+        }
+        // 后端会拒绝「还没配好就开开关」，把原因显示出来并把开关拨回去。
+        const data = await res.json().catch(() => ({}));
+        toast(data.detail || '操作失败', false);
+        box.checked = !enabled;
+    }
+
+    // ---- 步骤链编辑器 ----
+    function stepTypeOptions(current) {
+        return STEP_TYPES.map(([value, label]) =>
+            `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`
+        ).join('');
+    }
+
+    function setStepField(index, key, value) { steps[index][key] = value; }
+
+    function setStepType(index, type) {
+        // 换类型时把上一种类型专属的字段清掉，免得提交时留下互相矛盾的残留值。
+        const step = steps[index];
+        step.type = type;
+        ['chat', 'text', 'button', 'pattern'].forEach(k => { if (k in step) delete step[k]; });
+        if (type === 'wait') step.seconds = num(step.seconds) || 1;
+        if (type === 'wait_reply') step.timeout = num(step.timeout) || 15;
+        renderSteps();
+    }
+
+    function addStep() {
+        steps.push({type: 'send', name: '', delay: 0, optional: false, chat: '', text: ''});
+        renderSteps();
+    }
+
+    function removeStep(index) { steps.splice(index, 1); renderSteps(); }
+
+    function moveStep(index, delta) {
+        const target = index + delta;
+        if (target < 0 || target >= steps.length) return;
+        const [item] = steps.splice(index, 1);
+        steps.splice(target, 0, item);
+        renderSteps();
+    }
+
+    function fillExample() {
+        steps = [
+            {type: 'send', name: '把码发给机器人', delay: 0, optional: false, chat: '@example_bot', text: '/bind {code}'},
+            {type: 'wait', name: '等它处理', delay: 0, optional: false, seconds: 1.5},
+            {type: 'wait_reply', name: '看回执', delay: 0, optional: false, chat: '', pattern: '成功|失败|已使用', timeout: 15},
+        ];
+        renderSteps();
+        toast('已插入示例链，记得把机器人改成你自己的', true);
+    }
+
+    function renderSteps() {
+        const box = document.getElementById('rg-steps');
+        if (!steps.length) {
+            box.innerHTML = '<div class="rg-steps-empty">还没有步骤。点下面的「添加步骤」，或直接「插入示例链」。</div>';
+            return;
+        }
+        box.innerHTML = steps.map((step, i) => stepHtml(step, i)).join('');
+    }
+
+    function stepHtml(step, i) {
+        return `
+        <div class="rg-step">
+            <div class="rg-step-head">
+                <span class="rg-step-no">${i + 1}</span>
+                <select onchange="setStepType(${i}, this.value)">${stepTypeOptions(step.type)}</select>
+                <input type="text" value="${attr(step.name)}" placeholder="备注（可选）"
+                       oninput="setStepField(${i}, 'name', this.value)" />
+                <div class="rg-step-actions">
+                    <button type="button" title="上移" ${i === 0 ? 'disabled' : ''} onclick="moveStep(${i}, -1)">↑</button>
+                    <button type="button" title="下移" ${i === steps.length - 1 ? 'disabled' : ''} onclick="moveStep(${i}, 1)">↓</button>
+                    <button type="button" title="删除" onclick="removeStep(${i})">✕</button>
+                </div>
+            </div>
+            <div class="rg-step-body">
+                ${stepFields(step, i)}
+                <div class="rg-grid">
+                    <div class="rg-input-group">
+                        <label>执行前延迟（秒）</label>
+                        <input type="number" min="0" step="0.1" value="${num(step.delay)}"
+                               oninput="setStepField(${i}, 'delay', num(this.value))" />
+                    </div>
+                    <div class="rg-input-group">
+                        <label>这一步失败时</label>
+                        <select onchange="setStepField(${i}, 'optional', this.value === 'continue')">
+                            <option value="stop" ${step.optional ? '' : 'selected'}>中止整条链</option>
+                            <option value="continue" ${step.optional ? 'selected' : ''}>跳过，继续下一步</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    }
+
+    function stepFields(step, i) {
+        if (step.type === 'send') {
+            return `
+            <div class="rg-input-group">
+                <label>目标会话</label>
+                <input type="text" value="${attr(step.chat)}" placeholder="留空 = 注册码所在的群；也可填 @机器人 或 -100xxx"
+                       oninput="setStepField(${i}, 'chat', this.value)" />
+            </div>
+            <div class="rg-input-group">
+                <label>发送内容</label>
+                <input type="text" value="${attr(step.text)}" placeholder="如：/bind {code}"
+                       oninput="setStepField(${i}, 'text', this.value)" />
+                <p class="rg-hint">可用变量：{code} 注册码、{chat_title} 群名、{sender} 发送者、{text} 原文、{link} 链接</p>
+            </div>`;
+        }
+        if (step.type === 'click') {
+            return `
+            <div class="rg-input-group">
+                <label>目标会话</label>
+                <input type="text" value="${attr(step.chat)}" placeholder="留空 = 上一步操作的那个会话"
+                       oninput="setStepField(${i}, 'chat', this.value)" />
+            </div>
+            <div class="rg-input-group">
+                <label>按钮文字（正则）</label>
+                <input type="text" value="${attr(step.button)}" placeholder="如：领取|确认"
+                       oninput="setStepField(${i}, 'button', this.value)" />
+                <p class="rg-hint">先在「当前消息」上找，找不到再退回该会话最近一条带按钮的消息</p>
+            </div>`;
+        }
+        if (step.type === 'wait') {
+            return `
+            <div class="rg-input-group">
+                <label>等待秒数</label>
+                <input type="number" min="0" step="0.1" value="${num(step.seconds)}"
+                       oninput="setStepField(${i}, 'seconds', num(this.value))" />
+            </div>`;
+        }
+        if (step.type === 'wait_reply') {
+            return `
+            <div class="rg-input-group">
+                <label>目标会话</label>
+                <input type="text" value="${attr(step.chat)}" placeholder="留空 = 上一步操作的那个会话"
+                       oninput="setStepField(${i}, 'chat', this.value)" />
+            </div>
+            <div class="rg-input-group">
+                <label>判定正则</label>
+                <input type="text" value="${attr(step.pattern)}" placeholder="留空 = 收到任意回复就算成功"
+                       oninput="setStepField(${i}, 'pattern', this.value)" />
+                <p class="rg-hint">自己发出去的消息不算回执；命中的那条会成为后续「点击按钮」的当前消息</p>
+            </div>
+            <div class="rg-input-group">
+                <label>超时（秒）</label>
+                <input type="number" min="0" step="1" value="${num(step.timeout) || 15}"
+                       oninput="setStepField(${i}, 'timeout', num(this.value) || 15)" />
+            </div>`;
+        }
+        return '';
+    }
+
+    // ---- 正则试提取 ----
+    async function testPattern() {
+        const pattern = document.getElementById('rg-code-pattern').value.trim();
+        const text = document.getElementById('rg-test-text').value;
+        const out = document.getElementById('rg-test-result');
+        if (!pattern) { out.textContent = '先填提取正则'; return; }
+        if (!text.trim()) { out.textContent = '先粘一条消息进来'; return; }
+        const res = await fetch('/api/rules/test', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({pattern, text, mode: 'regex', ignore_case: true}),
+        });
+        const data = await res.json();
+        if (data.error) { out.textContent = data.error; return; }
+        if (!data.match) { out.textContent = '❌ 没匹配上'; return; }
+        const code = (data.groups && data.groups.length) ? data.groups[0] : data.full_match;
+        out.textContent = `✅ 提取到：${code}`;
+    }
+
+    // ---- 保存 ----
+    function cleanStep(step) {
+        // 只提交当前类型用得上的字段：既避免残留值互相矛盾，也让校验报错更准。
+        const base = {
+            type: step.type,
+            name: step.name || '',
+            delay: num(step.delay),
+            optional: !!step.optional,
+        };
+        if (step.type === 'send') {
+            base.chat = step.chat || null;
+            base.text = step.text || null;
+        } else if (step.type === 'click') {
+            base.chat = step.chat || null;
+            base.button = step.button || null;
+        } else if (step.type === 'wait') {
+            base.seconds = num(step.seconds);
+        } else if (step.type === 'wait_reply') {
+            base.chat = step.chat || null;
+            base.pattern = step.pattern || null;
+            base.timeout = num(step.timeout) || 15;
+        }
+        return base;
+    }
+
+    async function saveRegGrab() {
+        const payload = {
+            enabled: document.getElementById('rg-enabled').checked,
+            chats: tagInputs.chats,
+            exclude_chats: tagInputs.exclude_chats,
+            detect: {
+                code_pattern: document.getElementById('rg-code-pattern').value.trim() || null,
+                text_patterns: tagInputs.text_patterns,
+                only_from_bots: document.getElementById('rg-only-bots').value === 'true',
+                ignore_self: document.getElementById('rg-ignore-self').value === 'true',
+            },
+            steps: steps.map(cleanStep),
+            delay: num(document.getElementById('rg-delay').value),
+            jitter: num(document.getElementById('rg-jitter').value),
+            code_ttl: num(document.getElementById('rg-code-ttl').value),
+            max_concurrency: parseInt(document.getElementById('rg-max-concurrency').value) || 1,
+            notify: document.getElementById('rg-notify').checked,
+            include_edited: document.getElementById('rg-include-edited').checked,
+        };
+        const res = await fetch(`/api/config/${currentAccount}/reg_grab`, {
+            method: 'PUT', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+            toast('保存成功', true);
+            await loadRegGrab();
+            return;
+        }
+        const data = await res.json().catch(() => ({}));
+        toast(data.detail || '保存失败', false);
+    }
+
+    init();
+</script>
+{% endblock %}

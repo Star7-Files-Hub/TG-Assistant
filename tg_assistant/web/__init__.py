@@ -138,6 +138,21 @@ def create_app(
     return app
 
 
+def _static_version(static_dir: Path) -> str:
+    """静态资源版本号：取目录里最新的 mtime。
+
+    ``/static`` 由 StaticFiles 直接发盘上的文件，没有 Cache-Control，
+    浏览器会按 Last-Modified 做「启发式缓存」—— 改完 CSS 后用户仍可能
+    看到旧样式，然后以为没修好。把版本号拼进 URL 就彻底绕开这个坑；
+    部署时服务会重启，mtime 变了，URL 也就变了。
+    """
+    try:
+        newest = max(p.stat().st_mtime for p in static_dir.rglob("*") if p.is_file())
+    except (OSError, ValueError):  # pragma: no cover - 目录缺失/为空时不该拖垮启动
+        return "0"
+    return str(int(newest))
+
+
 def _build_template_env(template_dir: Path):
     from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -147,6 +162,7 @@ def _build_template_env(template_dir: Path):
         enable_async=True,
     )
     env.filters["boolicon"] = lambda v: "✅" if v else "❌"
+    env.globals["static_version"] = _static_version(template_dir.parent / "static")
     return env
 
 

@@ -24,6 +24,7 @@
                 <th>会话</th>
                 <th>转发</th>
                 <th>抢到</th>
+                <th>抢注</th>
                 <th>操作</th>
             </tr>
         </thead>
@@ -68,6 +69,7 @@
                 <td>${a.stats?.forward?.forwarded ?? '-'}</td>
                 <td>${a.stats?.forward?.matched ?? '-'}</td>
                 <td>${a.stats?.red_packet?.success ?? '-'}</td>
+                <td>${a.stats?.reg_grab?.success ?? '-'}</td>
                 <td>
                     <a href="/config/${encodeURIComponent(a.name)}" class="btn btn-sm">配置</a>
                     <a href="/chats/${encodeURIComponent(a.name)}" class="btn btn-sm">会话</a>

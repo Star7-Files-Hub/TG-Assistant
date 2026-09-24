@@ -281,6 +281,7 @@ def accounts_list(ctx: Context, as_json: bool) -> None:
                 "转发规则": len(config.forward.active_rules),
                 "监听会话": source_count,
                 "抢红包": "开" if config.red_packet.enabled else "关",
+                "抢注任务": "开" if config.reg_grab.enabled else "关",
                 "通知": "开" if config.notify.enabled else "关",
                 "最后登录": record.last_login_at or "-",
             }
@@ -670,6 +671,13 @@ def config_validate(ctx: Context, accounts: tuple[str, ...]) -> None:
         _info(f"    抢红包：{'开启' if config.red_packet.enabled else '关闭'}")
         if config.red_packet.enabled:
             _info(f"      策略：{config.red_packet.strategy}，回复：{'开' if config.red_packet.reply.enabled else '关'}")
+        _info(f"    抢注任务：{'开启' if config.reg_grab.enabled else '关闭'}")
+        if config.reg_grab.enabled:
+            _info(
+                f"      提取正则：{config.reg_grab.detect.code_pattern or '（未填）'}"
+                f"，步骤：{len(config.reg_grab.steps)} 步"
+                f"{'' if config.reg_grab.ready else ' ⚠️ 配置不完整，不会执行'}"
+            )
         _info(f"    通知：{'开启' if config.notify.enabled else '关闭'}（模式 {config.notify.mode}）")
         if watched:
             _info(f"    监听会话：{len(watched)} 个")
@@ -887,7 +895,7 @@ def _example_config() -> AccountConfig:
                 "bot_token": "${TGA_BOT_TOKEN}",
                 "chat_id": 0,
                 "mode": "copy",
-                "events": ["forward", "red_packet"],
+                "events": ["forward", "red_packet", "reg_grab"],
             },
             "red_packet": {
                 "enabled": False,
@@ -904,6 +912,19 @@ def _example_config() -> AccountConfig:
                     "only_on_success": True,
                     "delay_range": [0.8, 2.5],
                 },
+            },
+            "reg_grab": {
+                "enabled": False,
+                "chats": [],
+                "detect": {
+                    "code_pattern": r"(?:Register|Renew|Whitelist)_([A-Za-z0-9]{10})",
+                    "text_patterns": [],
+                },
+                "steps": [
+                    {"type": "send", "name": "把码发给机器人", "chat": "@example_bot", "text": "/bind {code}"},
+                    {"type": "wait", "name": "等它处理", "seconds": 1.5},
+                    {"type": "wait_reply", "name": "看回执", "pattern": "成功|失败|已使用", "timeout": 15},
+                ],
             },
         }
     )

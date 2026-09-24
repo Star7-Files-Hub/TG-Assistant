@@ -68,6 +68,11 @@ async def red_packet_page(request: Request) -> HTMLResponse:
     return await _render(request, "red_packet.html")
 
 
+@router.get("/reg_grab", response_class=HTMLResponse)
+async def reg_grab_page(request: Request) -> HTMLResponse:
+    return await _render(request, "reg_grab.html")
+
+
 @router.get("/cloudflare_ip", response_class=HTMLResponse)
 async def cloudflare_ip_page(request: Request) -> HTMLResponse:
     return await _render(request, "cloudflare_ip.html")
