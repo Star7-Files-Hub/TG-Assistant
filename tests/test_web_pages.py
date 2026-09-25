@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -301,6 +302,80 @@ def test_shared_form_selectors_cover_every_page_prefix() -> None:
         for prefix in prefixes:
             selector = f".{prefix}-input-group {element}:focus"
             assert selector in css, f"style.css 里没有 {selector}"
+
+
+def test_every_master_toggle_shows_its_checked_state() -> None:
+    """每个 ``*-master-toggle`` 都必须有 ``:checked + .toggle-slider`` 规则。
+
+    🔴 真实事故：``:checked`` 那两条只写了 ``.rules-master-toggle``，而 ``input``
+    又被 ``display: none`` 藏了起来 —— 于是抢红包 / 抢注 / 通知 / 优选IP 四个页面的
+    开关**永远是灰的**，滑块也不动。功能其实是好的（label 点击照样切换隐藏的
+    checkbox），但**零视觉反馈**，用户根本看不出开着还是关着。原话：
+    「开关都不会动，开着还是关闭看不出来」。
+
+    这里按模板**实际用到的类名**逐个检查，所以以后新增页面也跑不掉。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    css = (web_dir / "static" / "css" / "style.css").read_text(encoding="utf-8")
+
+    prefixes: set[str] = set()
+    for tpl in sorted((web_dir / "templates").glob("*.html")):
+        for cls in _referenced_classes(tpl.read_text(encoding="utf-8")):
+            if cls.endswith("master-toggle"):
+                prefixes.add(cls)
+    assert prefixes, "前提：至少有一个页面用了总开关"
+
+    # 把 CSS 拆成「选择器块」，再按逗号拆成**单条**选择器，然后精确比对。
+    #
+    # 🔴 这里必须精确匹配，不能子串匹配：`.x input:checked + .toggle-slider::after`
+    # 天然包含 `.x input:checked + .toggle-slider` —— 用子串查的话，就算
+    # background 那条被删了也照样"找得到"，测试成了摆设（第一版就是这么写的，
+    # 故意删掉 `.rg-` 那行仍然是 43 passed）。
+    selectors: set[str] = set()
+    for block in re.findall(r"([^{}]+)\{", css):
+        for selector in block.split(","):
+            selectors.add(" ".join(selector.split()))
+
+    for prefix in sorted(prefixes):
+        assert f".{prefix} input:checked + .toggle-slider" in selectors, (
+            f"{prefix} 没有 `:checked + .toggle-slider` 规则 ⇒ 这个页面的开关永远是灰的"
+        )
+        assert f".{prefix} input:checked + .toggle-slider::after" in selectors, (
+            f"{prefix} 的滑块不会位移 ⇒ 看不出开没开"
+        )
+
+
+def test_static_version_follows_the_file_without_a_restart(tmp_path) -> None:
+    """🔴 改了静态文件、但服务没重启时，版本号必须跟着变。
+
+    否则页面继续带**旧**的 ``?v=``，浏览器照旧吃缓存里的旧 CSS —— 用户看到的
+    还是没修的样子，而服务端一切正常、日志里毫无报错。
+
+    真实事故：部署时「先重启、后落盘 CSS」，页面 ``style.css?v=1790345286``
+    而文件 mtime 是 ``1790347538``，版本号比文件还旧。
+    """
+    from tg_assistant.web import _build_template_env
+
+    (tmp_path / "templates").mkdir()
+    static = tmp_path / "static"
+    static.mkdir()
+    css = static / "style.css"
+    css.write_text("a{}", encoding="utf-8")
+    os.utime(css, (1_000_000, 1_000_000))
+
+    env = _build_template_env(tmp_path / "templates")
+    get_version = env.globals["static_version"]
+    assert callable(get_version), "必须是可调用的 —— 存成常量就又回到启动时缓存了"
+    first = get_version()
+
+    os.utime(css, (1_000_500, 1_000_500))
+    assert get_version() != first, "文件变了，版本号没变 ⇒ 浏览器会一直用旧 CSS"
+
+    # 模板也必须真的**调用**它，否则惰性求值白做。
+    base = (Path(__file__).resolve().parents[1] / "tg_assistant" / "web" / "templates" / "base.html")
+    html = base.read_text(encoding="utf-8")
+    assert "{{ static_version() }}" in html, "base.html 里必须写成 static_version()"
+    assert "{{ static_version }}" not in html, "漏了括号就渲染成函数对象本身了"
 
 
 def test_time_inputs_render_in_dark_mode() -> None:

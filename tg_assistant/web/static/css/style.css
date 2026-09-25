@@ -1007,15 +1007,20 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     background: var(--text-muted);
 }
 
-/* 总开关 */
-.rules-master-toggle {
+/* 总开关
+   🔴 四个前缀必须**全部**出现在下面每一条选择器上。这里踩过一次：
+   ``:checked`` 那两条只写了 ``.rules-``，而 ``input`` 又被 ``display:none`` 藏了起来
+   —— 于是抢红包 / 抢注 / 通知 / 优选IP 四个页面的开关**永远是灰的**：
+   开着关着长得一模一样，用户根本看不出状态（功能其实是好的，只是零视觉反馈）。 */
+.rules-master-toggle, .rp-master-toggle, .nt-master-toggle, .rg-master-toggle {
     display: flex;
     align-items: center;
     gap: 8px;
     cursor: pointer;
     user-select: none;
 }
-.rules-master-toggle input { display: none; }
+.rules-master-toggle input, .rp-master-toggle input,
+.nt-master-toggle input, .rg-master-toggle input { display: none; }
 .toggle-slider {
     width: 40px; height: 22px;
     background: var(--border);
@@ -1032,10 +1037,16 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     top: 2px; left: 2px;
     transition: transform 0.3s;
 }
-.rules-master-toggle input:checked + .toggle-slider {
+.rules-master-toggle input:checked + .toggle-slider,
+.rp-master-toggle input:checked + .toggle-slider,
+.nt-master-toggle input:checked + .toggle-slider,
+.rg-master-toggle input:checked + .toggle-slider {
     background: var(--primary);
 }
-.rules-master-toggle input:checked + .toggle-slider::after {
+.rules-master-toggle input:checked + .toggle-slider::after,
+.rp-master-toggle input:checked + .toggle-slider::after,
+.nt-master-toggle input:checked + .toggle-slider::after,
+.rg-master-toggle input:checked + .toggle-slider::after {
     transform: translateX(18px);
 }
 .toggle-label {
@@ -1520,9 +1531,6 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     /* 选项文字最长可能是「小白（@meng5680）」，不给上限会把整个 header 挤变形 */
     max-width: 260px;
 }
-.rp-master-toggle, .nt-master-toggle, .rg-master-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-.rp-master-toggle input, .nt-master-toggle input, .rg-master-toggle input { display: none; }
-
 /* 卡片 */
 .rp-card, .nt-card, .rg-card {
     background: rgba(22, 27, 34, 0.8); backdrop-filter: blur(10px);

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}TG-Assistant{% endblock %}</title>
-    <link rel="stylesheet" href="/static/css/style.css?v={{ static_version }}">
+    <link rel="stylesheet" href="/static/css/style.css?v={{ static_version() }}">
 </head>
 <body>
     <div class="app-layout">
@@ -90,7 +90,7 @@
         </main>
     </div>
     <div id="toast" class="toast toast-hidden"></div>
-    <script src="/static/js/app.js?v={{ static_version }}"></script>
+    <script src="/static/js/app.js?v={{ static_version() }}"></script>
     <script>
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');

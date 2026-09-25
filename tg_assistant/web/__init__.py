@@ -143,8 +143,10 @@ def _static_version(static_dir: Path) -> str:
 
     ``/static`` 由 StaticFiles 直接发盘上的文件，没有 Cache-Control，
     浏览器会按 Last-Modified 做「启发式缓存」—— 改完 CSS 后用户仍可能
-    看到旧样式，然后以为没修好。把版本号拼进 URL 就彻底绕开这个坑；
-    部署时服务会重启，mtime 变了，URL 也就变了。
+    看到旧样式，然后以为没修好。把版本号拼进 URL 就彻底绕开这个坑。
+
+    调用方（:func:`_build_template_env`）把它包成 lambda **每次渲染现算**，
+    所以「改了文件但没重启」也能立刻生效 —— 这一点很要紧，见那里的注释。
     """
     try:
         newest = max(p.stat().st_mtime for p in static_dir.rglob("*") if p.is_file())
@@ -162,7 +164,15 @@ def _build_template_env(template_dir: Path):
         enable_async=True,
     )
     env.filters["boolicon"] = lambda v: "✅" if v else "❌"
-    env.globals["static_version"] = _static_version(template_dir.parent / "static")
+    # 惰性求值：每次渲染现算，而不是启动时算一次存进 globals。
+    #
+    # 🔴 这里踩过一次：启动时缓存的话，只要部署顺序是「先重启、后落盘静态文件」
+    # （同步脚本很常见），页面就会继续带着**旧**的 `?v=`，浏览器照旧吃缓存里的
+    # 旧 CSS —— 用户看到的还是没修的样子，而服务端一切正常、日志里毫无报错。
+    # 实测踩中时的现象：页面 `style.css?v=1790345286`，而文件 mtime 是 `1790347538`。
+    #
+    # 静态目录只有 2 个文件，每次渲染 rglob 一遍的开销可以忽略。
+    env.globals["static_version"] = lambda: _static_version(template_dir.parent / "static")
     return env
 
 
