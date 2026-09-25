@@ -430,7 +430,7 @@ class RuntimeManager:
             if self._dedupe is None:
                 self._dedupe = CrossAccountDedupe()
             # 「频道 ↔ 群组 同内容」去重表同理：重建一次 MultiRunner 就换新表的话，
-            # 刚发过的频道消息又能重发一遍，群组那条也就无从「顶替」。
+            # 刚发过的频道消息又能重发一遍，群组那条也就拦不住了。
             if self._pair_dedupe is None:
                 self._pair_dedupe = ChannelGroupDedupe()
             # 「最近已转发的内容」去重表同理：换表 = 「前 5 条 / 一天内」的记录全没了。

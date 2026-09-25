@@ -1096,8 +1096,8 @@ class TestCopyPathReportsSentIds:
     1. ``delivered`` 为空 ⇒ ``if rule.notify and ... and delivered`` 不成立
        ⇒ **通知不推送**。线上实测：09-24 15:14:19 那条 ``copy(降级)`` 转发成功，
        同一秒却没有任何通知日志。
-    2. ``mark_sent(..., sent_ids=[])`` 记不下消息 id ⇒ 群组那条后到时
-       **撤不掉频道那条** ⇒ 目标里留下两条重复内容。
+    2. 空 ``sent_ids`` 让「这条消息到底发成了几条」在日志里查不出来
+       （``sent_ids=-``），排查重复时没有依据。
 
     触发条件是「源会话禁止转发」⇒ ``forward`` 撞 ``CHAT_FORWARDS_RESTRICTED``
     ⇒ 自动降级复制。当时所有规则都是 ``forward``，所以只有降级路径会中招；
@@ -1165,10 +1165,11 @@ class TestCopyPathReportsSentIds:
         )
 
     @pytest.mark.asyncio
-    async def test_channel_copy_is_withdrawn_when_the_group_version_arrives(self, alog):
-        """copy 出去的频道那条，被群组那条顶替时**必须撤得掉**。
+    async def test_channel_copy_blocks_the_group_version(self, alog):
+        """copy 出去的频道那条先到 ⇒ 群组那条**直接不发**，已发出的那条也不删。
 
-        撤不掉就留下两条重复内容 —— 这是 copy 路径 ``sent_ids`` 空掉的第二个后果。
+        这条曾经是「撤不掉频道那条 ⇒ 目标里两条重复」的回归点。现在这条风险整个
+        消失了：后到的那条压根不发，所以没有任何东西需要撤回。
         """
         pair = ChannelGroupDedupe()
         client = FakeClient()
@@ -1176,21 +1177,16 @@ class TestCopyPathReportsSentIds:
             client, build_config(sources=[], mode="copy"), alog, pair_dedupe=pair
         )
 
-        before = client.next_message_id
         engine._handle(channel_message("关键词123"), edited=False)
         await drain(engine)
         assert len(client.sent) == 1, "copy 模式：重发一条新消息（链接写在正文里）"
-        channel_sent = [before + 1]
 
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
 
-        assert len(client.sent) == 2, "群组那条也要发出去"
-        assert [call["message_ids"] for call in client.deleted] == [channel_sent], (
-            "copy 路径的 sent_ids 为空 ⇒ 记不下频道那条的 id ⇒ 群组后到时撤不掉它 "
-            "⇒ 目标里留下两条重复内容"
-        )
-        assert engine.stats["pair_superseded"] == 1
+        assert len(client.sent) == 1, "群组那条后到 ⇒ 直接不发"
+        assert client.deleted == [], "🔴 已经发出去的那条不许删 —— 用户要的就是「直接拦截」"
+        assert engine.stats["pair_blocked"] == 1
 
 
 class TestSentIdsExtraction:
@@ -2014,7 +2010,7 @@ class TestHeartbeatSurfacesNewCounters:
         assert captured["cross_deduped"] == 3
         assert captured["downgraded"] == 2
         assert captured["pair_deduped"] == 0
-        assert captured["pair_superseded"] == 0
+        assert captured["pair_blocked"] == 0
 
     def test_heartbeat_includes_pair_counters(self, paths, client, alog):
         """「频道 ↔ 群组」那层去重的计数也必须进心跳 —— 明细日志是 INFO 级，
@@ -2023,7 +2019,7 @@ class TestHeartbeatSurfacesNewCounters:
         runner.started_at = time.time()
         runner.forwarder = ForwardEngine(client, build_config(), alog)
         runner.forwarder.stats["pair_deduped"] = 5
-        runner.forwarder.stats["pair_superseded"] = 1
+        runner.forwarder.stats["pair_blocked"] = 1
 
         captured: dict[str, Any] = {}
         runner.alog = types.SimpleNamespace(info=lambda msg, **kw: captured.update(kw))
@@ -2031,7 +2027,7 @@ class TestHeartbeatSurfacesNewCounters:
         runner._log_heartbeat()
 
         assert captured["pair_deduped"] == 5
-        assert captured["pair_superseded"] == 1
+        assert captured["pair_blocked"] == 1
 
     def test_heartbeat_includes_gate_counter(self, paths, client, alog):
         """「同内容 + 同目标」串行闸门挡下的次数也必须进心跳。
@@ -2096,85 +2092,71 @@ class TestContentFingerprint:
 
 
 class TestChannelGroupDedupe:
-    """频道与它的关联群组各发一遍同一条内容 ⇒ 只保留**群组**那条。
+    """频道与它的关联群组各发一遍同一条内容 ⇒ 只留**先到**的那条，后到的直接不发。
 
     小白 2026-09-21 的需求：「频道发送消息时会在群组也同时发送一条，两条是一样的但是
     原文链接不一样，我只需要保留群组这一条」。
 
-    线上取证（``tg-assistant chats`` + 直接读消息）钉死了两件事，正是这两点决定了
-    实现方式：
+    线上取证（``tg-assistant chats`` + 直接读消息）钉死了两件事：
 
     1. 群里那条**不是**频道的转发（``forward_origin`` / ``forward_from_chat`` 都是空）
        ⇒ 拿不到「同一条原始消息」这个强标识，只能比**内容指纹**；
     2. 先后顺序**随机** —— 流光画廊那对是群组先到（47.505 / 48.354），秀儿那对却是
-       **频道先到**（频道 37.651、群组 39.144）⇒ 「先到先得」会留下一半的错那条，
-       必须支持「群组那条后到时把已发的频道那条撤回」。
+       **频道先到**（频道 37.651、群组 39.144）。
+
+    🔴 2026-09-25 改版。原来是「群组优先，与先后顺序无关」：频道先到就先把它发出去，
+    群组那条到了再把频道那条**撤回**、重发群组那条。用户原话是「我要的是重复的直接
+    拦截，而不是一直更新再自动删除上一条消息」—— 目标里先冒一条、过一两秒又消失、
+    再补一条，看起来就是消息被吞了又重发，比多一条重复还难受。
+
+    现在改成**先到先得、后到的直接不发**：这一层是纯判断、零副作用。
+    代价是频道先到的那一对会留下频道那条（链接指向频道帖而不是群组帖）。
     """
 
     # ---------------------------------------------------------------- #
-    # 顺序两种都要对
+    # 顺序两种都要对，且**两种都不撤回**
     # ---------------------------------------------------------------- #
     def test_group_first_then_channel_is_skipped(self):
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "group", 300).send is True
-        decision = dedupe.claim("fp", DST, "channel", 300)
-        assert decision.send is False, "群组已发过 ⇒ 频道这条不该再发"
-        assert decision.withdraw == (), "没有已发的频道消息可撤"
-        assert (dedupe.claimed, dedupe.rejected) == (1, 1)
+        assert dedupe.claim("fp", DST, "group", 300) is True
+        assert dedupe.claim("fp", DST, "channel", 300) is False, "群组已发过 ⇒ 频道这条不该再发"
+        assert (dedupe.claimed, dedupe.channel_dropped, dedupe.group_dropped) == (1, 1, 0)
 
-    def test_channel_first_then_group_supersedes(self):
-        """群组那条后到 ⇒ 照样发，并把先前发出去的频道那条（含链接那条）撤回。"""
+    def test_channel_first_then_group_is_also_skipped(self):
+        """🔴 回归：频道先到时**不再**撤回已发的那条、也不再重发群组那条。"""
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "channel", 300).send is True
-        assert dedupe.mark_sent("fp", DST, "channel", [11, 12]) is False
+        assert dedupe.claim("fp", DST, "channel", 300) is True
+        assert dedupe.claim("fp", DST, "group", 300) is False, (
+            "先到的那条已经发出去了 ⇒ 群组这条直接拦掉，绝不撤回重发"
+        )
+        assert (dedupe.claimed, dedupe.channel_dropped, dedupe.group_dropped) == (1, 0, 1)
 
-        decision = dedupe.claim("fp", DST, "group", 300)
+    def test_the_first_record_never_flips(self):
+        """🔴 后到的那条**不能**覆盖记录 —— 否则第三条同内容消息的判据会漂移。
 
-        assert decision.send is True
-        assert decision.withdraw == (11, 12)
-        assert dedupe.superseded == 1
-
-    def test_superseded_channel_sent_ids_are_cleared(self):
-        """顶替之后旧记录要换成群组那条 —— 否则再来的频道消息还能读到过期的 sent。"""
-        dedupe = ChannelGroupDedupe()
-        dedupe.claim("fp", DST, "channel", 300)
-        dedupe.mark_sent("fp", DST, "channel", [11])
-        dedupe.claim("fp", DST, "group", 300)
-
-        assert dedupe.claim("fp", DST, "channel", 300).send is False
-
-    # ---------------------------------------------------------------- #
-    # 🔴 claim 与发送之间的竞态：发送期间被群组顶替
-    # ---------------------------------------------------------------- #
-    def test_mark_sent_reports_superseded_during_send(self):
-        """🔴 `claim` 与真正发送之间隔着一个 ``await``（线上 `pipeline_ms` 到过 4223ms）。
-
-        群组那条可能**就在这个窗口里**到达：它 `claim` 时读到的 ``sent`` 还是空的，
-        撤不掉任何东西。⇒ 发送完成后必须能发现自己已被顶替，由调用方撤回自己刚发的。
+        记录里必须始终是「频道先到」，所以：
+        - 再来的**群组**消息照样被拦（判据没漂）；
+        - 再来的**频道**消息与记录同类型 ⇒ 这一层放行（同类型之间的内容重复
+          是「最近已转发的内容」那层的活，见 ``TestRecentContentDedupeInEngine``）。
         """
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "channel", 300).send is True
-        # 频道那条还在发（sent 还是空的），群组那条到了 —— 它撤不掉东西
-        group_decision = dedupe.claim("fp", DST, "group", 300)
-        assert group_decision.send is True
-        assert group_decision.withdraw == (), "此刻频道那条还没发完，没有 id 可撤"
-
-        # 频道那条发完了 ⇒ 必须自报「我被顶替了」
-        assert dedupe.mark_sent("fp", DST, "channel", [11, 12]) is True, (
-            "发送期间被群组顶替，mark_sent 必须返回 True 让调用方撤回自己"
-        )
-
-    def test_mark_sent_is_false_when_not_superseded(self):
-        dedupe = ChannelGroupDedupe()
-        dedupe.claim("fp", DST, "group", 300)
-        assert dedupe.mark_sent("fp", DST, "group", [11]) is False
-
-    def test_group_send_is_never_reported_superseded(self):
-        """群组那条自己是赢家，不该被报告成顶替（否则会把自己撤回）。"""
-        dedupe = ChannelGroupDedupe()
         dedupe.claim("fp", DST, "channel", 300)
         dedupe.claim("fp", DST, "group", 300)
-        assert dedupe.mark_sent("fp", DST, "group", [21]) is False
+        assert dedupe.claim("fp", DST, "group", 300) is False, "记录仍是「频道先到」"
+        assert dedupe.claim("fp", DST, "channel", 300) is True, "同类型 ⇒ 这一层不管"
+        assert dedupe._seen[("fp", str(DST))].kind == "channel", "记录不许被后到的那条改写"
+
+    def test_dedupe_has_no_withdrawal_machinery(self):
+        """🔴 回归：这一层不许再长出「撤回」入口 —— 拦下就只是不发。
+
+        ``mark_sent`` / 记录里的 ``sent`` 都是「先发一条再撤掉」那套机制的残留，
+        它们存在就意味着还有可能删用户已经看到的消息。
+        """
+        dedupe = ChannelGroupDedupe()
+        assert not hasattr(dedupe, "mark_sent")
+        dedupe.claim("fp", DST, "channel", 300)
+        entry = dedupe._seen[("fp", str(DST))]
+        assert not hasattr(entry, "sent"), "记录里不该再存「已发出的消息 id」"
 
     # ---------------------------------------------------------------- #
     # 不能误杀
@@ -2182,56 +2164,56 @@ class TestChannelGroupDedupe:
     def test_same_kind_is_not_deduped(self):
         """两个**群组**发的同内容帖子不能被误杀 —— 只有「频道 ↔ 群组」才算一对。"""
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "group", 300).send is True
-        assert dedupe.claim("fp", DST, "group", 300).send is True
-        assert dedupe.rejected == 0
+        assert dedupe.claim("fp", DST, "group", 300) is True
+        assert dedupe.claim("fp", DST, "group", 300) is True
+        assert (dedupe.channel_dropped, dedupe.group_dropped) == (0, 0)
 
     def test_unknown_kind_is_not_deduped(self):
         """类型判不出来（例如 pyrogram 的 ``community``）⇒ 宁可漏去重也不误杀。"""
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, None, 300).send is True
-        assert dedupe.claim("fp", DST, "channel", 300).send is True
-        assert dedupe.rejected == 0
+        assert dedupe.claim("fp", DST, None, 300) is True
+        assert dedupe.claim("fp", DST, "channel", 300) is True
+        assert (dedupe.channel_dropped, dedupe.group_dropped) == (0, 0)
 
     def test_different_targets_are_independent(self):
         """键必须带目标：同一条内容发往不同目标时互不影响。"""
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "group", 300).send is True
-        assert dedupe.claim("fp", -1009999999999, "channel", 300).send is True
+        assert dedupe.claim("fp", DST, "group", 300) is True
+        assert dedupe.claim("fp", -1009999999999, "channel", 300) is True
 
     def test_different_content_is_independent(self):
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp1", DST, "group", 300).send is True
-        assert dedupe.claim("fp2", DST, "channel", 300).send is True
+        assert dedupe.claim("fp1", DST, "group", 300) is True
+        assert dedupe.claim("fp2", DST, "channel", 300) is True
 
     def test_zero_ttl_disables(self):
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "group", 0).send is True
-        assert dedupe.claim("fp", DST, "channel", 0).send is True
+        assert dedupe.claim("fp", DST, "group", 0) is True
+        assert dedupe.claim("fp", DST, "channel", 0) is True
 
     def test_claim_expires_after_ttl(self, monkeypatch):
         dedupe = ChannelGroupDedupe()
         now = [1000.0]
         monkeypatch.setattr("tg_assistant.forwarder.time.monotonic", lambda: now[0])
 
-        assert dedupe.claim("fp", DST, "group", 10).send is True
+        assert dedupe.claim("fp", DST, "group", 10) is True
         now[0] += 5
-        assert dedupe.claim("fp", DST, "channel", 10).send is False
+        assert dedupe.claim("fp", DST, "channel", 10) is False
         now[0] += 6  # 超过 TTL
-        assert dedupe.claim("fp", DST, "channel", 10).send is True
+        assert dedupe.claim("fp", DST, "channel", 10) is True
 
     # ---------------------------------------------------------------- #
     # release：发送失败必须退还名额
     # ---------------------------------------------------------------- #
     def test_release_frees_the_slot(self):
-        """🔴 不退的话，同内容的群组那条会被判成重复而跳过 ⇒ 消息彻底丢。"""
+        """🔴 不退的话，同内容的另一条会被判成重复而跳过 ⇒ 消息彻底丢。"""
         dedupe = ChannelGroupDedupe()
-        assert dedupe.claim("fp", DST, "group", 300).send is True
-        assert dedupe.claim("fp", DST, "channel", 300).send is False
+        assert dedupe.claim("fp", DST, "group", 300) is True
+        assert dedupe.claim("fp", DST, "channel", 300) is False
 
         dedupe.release("fp", DST)
 
-        assert dedupe.claim("fp", DST, "channel", 300).send is True
+        assert dedupe.claim("fp", DST, "channel", 300) is True
         assert dedupe.released == 1
 
     def test_release_is_idempotent(self):
@@ -2241,11 +2223,6 @@ class TestChannelGroupDedupe:
         assert len(dedupe) == 0
         assert dedupe.released == 2
 
-    def test_mark_sent_on_missing_key_is_noop(self):
-        dedupe = ChannelGroupDedupe()
-        assert dedupe.mark_sent("nope", DST, "channel", [1, 2]) is False
-        assert len(dedupe) == 0
-
     def test_snapshot_counts(self):
         dedupe = ChannelGroupDedupe()
         dedupe.claim("fp", DST, "group", 300)
@@ -2254,8 +2231,8 @@ class TestChannelGroupDedupe:
         assert snapshot == {
             "size": 1,
             "claimed": 1,
-            "rejected": 1,
-            "superseded": 0,
+            "channel_dropped": 1,
+            "group_dropped": 0,
             "released": 0,
         }
 
@@ -2310,18 +2287,6 @@ class TestRecentContentDedupe:
         dedupe.add("fp", DST)
         dedupe.add("fp", DST)
         assert len(dedupe) == 1, "同一个指纹只留一条 —— 否则表会被重复项撑爆"
-
-    def test_remove_makes_it_forwardable_again(self):
-        """🔴 撤回一条已发消息后必须把它摘掉。
-
-        否则：频道那条先发出（已记表）→ 群组那条后到、撤回频道那条 ⇒
-        目标里其实没内容了，但表还记着 ⇒ 群组那条被当成重复跳过 ⇒ 一条都不剩。
-        """
-        dedupe = RecentContentDedupe(limit=5, ttl=3600)
-        dedupe.add("fp", DST)
-        assert dedupe.contains("fp", DST) is True
-        dedupe.remove("fp", DST)
-        assert dedupe.contains("fp", DST) is False
 
     def test_targets_are_isolated(self):
         dedupe = RecentContentDedupe(limit=5, ttl=3600)
@@ -2407,12 +2372,12 @@ class TestRecentContentDedupeInEngine:
         assert engine.stats["recent_deduped"] == 0
 
     @pytest.mark.asyncio
-    async def test_superseded_channel_does_not_block_the_group_copy(self, alog):
-        """🔴🔴 频道那条先发出、随后被群组那条顶替时，**群组那条必须发出去**。
+    async def test_blocked_group_version_never_reaches_the_recent_table(self, alog):
+        """🔴 频道先发、群组后到时，群组那条在**频道↔群组**这一层就被拦下了。
 
-        顺序：频道发（记进本表）→ 群组到 → 撤回频道那条（从本表摘掉）→ 发群组那条。
-        只要这个环里任何一步把「摘掉」漏了，群组那条就会被判成重复而跳过
-        ⇒ 目标里一条都不剩，消息彻底丢失。
+        它根本走不到「最近已转发的内容」那一层 ⇒ ``recent_deduped`` 保持 0。
+        同时钉住：拦下群组那条**不会**动到 ``_recent`` 里的记录，目标里那条内容
+        仍然是「已转发」状态，第三条同内容消息照样会被拦。
         """
         pair = ChannelGroupDedupe()
         client = FakeClient()
@@ -2431,39 +2396,18 @@ class TestRecentContentDedupeInEngine:
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
 
-        assert len(client.forwarded) == 2, "群组那条必须发出去"
-        assert [c["message_ids"] for c in client.deleted], "频道那条必须被撤回"
-        assert engine.stats["pair_superseded"] == 1
-        assert engine.stats["recent_deduped"] == 0
+        assert len(client.forwarded) == 1, "群组那条后到 ⇒ 直接不发"
+        assert engine.stats["pair_blocked"] == 1
+        assert engine.stats["recent_deduped"] == 0, "在这一层就被拦下了，走不到「最近发过」那层"
+        assert client.deleted == [], "🔴 绝不删已经发出去的那条"
 
     @pytest.mark.asyncio
-    async def test_withdraw_clears_the_record(self, alog):
-        """🔴 撤回一条已发消息 ⇒ 它在「最近已转发」里的记录必须一起摘掉。
+    async def test_two_groups_same_content_is_caught_by_the_recent_table(self, alog):
+        """两个**群组**发同内容不是「频道 ↔ 群组」那一对 ⇒ 由「最近已转发」拦下。
 
-        不摘的后果：频道那条被撤回后，目标里**其实没有**这条内容，但表里还记着 ⇒
-        万一群组那条也发失败了，这条内容一整天都补不回来（消息彻底丢失）。
-        （上面那条用例测的是正常路径 —— 顶替时本来就绕过本层，所以它**测不到**这里，
-        必须单独钉。）
+        这条用例把两层的分工钉死：``pair_*`` 只认 ``{channel, group}``，
+        同类型之间的内容重复是 ``recent_deduped`` 的活。
         """
-        client = FakeClient()
-        engine = ForwardEngine(
-            client,
-            build_config(sources=[]),
-            alog,
-            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
-        )
-        engine._recent.add("fp", DST)
-        assert engine._recent.contains("fp", DST) is True, "前提：先记进去"
-
-        await engine._withdraw_superseded(DST, [11], engine.rules[0].rule, "来源", 1, fingerprint="fp")
-
-        assert engine._recent.contains("fp", DST) is False, (
-            "撤回之后目标里没这条内容了 ⇒ 记录必须摘掉，否则再也补发不了"
-        )
-
-    @pytest.mark.asyncio
-    async def test_content_can_be_sent_again_after_withdraw(self, alog):
-        """撤回之后目标里没这条内容了 ⇒ 同内容再来一次应当放行。"""
         pair = ChannelGroupDedupe()
         client = FakeClient()
         engine = ForwardEngine(
@@ -2474,19 +2418,25 @@ class TestRecentContentDedupeInEngine:
             recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
         )
 
-        engine._handle(channel_message("关键词123"), edited=False)
+        engine._handle(group_message("关键词123"), edited=False)
         await drain(engine)
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
-        # 目标里现在只剩群组那条；同样的内容**换一条新消息**再来 ⇒ 仍属重复，跳过
-        engine._handle(group_message("关键词123", message_id=300), edited=False)
-        await drain(engine)
 
-        assert engine.stats["recent_deduped"] == 1, "目标里已经有一模一样的内容了"
+        assert len(client.forwarded) == 1
+        assert engine.stats["recent_deduped"] == 1
+        assert (engine.stats["pair_deduped"], engine.stats["pair_blocked"]) == (0, 0)
+        assert client.deleted == []
 
 
 class TestChannelGroupSameContentInEngine:
-    """引擎层：同一条内容由频道和群组各发一遍，目标里只留群组那条。"""
+    """引擎层：同一条内容由频道和群组各发一遍，目标里只留**先到**那条。
+
+    🔴 2026-09-25 改版：原来是「群组优先」—— 频道先到就先发出去，群组那条到了
+    再把频道那条撤回、重发群组那条。用户原话「我要的是重复的直接拦截，而不是
+    一直更新再自动删除上一条消息」⇒ 现在是**先到先得、后到的不发**，
+    整个引擎里不再有任何「删掉已发消息」的路径。
+    """
 
     @pytest.mark.asyncio
     async def test_group_first_channel_is_dropped(self, alog):
@@ -2501,12 +2451,16 @@ class TestChannelGroupSameContentInEngine:
 
         assert len(client.forwarded) == 1, "群组已发过 ⇒ 频道那条不该再发一遍"
         assert engine.stats["pair_deduped"] == 1
-        assert engine.stats["pair_superseded"] == 0
+        assert engine.stats["pair_blocked"] == 0
         assert client.deleted == []
 
     @pytest.mark.asyncio
-    async def test_channel_first_group_supersedes_and_withdraws(self, alog):
-        """线上实测到的顺序之一（秀儿那对：频道 00:01:37 先到、群组 00:01:39 后到）。"""
+    async def test_channel_first_group_is_dropped_without_deleting_anything(self, alog):
+        """🔴 回归：线上实测到的顺序之一（秀儿那对：频道 00:01:37 先到、群组 00:01:39 后到）。
+
+        旧行为是「群组那条照样发 + 把先前发出的频道消息撤回」；用户否掉了那种观感。
+        新行为：群组那条**直接不发**，已经发出去的频道那条**保持原样**。
+        """
         pair = ChannelGroupDedupe()
         client = FakeClient()
         engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
@@ -2514,72 +2468,51 @@ class TestChannelGroupSameContentInEngine:
         before = client.next_message_id
         engine._handle(channel_message("关键词123"), edited=False)
         await drain(engine)
-        first_sent = list(range(before + 1, client.next_message_id + 1))
-        assert len(first_sent) == 2, "forward 模式：转发消息 + 下方补的链接消息"
+        channel_sent = list(range(before + 1, client.next_message_id + 1))
+        assert len(channel_sent) == 2, "forward 模式：转发消息 + 下方补的链接消息"
         assert client.deleted == []
 
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
 
-        assert len(client.forwarded) == 2, "群组那条必须发出去"
-        assert [call["message_ids"] for call in client.deleted] == [first_sent], (
-            "群组那条后到 ⇒ 先前发出的频道消息（含链接那条）要撤回"
-        )
-        assert engine.stats["pair_superseded"] == 1
+        assert len(client.forwarded) == 1, "群组那条后到 ⇒ 不发"
+        assert client.deleted == [], "🔴 不许删已经发出去的频道那条"
+        assert engine.stats["pair_blocked"] == 1
         assert engine.stats["pair_deduped"] == 0
 
     @pytest.mark.asyncio
     async def test_send_in_flight_when_group_arrives_still_ends_with_one(self, alog):
-        """🔴 竞态：频道那条**还在发**的时候群组那条就到了。
+        """🔴 竞态：频道那条**还在发**的时候群组那条就到了，最终仍然只该有一条。
 
         ``claim`` 与真正发送之间隔着一个 ``await``（线上 ``pipeline_ms`` 实测到过 **4223ms**），
         群组那条完全可能就在这个窗口里到达。
 
-        🔴 2026-09-23 起这个窗口由**串行闸门**（``RecentContentDedupe.gate``）关掉：
-        同一条内容发往同一个目标时两个 handler **排队**跑 ⇒ 群组那条会**等**频道那条
-        发完，因此它 ``claim`` 时能读到频道那条的 ``sent``、发完后把它撤回。
-        最终目标里仍旧只该剩群组那条 —— 结论不变，但「两条都先发出去、再撤掉一条」
-        的那个危险窗口没有了。
-
-        ⚠️ 本用例原来钉的是**闸门之前**的行为（群组抢跑先发、频道那条发完后自己在
-        ``mark_sent`` 里发现被顶替再自撤）。闸门之后「抢跑」不可能发生，断言随之更新。
+        串行闸门（``RecentContentDedupe.gate``）让同内容 + 同目标的两个 handler **排队**：
+        群组那条会等频道那条发完才轮到它 ``claim`` ⇒ 它读到记录里是「频道先到」⇒
+        直接拦掉。目标里从头到尾只有频道那一条，**没有任何删除**。
         """
         pair = ChannelGroupDedupe()
         client = SlowFirstForwardClient()
         engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
 
-        before = client.next_message_id
         engine._handle(channel_message("关键词123"), edited=False)
         await asyncio.sleep(0.05)  # 频道那条卡在 forward_messages 里
         assert client.forwarded == [], "前提：频道那条确实还没发出去"
 
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await asyncio.sleep(0.05)
-        # 🔴 闸门生效：群组那条必须**被挡住**，不能抢在频道那条前面发出去。
         assert client.forwarded == [], "群组那条应当排队等频道那条，而不是抢跑"
-        assert client.deleted == [], "此刻还没有可撤的东西"
 
         client.release.set()  # 放行频道那条
         await drain(engine)
 
-        channel_sent = [before + 1, before + 2]  # 转发消息 + 下方补的链接消息
-        group_sent = [before + 3, before + 4]
-        assert len(client.forwarded) == 2, "频道那条发完，群组那条接着才发"
-        assert [call["message_ids"] for call in client.deleted] == [channel_sent], (
-            "群组那条 claim 时已经读得到频道那条的 sent ⇒ 群组发完后把频道那条撤回"
-        )
-        assert engine.stats["pair_superseded"] == 1
-        deleted_ids = [i for call in client.deleted for i in call["message_ids"]]
-        assert deleted_ids == channel_sent, "撤掉的是频道那条，不是群组那条"
-        assert not set(group_sent) & set(deleted_ids), "群组那条必须留在目标里"
+        assert len(client.forwarded) == 1, "最终目标里只该有一条 —— 群组那条被拦掉了"
+        assert client.deleted == [], "🔴 全程没有任何删除"
+        assert engine.stats["pair_blocked"] == 1
 
     @pytest.mark.asyncio
-    async def test_superseding_also_withdraws_the_stale_notification(self, alog):
-        """🔴 撤回频道那条时，**它那条通知**也必须跟着撤。
-
-        通知是 bot 复制到**另一个会话**里的，引擎删不到它。不撤的后果：
-        用户收到两条通知，第一条指向一条已经被删掉的消息（点了是空的）。
-        """
+    async def test_channel_first_sends_only_one_notification(self, alog):
+        """频道先到 ⇒ 群组那条被拦 ⇒ 只该有一条通知，且没有可撤的。"""
         pair = ChannelGroupDedupe()
         client = FakeClient()
         notifier = FakeNotifier()
@@ -2590,22 +2523,15 @@ class TestChannelGroupSameContentInEngine:
 
         engine._handle(channel_message("关键词123"), edited=False)
         await drain(engine)
-        assert len(notifier.submitted) == 1, "前提：频道那条已经发过通知"
-        assert notifier.submitted[0].key is not None, (
-            "频道那条必须带撤回键 —— 否则事后撤不掉那条通知"
-        )
-
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
 
-        assert client.deleted, "前提：目标里那条频道消息确实被撤回了"
-        assert notifier.withdrawn == [notifier.submitted[0].key], (
-            "通知没被连带撤回 ⇒ 用户会看到一条指向已删消息的空通知"
-        )
+        assert len(notifier.submitted) == 1, "群组那条被拦下了 ⇒ 不该有第二条通知"
+        assert notifier.withdrawn == [], "🔴 通知也不再需要撤回"
 
     @pytest.mark.asyncio
     async def test_group_first_sends_only_one_notification(self, alog):
-        """群组先到 ⇒ 频道那条压根不发 ⇒ 只该有一条通知（不该有可撤的）。"""
+        """群组先到 ⇒ 频道那条压根不发 ⇒ 只该有一条通知。"""
         pair = ChannelGroupDedupe()
         client = FakeClient()
         notifier = FakeNotifier()
@@ -2621,22 +2547,6 @@ class TestChannelGroupSameContentInEngine:
 
         assert len(notifier.submitted) == 1, "频道那条被跳过了 ⇒ 不该有第二条通知"
         assert notifier.withdrawn == []
-
-    @pytest.mark.asyncio
-    async def test_withdraw_failure_still_sends_group_copy(self, alog):
-        """撤回失败（目标里没有删除权限等）**不能**把群组那条也丢掉。"""
-        pair = ChannelGroupDedupe()
-        client = FakeClient(delete_error=RuntimeError("no rights"))
-        engine = ForwardEngine(client, build_config(sources=[]), alog, pair_dedupe=pair)
-
-        engine._handle(channel_message("关键词123"), edited=False)
-        await drain(engine)
-        engine._handle(group_message("关键词123", message_id=200), edited=False)
-        await drain(engine)
-
-        assert len(client.forwarded) == 2
-        assert engine.stats["pair_superseded"] == 0, "撤回失败不算顶替成功"
-        assert engine.stats["failed"] == 0, "撤回失败不该把这次转发记成失败"
 
     @pytest.mark.asyncio
     async def test_different_content_both_sent(self, alog):
@@ -2857,13 +2767,13 @@ class TestDuplicateRegression:
         await asyncio.gather(drain(engine_a), drain(engine_b))
 
         assert len(client.forwarded) == 1, "同一条内容并发只允许发出去一次"
-        assert len(client.deleted) == 0, "都是群组来源，没有谁该被撤回"
+        assert len(client.deleted) == 0, "全程不该有任何删除动作"
 
     @pytest.mark.asyncio
-    async def test_failed_takeover_keeps_old_copy_and_blocks_the_next_one(self, alog):
-        """② 顶替者发送失败时：**不撤**旧的，且下一条同内容仍被拦住（不再连发）。
+    async def test_late_group_version_never_even_attempts_a_send(self, alog):
+        """② 后到的那条**连发送都不会尝试** ⇒ 「顶替者自己失败」这一类事故从根上没有了。
 
-        旧行为的两个毛病都在这里被钉住：
+        旧行为的两个毛病都在这里被钉住（现在都消失了）：
         - 先在发送**之前**撤掉频道那条 ⇒ 顶替者失败后目标里一条不剩（内容丢失）；
         - 撤回把「最近发过」记录摘掉 ⇒ 下一条同内容又被当成新的发一遍（重复）。
         """
@@ -2880,16 +2790,19 @@ class TestDuplicateRegression:
         engine._handle(channel_message("关键词123"), edited=False)
         await drain(engine)
         assert len(client.forwarded) == 1, "前提：频道那条已经发出去了"
+        assert client._n == 1, "前提：只尝试发送过一次"
 
-        # 群组那条来顶替 —— 但它自己发送失败（线上 20:09:19「被 Telegram 拒绝」）
+        # 群组那条后到 —— 它在**发送之前**就被拦掉了，根本不会去尝试发送
         engine._handle(group_message("关键词123", message_id=200), edited=False)
         await drain(engine)
-        assert engine.stats["failed"] == 1, "群组那条确实失败了"
-        assert client.deleted == [], "🔴 顶替者没发成功 ⇒ 绝不能撤掉旧的那条"
-        assert engine.stats["pair_superseded"] == 0
+        assert client._n == 1, "🔴 后到的那条压根没尝试发送（旧行为会尝试、然后失败）"
+        assert engine.stats["failed"] == 0, "没尝试就谈不上失败"
+        assert len(client.forwarded) == 1, "目标里还是那条频道消息，一条没少"
+        assert client.deleted == [], "🔴 绝不删已经发出去的那条"
+        assert engine.stats["pair_blocked"] == 1
 
         # 下一条**同内容**的消息（线上 20:09:27 那条）必须被拦住，不能又发一遍
         engine._handle(group_message("关键词123", message_id=300), edited=False)
         await drain(engine)
         assert len(client.forwarded) == 1, "🔴 目标里已经有这条内容了，不能再发一遍"
-        assert engine.stats["recent_deduped"] == 1
+        assert engine.stats["pair_blocked"] == 2, "同内容的群组消息再来一条，照样拦掉"

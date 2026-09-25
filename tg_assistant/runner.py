@@ -618,7 +618,7 @@ class AccountRunner:
             # 否则两个账号都在同一个源群里时会把同一条消息各发一遍。
             shared_dedupe=self.shared_dedupe,
             # 同理：「频道 ↔ 群组 同内容」去重表也要共享 —— 频道那条由账号 A 发出去、
-            # 群组那条由账号 B 收到时，B 得能撤回 A 发的那条。
+            # 群组那条由账号 B 收到时，B 得知道「这条内容已经发过了」才能拦下来。
             pair_dedupe=self.pair_dedupe,
             recent_dedupe=self.recent_dedupe,
         )
@@ -699,10 +699,11 @@ class AccountRunner:
                     # 这两个数字是判断「去重生效没有」「降级生效没有」的**唯一可见口径** ——
                     # 明细日志是 debug 级，线上 TGA_LOG_LEVEL=INFO 看不到。
                     "cross_deduped": snapshot["cross_deduped"],
-                    # 「同一内容由频道和群组各发一遍」时被群组挤掉的频道消息数 / 群组那条
-                    # 后到、把已发出的频道消息撤回掉的次数。
+                    # 「同一内容由频道和群组各发一遍」时，先到的那条留下、后到的直接不发。
+                    # 两个数字只差「谁先到」：频道后到 / 群组后到。
+                    # 🔴 两者都只是**不发**，不会撤回任何已发出的消息。
                     "pair_deduped": snapshot["pair_deduped"],
-                    "pair_superseded": snapshot["pair_superseded"],
+                    "pair_blocked": snapshot["pair_blocked"],
                     # 目标里**最近已经转发过相同内容**而被跳过的次数。
                     "recent_deduped": snapshot["recent_deduped"],
                     # 「同内容发往同目标」的**串行闸门**挡下的次数（累计、跨账号共享）。
