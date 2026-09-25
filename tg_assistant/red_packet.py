@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
-import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -47,6 +46,7 @@ from .matching import (
     build_variables,
     chat_identity,
     compile_patterns,
+    compile_user_pattern,
     first_match,
     message_text,
     render_template,
@@ -141,7 +141,9 @@ class PreparedTask:
             exclude_chats=RefSet(config.exclude_chats),
             button_keywords=[keyword.lower() for keyword in detect.button_keywords],
             text_patterns=compile_patterns(detect.text_patterns),
-            code_pattern=re.compile(detect.code_pattern) if detect.code_pattern else None,
+            code_pattern=(
+                compile_user_pattern(detect.code_pattern) if detect.code_pattern else None
+            ),
             success_patterns=compile_patterns(config.success.success_patterns),
             failure_patterns=compile_patterns(config.success.failure_patterns),
         )

@@ -60,6 +60,7 @@ from .matching import (
     build_variables,
     chat_identity,
     compile_patterns,
+    compile_user_pattern,
     first_match,
     message_text,
     render_template,
@@ -219,24 +220,28 @@ class RegGrabHunter:
         self._exclude_chats = RefSet(self.config.exclude_chats)
         self._text_patterns = compile_patterns(self.config.detect.text_patterns)
         self._code_pattern = (
-            re.compile(self.config.detect.code_pattern)
+            compile_user_pattern(self.config.detect.code_pattern)
             if self.config.detect.code_pattern
             else None
         )
         self._steps: list[RegGrabStep] = list(self.config.steps)
         #: 与 ``_steps`` 一一对应的按钮正则（``click`` 用）。
         self._button_patterns: list[Optional[re.Pattern[str]]] = [
-            re.compile(step.button) if step.type == "click" and step.button else None
+            compile_user_pattern(step.button)
+            if step.type == "click" and step.button
+            else None
             for step in self._steps
         ]
         #: 与 ``_steps`` 一一对应的回执正则（``wait_reply`` 用）。
         self._reply_patterns: list[Optional[re.Pattern[str]]] = [
-            re.compile(step.pattern) if step.type == "wait_reply" and step.pattern else None
+            compile_user_pattern(step.pattern)
+            if step.type == "wait_reply" and step.pattern
+            else None
             for step in self._steps
         ]
         #: 「注册码已被使用」通知的正则（``None`` = 不做这项判定）。
         self._used_pattern: Optional[re.Pattern[str]] = (
-            re.compile(self.config.detect.used_pattern)
+            compile_user_pattern(self.config.detect.used_pattern)
             if self.config.detect.used_pattern
             else None
         )

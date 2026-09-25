@@ -425,6 +425,46 @@ def test_global_rules_test_matches_the_per_account_endpoint(client, app, account
     assert "无效" in global_body["error"]
 
 
+@pytest.mark.parametrize(
+    ("pattern", "text"),
+    [
+        # 用户报的那个场景：码独占一行，上下都是别的字
+        (r"^(?!.*(.)\1{3})[A-Z0-9]{12}$", "🎁 注册码\nCZAMTIRLMX2U\n有效期 30 天"),
+        (r"^MSKY-\d+-[A-Za-z]+_[0-9a-f]{10}$", "🎥 影库\nMSKY-30-Register_ab12cd34ef\n请尽快注册"),
+        (r"^广告$", "正常内容\n广告\n正常内容"),
+        (r"^abc$", "XYZ\nABC\nXYZ"),
+        (r"抢到", "第一行\n恭喜你抢到\n第三行"),
+        (r"^a.*b$", "a\nb"),
+        (r"金额[:：]\s*(\d+)", "今天金额：128 元"),
+    ],
+)
+def test_rules_tester_agrees_with_the_forward_engine(client, app, pattern, text) -> None:
+    """面板上的「正则测试器」和**真正干活的转发引擎**必须给同一个答案。
+
+    🔴 这两边原来是各写各的编译：测试器走 ``_run_match_test`` 里裸的
+    ``re.compile(pattern, IGNORECASE)``，引擎走 ``CompiledMatcher`` 的
+    ``USER_PATTERN_FLAGS | IGNORECASE``。引擎哪天调了标志（比如加
+    ``re.MULTILINE``），测试器就会开始撒谎 —— 而用户理所当然地会信测试器，
+    然后认定"你们的匹配坏了"，最后把一条完全正确的正则删掉。
+
+    这条测试只断言**两边一致**，不钉具体结果：具体结果由
+    ``test_matching.py::TestUserPatternsAreMultiline`` 负责。
+    """
+    from tg_assistant.config import MatchConfig
+    from tg_assistant.matching import CompiledMatcher
+
+    tested = client.post(
+        "/api/rules/test", json={"pattern": pattern, "text": text, "mode": "regex"}
+    ).json()
+    engine = CompiledMatcher(
+        MatchConfig(mode="regex", patterns=[pattern], ignore_case=True)
+    ).match_text(text)
+    assert tested["match"] is engine.matched, (
+        f"测试器说 {tested['match']}，引擎说 {engine.matched}（{engine.reason}）"
+        f" —— 用户会信测试器，所以两边必须一模一样"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 抢红包
 # --------------------------------------------------------------------------- #

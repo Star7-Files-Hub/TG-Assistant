@@ -438,6 +438,8 @@ def _run_match_test(payload: dict[str, Any]) -> dict[str, Any]:
     """
     import re
 
+    from tg_assistant.matching import compile_user_pattern
+
     pattern = str(payload.get("pattern", ""))
     text = str(payload.get("text", ""))
     mode = str(payload.get("mode", "regex"))
@@ -450,7 +452,12 @@ def _run_match_test(payload: dict[str, Any]) -> dict[str, Any]:
 
     if mode == "regex":
         try:
-            compiled = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+            # 🔴 必须走 ``compile_user_pattern``：它和转发引擎（``CompiledMatcher``）
+            # 用的是**同一份** flags。这里曾经是裸的 ``re.compile(pattern,
+            # IGNORECASE)`` —— 两边各写各的，引擎哪天调了标志（比如加
+            # ``re.MULTILINE``），测试器就会给出**不一样**的答案，
+            # 而用户理所当然地会信测试器，然后认定"你们的匹配坏了"。
+            compiled = compile_user_pattern(pattern, ignore_case=ignore_case)
         except re.error as exc:
             return {"match": False, "error": f"正则表达式无效: {exc}"}
         found = compiled.search(text)

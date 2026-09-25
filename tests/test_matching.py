@@ -16,8 +16,10 @@ from tg_assistant.matching import (
     build_variables,
     button_texts,
     chat_identity,
+    USER_PATTERN_FLAGS,
     chat_kind,
     compile_patterns,
+    compile_user_pattern,
     first_match,
     message_link,
     message_text,
@@ -309,6 +311,63 @@ class TestIdentity:
         assert username == "ch"
         assert is_self is False
         assert is_bot is False
+
+
+class TestUserPatternsAreMultiline:
+    """用户写的正则必须**默认**按行匹配。
+
+    🔴 真实反馈：用户照着「一行一个码」写了
+    ``^(?!.*(.)\\1{3})[A-Z0-9]{12}$``，在一个三行的消息上一条都匹配不上 ——
+    而这条正则在任何在线正则测试工具里都是好的，因为那些工具**默认就按行匹配**。
+    没有 ``re.MULTILINE`` 时 ``^`` / ``$`` 只认整段文本的首尾，用户完全看不出
+    哪里错了，只会以为「你们的正则引擎坏了」。
+    """
+
+    #: 用户实际会收到的消息形状：码独占一行，上下都是别的字。
+    MESSAGE = "🎁 注册码\nCZAMTIRLMX2U\n有效期 30 天"
+
+    def test_patterns_get_the_multiline_flag(self):
+        assert compile_patterns(["x"])[0].flags & USER_PATTERN_FLAGS
+        assert compile_user_pattern("x").flags & USER_PATTERN_FLAGS
+
+    def test_code_on_its_own_line_matches(self):
+        """这一条就是用户报的那个场景。"""
+        pattern = compile_patterns([r"^(?!.*(.)\1{3})[A-Z0-9]{12}$"])[0]
+        assert pattern.search(self.MESSAGE) is not None
+
+    def test_forward_rule_regex_matches_a_line(self):
+        """转发任务走的是 ``CompiledMatcher``，也要按行匹配。"""
+        config = MatchConfig(mode="regex", patterns=[r"^MSKY-\d+-[A-Za-z]+_[0-9a-f]{10}$"])
+        result = CompiledMatcher(config).match_text("🎥 影库\nMSKY-30-Register_ab12cd34ef\n请尽快注册")
+        assert result.matched, result.reason
+
+    def test_exclude_patterns_are_multiline_too(self):
+        """排除规则不加 MULTILINE 的话，行内的排除项一条都拦不住。"""
+        config = MatchConfig(
+            mode="regex",
+            patterns=["."],
+            exclude_patterns=[r"^广告$"],
+        )
+        assert CompiledMatcher(config).match_text("正常内容\n广告\n正常内容").matched is False
+
+    def test_ignore_case_still_composes(self):
+        config = MatchConfig(mode="regex", patterns=["^abc$"], ignore_case=True)
+        assert CompiledMatcher(config).match_text("XYZ\nABC\nXYZ").matched is True
+
+    def test_dot_does_not_cross_lines(self):
+        """只加 MULTILINE，**不加** DOTALL。
+
+        ``.`` 跨行会把整条消息吞成一个匹配，``.*`` 这类写法立刻变得不可控 ——
+        这是刻意不做的，钉在这里防止以后有人"顺手"补上。
+        """
+        pattern = compile_patterns([r"^a.*b$"])[0]
+        assert pattern.search("a\nb") is None
+        assert pattern.search("axxb") is not None
+
+    def test_a_pattern_without_anchors_is_unaffected(self):
+        """没写 ``^`` / ``$`` 的老正则行为完全不变（MULTILINE 对它们无影响）。"""
+        pattern = compile_patterns(["抢到"])[0]
+        assert pattern.search("第一行\n恭喜你抢到\n第三行") is not None
 
 
 class TestHelpers:

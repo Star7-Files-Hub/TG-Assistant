@@ -55,7 +55,10 @@
                 </div>
                 <div class="rg-input-group">
                     <label>正文预筛正则</label>
-                    <p class="rg-hint">命中任意一条才去提取（留空表示不预筛）</p>
+                    <p class="rg-hint">
+                        命中任意一条才去提取（留空表示不预筛）。<code>^</code> / <code>$</code>
+                        匹配<b>每一行</b>的首尾（多行模式默认开启），不是整条消息的首尾。
+                    </p>
                     <div class="tag-input" id="rg-text-patterns-input">
                         <div class="tag-list" id="rg-text-patterns-list"></div>
                         <input type="text" id="rg-text-patterns-field" placeholder="输入正则，按回车添加" />

@@ -158,6 +158,11 @@
                             <div class="tag-list" id="patterns-list"></div>
                             <input type="text" id="patterns-field" placeholder="输入正则，按回车添加，如：(?:BTC|比特币)" />
                         </div>
+                        <p class="form-hint">
+                            <code>^</code> 和 <code>$</code> 匹配<b>每一行</b>的首尾（多行模式默认开启），
+                            所以「码独占一行」的写法直接可用：<code>^[A-Z0-9]{12}$</code>。
+                            多条正则之间是「或」。
+                        </p>
                     </div>
 
                     <!-- 排除规则 -->

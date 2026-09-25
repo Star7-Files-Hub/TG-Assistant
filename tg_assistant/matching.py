@@ -223,7 +223,7 @@ class CompiledMatcher:
 
     def __init__(self, config: MatchConfig) -> None:
         self.config = config
-        self._flags = re.IGNORECASE if config.ignore_case else 0
+        self._flags = USER_PATTERN_FLAGS | (re.IGNORECASE if config.ignore_case else 0)
         if config.mode == "regex":
             self._patterns = [(p, re.compile(p, self._flags)) for p in config.patterns]
             self._excludes = [(p, re.compile(p, self._flags)) for p in config.exclude_patterns]
@@ -290,8 +290,32 @@ class CompiledMatcher:
         return False
 
 
+#: 用户写的正则一律按**逐行**语义编译（``re.MULTILINE``）。
+#:
+#: 不加这个标志时 ``^`` / ``$`` 只认**整段文本**的首尾，而 Telegram 消息几乎
+#: 都是多行的::
+#:
+#:     🎁 注册码
+#:     MSKY-30-Register_ab12cd34ef
+#:     有效期 30 天
+#:
+#: 于是用户照着「一行一个码」写的 ``^[A-Z0-9]{12}$`` 一条都匹配不上 ——
+#: 而这条正则在任何在线正则测试工具里都是好的（那些工具默认就按行匹配），
+#: 用户完全看不出哪里错了。这不是"少了个高级选项"，是**默认行为错了**。
+#:
+#: 只加 ``MULTILINE``，不加 ``DOTALL``：``.`` 跨行会把整条消息吞成一个
+#: 匹配，``.*`` 这种写法立刻变得不可控。
+USER_PATTERN_FLAGS = re.MULTILINE
+
+
+def compile_user_pattern(pattern: str, *, ignore_case: bool = False) -> re.Pattern[str]:
+    """编译一条**用户写的**正则（统一带上 :data:`USER_PATTERN_FLAGS`）。"""
+    flags = USER_PATTERN_FLAGS | (re.IGNORECASE if ignore_case else 0)
+    return re.compile(pattern, flags)
+
+
 def compile_patterns(patterns: Sequence[str], ignore_case: bool = True) -> list[re.Pattern[str]]:
-    flags = re.IGNORECASE if ignore_case else 0
+    flags = USER_PATTERN_FLAGS | (re.IGNORECASE if ignore_case else 0)
     return [re.compile(p, flags) for p in patterns]
 
 
@@ -439,7 +463,9 @@ __all__ = [
     "build_variables",
     "button_texts",
     "chat_identity",
+    "USER_PATTERN_FLAGS",
     "compile_patterns",
+    "compile_user_pattern",
     "first_match",
     "match_fields_text",
     "media_kind",
