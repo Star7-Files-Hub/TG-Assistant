@@ -33,6 +33,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
@@ -265,6 +266,8 @@ class RegGrabHunter:
             "duplicate_code": 0,
             "usage_notices": 0,
             "used_skipped": 0,
+            #: 发现了注册码，但因为不在**监听时段**内而没有动手的次数。
+            "outside_window": 0,
             "steps_ok": 0,
             "steps_failed": 0,
         }
@@ -350,6 +353,8 @@ class RegGrabHunter:
             delay_range_s=f"{self.config.delay:.1f}~{self.config.delay + self.config.jitter:.1f}",
             code_ttl_s=self.config.code_ttl,
             max_concurrency=self.config.max_concurrency,
+            window=self.config.window.describe(),
+            in_window=self.config.in_window,
         )
 
     async def close(self) -> None:
@@ -370,6 +375,19 @@ class RegGrabHunter:
     async def _on_edited(self, client: Client, message: Any) -> None:
         del client
         self._dispatch(message, edited=True)
+
+    def _now(self) -> datetime:
+        """当前**本地**时间。抽成方法是为了测试能注入固定时刻。
+
+        ⚠️ 用 ``datetime.now()``（本地时区）而不是 ``utcnow()``：服务进程的
+        ``TZ=Asia/Shanghai``，面板上填的 ``08:00`` 就是北京时间。换成 UTC 会让
+        时段整体偏 8 小时 —— 而且是「看起来一切正常」的那种错。
+        """
+        return datetime.now()
+
+    def _in_window(self) -> bool:
+        """此刻是否允许动手。``window.enabled=False`` 时恒为 ``True``（全天）。"""
+        return self.config.window.contains(self._now())
 
     def _dispatch(self, message: Any, *, edited: bool) -> None:
         chat_id, _, _ = chat_identity(message)
@@ -393,6 +411,25 @@ class RegGrabHunter:
             return
 
         _, _, chat_title = chat_identity(message)
+
+        # 监听时段：不在时段内就只记一笔、**不动手**。
+        #
+        # 🔴 位置很讲究 —— 必须在下面「记去重名额」**之前**：
+        #    时段外把名额占掉的话，时段内同一条码再来时会被当成重复而跳过，
+        #    等于白白错过一次机会。
+        #
+        # 为什么要有这个开关：抢注是秒级响应的行为，半夜三点还能精准抢到码是脚本
+        # 最好认的特征之一。把动手时间限制在人类活动时段能明显降低被识别的概率。
+        if not self._in_window():
+            self.stats["outside_window"] += 1
+            self.alog.info(
+                "发现注册码，但不在监听时段内，跳过",
+                chat=chat_title or chat_id,
+                message_id=getattr(message, "id", None),
+                code=code,
+                window=self.config.window.describe(),
+            )
+            return
 
         # 群里已经播报过「这个码被用掉了」—— 再抢就是白跑一趟，
         # 还会在群里多留一次脚本痕迹，直接剔除。
@@ -567,6 +604,17 @@ class RegGrabHunter:
             message_id=getattr(message, "id", None),
         )
         self.stats["started"] += 1
+
+        # 延迟可能刚好把动手时刻推到了时段之外（比如 22:59:59 派发、23:00:01 才跑）。
+        # 抢注的价值全在「准点」，多等 2 秒也抢不到，但半夜动手会留下脚本痕迹 ⇒ 直接放弃。
+        if not self._in_window():
+            outcome.result = ChainResult.SKIPPED
+            outcome.detail = f"延迟结束时已不在监听时段（{self.config.window.describe()}），已放弃"
+            outcome.cost_ms = (time.perf_counter() - started) * 1000
+            self.stats["outside_window"] += 1
+            self._record(outcome)
+            self._log_outcome(outcome)
+            return outcome
 
         # 延迟期间群里可能已经冒出使用通知 —— 这段等待正好是个免费的检测窗口：
         # 真被别人抢了，在这里刹车就行，不必等步骤链跑完才发现白干。
@@ -971,6 +1019,9 @@ class RegGrabHunter:
             "watching_chats": self._bus.watching,
             "seen_codes": len(self._seen_codes),
             "used_codes": len(self._used),
+            #: 当前是否在监听时段内 —— 面板/CLI 靠它解释「为什么现在没动静」。
+            "in_window": self._in_window(),
+            "window": self.config.window.describe(),
         }
 
 

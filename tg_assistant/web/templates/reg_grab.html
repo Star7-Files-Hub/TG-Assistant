@@ -117,6 +117,35 @@
             </div>
         </div>
 
+        <!-- 监听时段 -->
+        <div class="rg-card">
+            <div class="rg-card-header"><h3>监听时段</h3></div>
+            <div class="rg-card-body">
+                <label class="tg-checkbox">
+                    <input id="rg-window-enabled" type="checkbox" onchange="renderWindow()" />
+                    <span class="tg-checkmark"></span>
+                    <span>只在指定时段内动手（其余时间看着不动）</span>
+                </label>
+                <div class="rg-grid" style="margin-top:12px;">
+                    <div class="rg-input-group">
+                        <label>开始</label>
+                        <input id="rg-window-start" type="time" value="08:00" oninput="renderWindow()" />
+                    </div>
+                    <div class="rg-input-group">
+                        <label>结束</label>
+                        <input id="rg-window-end" type="time" value="23:00" oninput="renderWindow()" />
+                    </div>
+                </div>
+                <p class="rg-hint" id="rg-window-hint"></p>
+                <p class="rg-hint">
+                    抢注是秒级响应的行为，<b>半夜三点还能精准抢到码</b>是脚本最好认的特征之一。
+                    把动手时间限制在人类活动时段，能明显降低被识别的概率。<br />
+                    时间用<b>服务端时区</b>（北京时间）；开始晚于结束表示<b>跨零点</b>（如 22:00 ~ 06:00）。
+                    想全天可抢就别勾这个开关。
+                </p>
+            </div>
+        </div>
+
         <!-- 高级设置 -->
         <div class="rg-card">
             <div class="rg-card-header"><h3>高级设置</h3></div>
@@ -172,6 +201,8 @@
     let currentAccount = '';
     //: 步骤链的本地状态。每次改动都写回这里，保存时整体提交。
     let steps = [];
+    //: 服务端当前时间（HH:MM）—— 时间框填的是服务端时区，没有这个对照用户发现不了时区错位。
+    let rgServerNow = '';
     const tagFields = ['chats', 'exclude_chats', 'text_patterns'];
     const tagInputs = {};
 
@@ -275,7 +306,12 @@
         document.getElementById('rg-max-concurrency').value = data.max_concurrency || 1;
         document.getElementById('rg-notify').checked = data.notify !== false;
         document.getElementById('rg-include-edited').checked = data.include_edited !== false;
+        rgServerNow = data.server_now || '';
+        document.getElementById('rg-window-enabled').checked = !!data.window?.enabled;
+        document.getElementById('rg-window-start').value = data.window?.start || '08:00';
+        document.getElementById('rg-window-end').value = data.window?.end || '23:00';
         renderDelayRange();
+        renderWindow();
 
         steps = (data.steps || []).map(s => Object.assign({}, s));
         renderSteps();
@@ -471,6 +507,32 @@
             + '这段等待同时也是「已被使用」通知的检测窗口：真被别人抢了，通知会在这期间冒出来，链还没开始就能刹车。';
     }
 
+    function renderWindow() {
+        const enabled = document.getElementById('rg-window-enabled').checked;
+        const start = document.getElementById('rg-window-start').value || '08:00';
+        const end = document.getElementById('rg-window-end').value || '23:00';
+        const el = document.getElementById('rg-window-hint');
+        const now = rgServerNow;
+        const clock = now ? `服务端现在 ${now}` : '服务端时间未知';
+
+        if (!enabled) {
+            el.textContent = `⏸ 全天可抢（${clock}）—— 半夜也会动手，脚本特征明显。`;
+            el.classList.add('rg-warn');
+            return;
+        }
+        if (start === end) {
+            el.textContent = '⚠️ 开始和结束不能相同 —— 想全天可抢请把上面的开关取消勾选。';
+            el.classList.add('rg-warn');
+            return;
+        }
+        const cross = start > end;
+        const inside = now ? (cross ? (now >= start || now < end) : (now >= start && now < end)) : null;
+        const scope = cross ? '（跨零点）' : '';
+        const state = inside === null ? '' : (inside ? '✅ 在时段内' : '⏸ 不在时段内，不会动手');
+        el.textContent = `✅ 实际时段：${start} ~ ${end}${scope}　·　${clock}　${state}`;
+        el.classList.remove('rg-warn');
+    }
+
     async function testNotify() {
         const res = await fetch(`/api/config/${currentAccount}/reg_grab/test_notify`, {method: 'POST'});
         const data = await res.json().catch(() => ({}));
@@ -539,6 +601,11 @@
             max_concurrency: parseInt(document.getElementById('rg-max-concurrency').value) || 1,
             notify: document.getElementById('rg-notify').checked,
             include_edited: document.getElementById('rg-include-edited').checked,
+            window: {
+                enabled: document.getElementById('rg-window-enabled').checked,
+                start: document.getElementById('rg-window-start').value || '08:00',
+                end: document.getElementById('rg-window-end').value || '23:00',
+            },
         };
         const res = await fetch(`/api/config/${currentAccount}/reg_grab`, {
             method: 'PUT', headers: {'Content-Type': 'application/json'},

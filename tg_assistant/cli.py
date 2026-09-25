@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Any, Optional
 
 import click
@@ -282,6 +283,8 @@ def accounts_list(ctx: Context, as_json: bool) -> None:
                 "监听会话": source_count,
                 "抢红包": "开" if config.red_packet.enabled else "关",
                 "抢注任务": "开" if config.reg_grab.enabled else "关",
+                # 时段直接进表格：一眼能看出哪个账号半夜还在动手。
+                "抢注时段": config.reg_grab.window.describe(),
                 "通知": "开" if config.notify.enabled else "关",
                 "最后登录": record.last_login_at or "-",
             }
@@ -677,6 +680,14 @@ def config_validate(ctx: Context, accounts: tuple[str, ...]) -> None:
                 f"      提取正则：{config.reg_grab.detect.code_pattern or '（未填）'}"
                 f"，步骤：{len(config.reg_grab.steps)} 步"
                 f"{'' if config.reg_grab.ready else ' ⚠️ 配置不完整，不会执行'}"
+            )
+            # 时段单独一行：它是「此刻到底会不会动手」的直接答案，
+            # 用户排查「为什么没动静」时第一个要看的就是它。
+            window = config.reg_grab.window
+            state = "在时段内" if config.reg_grab.in_window else "不在时段内，不会动手"
+            _info(
+                f"      监听时段：{window.describe()}"
+                f"（服务端现在 {datetime.now().strftime('%H:%M')}，{state}）"
             )
         _info(f"    通知：{'开启' if config.notify.enabled else '关闭'}（模式 {config.notify.mode}）")
         if watched:

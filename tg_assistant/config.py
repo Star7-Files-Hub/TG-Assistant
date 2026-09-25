@@ -26,6 +26,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -805,6 +806,91 @@ class RegGrabDetect(StrictModel):
         return self
 
 
+#: ``HH:MM`` 时钟字面量（也接受 ``H:MM``、中文冒号、以及纯分钟数）。
+_CLOCK_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$")
+
+
+def _parse_clock(value: Any, field: str) -> int:
+    """把 ``"HH:MM"`` 解析成「当天第几分钟」；格式不对直接报错。
+
+    🔴 **不做静默兜底**（比如解析失败就当 0 点）。时间窗这种地方，静默兜底是最危险的：
+    配错了要么整天不抢、要么半夜照抢，而两种情况都「看起来一切正常」——
+    用户只会觉得「功能没生效」，排查时毫无线索。
+    """
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
+        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
+    if isinstance(value, int):
+        if 0 <= value <= 1439:
+            return value
+        raise ValueError(f"{field} 的分钟数要在 0~1439 之间，当前是 {value!r}")
+    match = _CLOCK_RE.match(str(value))
+    if match is None:
+        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{field} 不是合法时间（00:00 ~ 23:59），当前是 {value!r}")
+    return hour * 60 + minute
+
+
+def _format_clock(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+class RegGrabWindow(StrictModel):
+    """抢注的**监听时段**：只在这段时间里动手，其余时间看着不动。
+
+    为什么需要它：抢注是秒级响应的行为，**半夜三点还能精准抢到码**是脚本最好认的
+    特征之一。把动手时间限制在人类活动时段，能明显降低被识别的概率。
+
+    语义（``enabled=False`` 时 :meth:`contains` 恒为 ``True``，即全天可抢）：
+
+    - ``start`` / ``end`` 用 ``HH:MM``，**本地时区**（服务进程 ``TZ=Asia/Shanghai``）；
+    - ``start < end``（如 ``08:00`` ~ ``23:00``）⇒ 当天的这一段；
+    - ``start > end``（如 ``22:00`` ~ ``06:00``）⇒ **跨零点**，从 start 到次日 end；
+    - ``start == end`` 直接报错 —— 想全天就把开关关掉，不要用「相等」去猜语义。
+
+    区间**左闭右开** ``[start, end)``：``08:00~23:00`` = 08:00:00 到 22:59:59。
+    这样 ``08:00~09:00`` 和 ``09:00~10:00`` 首尾相接不会重叠。
+    """
+
+    enabled: bool = False
+    start: str = "08:00"
+    end: str = "23:00"
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _normalize_clock(cls, value: Any, info: ValidationInfo) -> str:
+        return _format_clock(_parse_clock(value, f"reg_grab.window.{info.field_name}"))
+
+    @model_validator(mode="after")
+    def _check_range(self) -> RegGrabWindow:
+        if self.start == self.end:
+            raise ValueError(
+                f"reg_grab.window 的开始和结束时间不能相同（都是 {self.start}）——"
+                " 想全天可抢请把 window.enabled 关掉"
+            )
+        return self
+
+    def contains(self, moment: Optional[datetime] = None) -> bool:
+        """``moment``（默认「现在」）是否落在监听时段内。"""
+        if not self.enabled:
+            return True
+        moment = moment or datetime.now()
+        minute = moment.hour * 60 + moment.minute
+        start = _parse_clock(self.start, "reg_grab.window.start")
+        end = _parse_clock(self.end, "reg_grab.window.end")
+        if start < end:
+            return start <= minute < end
+        return minute >= start or minute < end  # 跨零点
+
+    def describe(self) -> str:
+        """给人看的一句话，用于日志 / 面板 / CLI。"""
+        if not self.enabled:
+            return "全天"
+        suffix = "（跨零点）" if self.start > self.end else ""
+        return f"{self.start}~{self.end}{suffix}"
+
+
 class RegGrabConfig(StrictModel):
     """抢注任务：监听到符合正则的注册码后，按**步骤链**自动操作。
 
@@ -842,6 +928,8 @@ class RegGrabConfig(StrictModel):
     notify: bool = True
     #: 也处理消息编辑事件（有些码是通过编辑消息补上的）。
     include_edited: bool = True
+    #: 监听时段：只在这段时间里动手，其余时间看着不动（避免半夜秒抢暴露脚本）。
+    window: RegGrabWindow = Field(default_factory=RegGrabWindow)
 
     @field_validator("chats", "exclude_chats", mode="before")
     @classmethod
@@ -854,8 +942,18 @@ class RegGrabConfig(StrictModel):
 
     @property
     def ready(self) -> bool:
-        """配置是否完整到能干活：开了开关、有提取正则、且至少一条步骤。"""
+        """配置是否完整到能干活：开了开关、有提取正则、且至少一条步骤。
+
+        ⚠️ 这里**不看**监听时段：时段是「现在能不能动手」，``ready`` 是「配好了没有」。
+        把两者混在一起，面板上会出现「明明配好了却显示未就绪」，而且随着时间跳变。
+        当前是否在时段内由 :meth:`in_window` 单独回答。
+        """
         return bool(self.enabled and self.detect.code_pattern and self.steps)
+
+    @property
+    def in_window(self) -> bool:
+        """此刻是否落在监听时段内（``window.enabled=False`` 时恒为 ``True``）。"""
+        return self.window.contains()
 
 
 # --------------------------------------------------------------------------- #

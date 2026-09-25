@@ -279,6 +279,44 @@ def test_every_template_class_is_defined_in_css() -> None:
     assert not missing, f"这些模板引用了 style.css 里不存在的类：{missing}"
 
 
+def test_shared_form_selectors_cover_every_page_prefix() -> None:
+    """共享表单选择器必须**三个前缀齐全** —— 少一个就是整页控件没样式。
+
+    真实事故：``.rp-input-group input, .nt-input-group input,`` 这一行列了 rp/nt，
+    下一行只写了 ``.rg-input-group textarea`` —— ``.rg-input-group input`` 谁都没提。
+    后果是抢注页所有输入框退回浏览器默认样式（深色主题上一片惨白），
+    而 :func:`test_every_template_class_is_defined_in_css` **查不出来** ——
+    类名 ``rg-input-group`` 本身是定义过的，缺的是元素选择器。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    css = (web_dir / "static" / "css" / "style.css").read_text(encoding="utf-8")
+    # 三个「同构页面」前缀：抢红包 / 通知 / 抢注。
+    prefixes = ("rp", "nt", "rg")
+
+    for element in ("input", "select", "textarea"):
+        for prefix in prefixes:
+            selector = f".{prefix}-input-group {element}"
+            assert selector in css, f"style.css 里没有 {selector} —— 这个页面的 {element} 会没样式"
+        # 焦点态同样要齐全，否则点了输入框只有部分页面有高亮。
+        for prefix in prefixes:
+            selector = f".{prefix}-input-group {element}:focus"
+            assert selector in css, f"style.css 里没有 {selector}"
+
+
+def test_time_inputs_render_in_dark_mode() -> None:
+    """``<input type="time">`` 要显式声明 ``color-scheme: dark``。
+
+    不声明时，原生时钟图标/下拉在深色输入框上几乎是黑的 —— 肉眼看不见，
+    而且只有点开才发现，属于「截图里根本看不出来」的那类问题。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    css = (web_dir / "static" / "css" / "style.css").read_text(encoding="utf-8")
+    reg_grab = (web_dir / "templates" / "reg_grab.html").read_text(encoding="utf-8")
+
+    assert 'type="time"' in reg_grab, "前提：抢注页确实用了原生时间控件"
+    assert "color-scheme: dark" in css, "原生时间控件在深色主题下会看不见图标"
+
+
 # --------------------------------------------------------------------------- #
 # 登录页 ↔ 登录接口的字段契约
 # --------------------------------------------------------------------------- #

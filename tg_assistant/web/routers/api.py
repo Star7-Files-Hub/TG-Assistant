@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query
@@ -304,6 +305,9 @@ def _example_config() -> Any:
                     "code_pattern": r"(?:Register|Renew|Whitelist)_([A-Za-z0-9]{10})",
                     "text_patterns": [],
                 },
+                # 监听时段：只在人类活动时段动手，避免半夜秒抢暴露脚本。
+                # enabled=False 表示全天可抢（默认）。start > end 表示跨零点。
+                "window": {"enabled": True, "start": "08:00", "end": "23:00"},
                 "steps": [
                     {
                         "type": "send",
@@ -817,6 +821,14 @@ async def api_red_packet_enabled(
 # --------------------------------------------------------------------------- #
 # 抢注任务
 # --------------------------------------------------------------------------- #
+#: GET 里额外塞给面板的**只读**字段：PUT 时直接丢掉。
+#:
+#: 不丢的话，`RegGrabConfig` 是 ``extra="forbid"`` 的 —— 面板（或任何脚本）
+#: 把 GET 的结果原样 PUT 回来会直接 400「Extra inputs are not permitted」，
+#: 而用户看到的是「保存失败」，根本猜不到是这三个字段惹的。
+_REG_GRAB_READONLY = ("ready", "in_window", "server_now")
+
+
 @router.get("/config/{name}/reg_grab")
 async def api_reg_grab_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
     _require_account(store, name)
@@ -824,6 +836,11 @@ async def api_reg_grab_get(name: str, store=Depends(get_store)) -> dict[str, Any
     data = config.model_dump(mode="json")
     # 面板要拿它来提示「开关开了但还没配好」，不用自己重复一遍判断逻辑。
     data["ready"] = config.ready
+    # 时段是「**此刻**能不能动手」，会随时间跳变 ⇒ 每次 GET 现算，不落盘。
+    # 同时把**服务端当前时间**给出去：时间框里填的是服务端时区（Asia/Shanghai），
+    # 用户本地时区不一致时，光看那两个时间框是发现不了的 —— 必须有个「现在几点」对照。
+    data["in_window"] = config.in_window
+    data["server_now"] = datetime.now().strftime("%H:%M")
     return data
 
 
@@ -837,8 +854,10 @@ async def api_reg_grab_put(
 
     _require_account(store, name)
     config = store.load_account_config(name, create=False)
+    # 只读字段直接丢掉，让「GET 回来改一改再 PUT 回去」这种用法也能work。
+    body = {k: v for k, v in payload.items() if k not in _REG_GRAB_READONLY}
     try:
-        config.reg_grab = RegGrabConfig.model_validate(payload)
+        config.reg_grab = RegGrabConfig.model_validate(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
     store.save_account_config(name, config)

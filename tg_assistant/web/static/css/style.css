@@ -1545,15 +1545,20 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
    那个「未运行」就是这么被拉长的，看着像个空进度条）。让它按内容宽度收缩。 */
 .rp-input-group .badge, .nt-input-group .badge, .rg-input-group .badge { align-self: flex-start; }
 .rp-input-group label, .nt-input-group label, .rg-input-group label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
-.rp-input-group input, .nt-input-group input,
-.rp-input-group select, .nt-input-group select,
+/* 🔴 三个前缀必须**同时**出现在每一行上。漏掉 `.rg-input-group input` 的后果是
+   抢注页所有输入框退回浏览器默认样式 —— 深色主题上一片惨白，而且不报任何错。 */
+.rp-input-group input, .nt-input-group input, .rg-input-group input,
+.rp-input-group select, .nt-input-group select, .rg-input-group select,
 .rp-input-group textarea, .nt-input-group textarea, .rg-input-group textarea {
     width: 100%; padding: 10px 12px; background: rgba(13,17,23,0.6);
     border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 13px;
     transition: all 0.2s;
+    /* 让 <input type="time"> 的原生时钟图标、下拉日历在深色主题下也是深色的。
+       不写这行的话图标是近黑色，在深色输入框上基本看不见。 */
+    color-scheme: dark;
 }
-.rp-input-group input:focus, .nt-input-group input:focus,
-.rp-input-group select:focus, .nt-input-group select:focus,
+.rp-input-group input:focus, .nt-input-group input:focus, .rg-input-group input:focus,
+.rp-input-group select:focus, .nt-input-group select:focus, .rg-input-group select:focus,
 .rp-input-group textarea:focus, .nt-input-group textarea:focus, .rg-input-group textarea:focus {
     outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(47,129,247,0.1);
 }

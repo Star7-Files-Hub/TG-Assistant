@@ -6,11 +6,17 @@ import asyncio
 import random
 import re
 import time
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
 
-from tg_assistant.config import AccountConfig, RegGrabConfig, RegGrabStep
+from tg_assistant.config import (
+    AccountConfig,
+    RegGrabConfig,
+    RegGrabStep,
+    RegGrabWindow,
+)
 from tg_assistant.reg_grab import (
     ChainResult,
     RegGrabHunter,
@@ -653,6 +659,213 @@ class TestUsageNotice:
 
 
 # --------------------------------------------------------------------------- #
+def at(hour: int, minute: int = 0) -> datetime:
+    """构造一个「本地时间」用于时段判定 —— 只看时分，日期无关紧要。"""
+    return datetime(2026, 1, 1, hour, minute)
+
+
+class TestWindow:
+    """监听时段：只在人类活动时段动手，避免半夜秒抢暴露脚本。"""
+
+    def test_disabled_by_default_means_all_day(self) -> None:
+        window = RegGrabWindow()
+        assert window.enabled is False
+        assert window.describe() == "全天"
+        for hour in (0, 3, 12, 23):
+            assert window.contains(at(hour)) is True, "开关关着 ⇒ 任何时刻都允许"
+
+    def test_normal_range_is_left_closed_right_open(self) -> None:
+        window = RegGrabWindow(enabled=True, start="08:00", end="23:00")
+        assert window.contains(at(7, 59)) is False
+        assert window.contains(at(8, 0)) is True, "起点含在内"
+        assert window.contains(at(22, 59)) is True
+        assert window.contains(at(23, 0)) is False, "终点不含 —— 否则相邻两段会重叠"
+
+    def test_adjacent_ranges_do_not_overlap(self) -> None:
+        morning = RegGrabWindow(enabled=True, start="08:00", end="09:00")
+        noon = RegGrabWindow(enabled=True, start="09:00", end="10:00")
+        assert morning.contains(at(9, 0)) is False
+        assert noon.contains(at(9, 0)) is True
+
+    def test_crossing_midnight(self) -> None:
+        """``start > end`` ⇒ 跨零点（如 22:00 ~ 06:00）。"""
+        window = RegGrabWindow(enabled=True, start="22:00", end="06:00")
+        assert window.contains(at(23, 30)) is True
+        assert window.contains(at(0, 0)) is True
+        assert window.contains(at(5, 59)) is True
+        assert window.contains(at(6, 0)) is False
+        assert window.contains(at(12, 0)) is False
+        assert "跨零点" in window.describe()
+
+    def test_start_equal_end_is_rejected(self) -> None:
+        """🔴 不许用「相等」猜语义 —— 想全天就关开关，别让人以为配上了。"""
+        with pytest.raises(ValidationError, match="不能相同"):
+            RegGrabWindow(enabled=True, start="08:00", end="08:00")
+
+    def test_bad_format_is_rejected_loudly(self) -> None:
+        """🔴 不静默兜底：解析失败就当 0 点的话，配错了会「看起来一切正常」。"""
+        for bad in ("8点", "晚上8点", "", "25:00", "08:70", "0800"):
+            with pytest.raises(ValidationError):
+                RegGrabWindow(start=bad)
+
+    def test_clock_is_normalized(self) -> None:
+        assert RegGrabWindow(start="8:5").start == "08:05"
+        assert RegGrabWindow(start="8：00", end="23:00").start == "08:00", "中文冒号也认"
+        assert RegGrabWindow(start= 8 * 60, end=23 * 60).start == "08:00", "纯分钟数也认"
+
+    def test_window_default_in_config_is_off(self) -> None:
+        config = RegGrabConfig()
+        assert config.window.enabled is False
+        assert config.in_window is True
+
+    def test_ready_ignores_the_window(self) -> None:
+        """``ready`` 是「配好了没有」，不是「现在能不能动手」—— 两者混在一起，
+        面板会出现「明明配好了却显示未就绪」，而且随着时间跳变。"""
+        config = RegGrabConfig(
+            enabled=True,
+            detect={"code_pattern": PATTERN},
+            steps=[{"type": "wait", "seconds": 1}],
+            window={"enabled": True, "start": "08:00", "end": "09:00"},
+        )
+        assert config.ready is True
+        assert config.window.contains(at(3)) is False, "凌晨不在时段内"
+
+
+# --------------------------------------------------------------------------- #
+class TestWindowInEngine:
+    """引擎层：时段外只看着不动，而且**不占去重名额**。"""
+
+    @staticmethod
+    def _at(hunter, hour: int, minute: int = 0):
+        hunter._now = lambda: at(hour, minute)
+        return hunter
+
+    def test_outside_window_does_not_grab(self, alog) -> None:
+        client = bot_client()
+        hunter = self._at(
+            build(rg_config(window={"enabled": True, "start": "08:00", "end": "23:00"}),
+                  client=client, alog=alog),
+            3,
+        )
+        hunter._dispatch(rg_message(), edited=False)
+
+        assert hunter.stats["outside_window"] == 1
+        assert hunter.stats["detected"] == 0, "时段外连「发现」都不该记"
+        assert client.sent == [], "半夜不该动手"
+        assert list(hunter._tasks) == []
+
+    @pytest.mark.asyncio
+    async def test_inside_window_still_grabs(self, alog) -> None:
+        client = bot_client()
+        hunter = self._at(
+            build(rg_config(window={"enabled": True, "start": "08:00", "end": "23:00"}),
+                  client=client, alog=alog),
+            12,
+        )
+        hunter._dispatch(rg_message(), edited=False)
+        await asyncio.gather(*list(hunter._tasks))
+
+        assert hunter.stats["outside_window"] == 0
+        assert hunter.stats["detected"] == 1
+        assert hunter.stats["success"] == 1, "白天照常抢"
+
+    @pytest.mark.asyncio
+    async def test_disabled_window_grabs_around_the_clock(self, alog) -> None:
+        """开关关着 ⇒ 任何时刻都照抢（不改变老行为）。"""
+        client = bot_client()
+        hunter = self._at(build(rg_config(), client=client, alog=alog), 3)
+        hunter._dispatch(rg_message(), edited=False)
+        await asyncio.gather(*list(hunter._tasks))
+        assert hunter.stats["detected"] == 1
+
+    @pytest.mark.asyncio
+    async def test_outside_window_does_not_consume_the_dedupe_slot(self, alog) -> None:
+        """🔴 时段外**不能**把「同码去重」名额占掉。
+
+        占了的话，时段内同一条码再来时会被当成重复而跳过 —— 白等一整天。
+        """
+        config = rg_config(window={"enabled": True, "start": "08:00", "end": "23:00"})
+        client = bot_client()
+        hunter = self._at(build(config, client=client, alog=alog), 3)
+        hunter._dispatch(rg_message(), edited=False)
+        assert hunter.stats["outside_window"] == 1
+        assert hunter._seen_codes == {}, "时段外不许记去重名额"
+
+        self._at(hunter, 12)
+        hunter._dispatch(rg_message(), edited=False)
+        await asyncio.gather(*list(hunter._tasks))
+        assert hunter.stats["detected"] == 1, "时段内同一条码必须还能抢"
+
+    @pytest.mark.asyncio
+    async def test_window_closing_during_delay_aborts_chain(self, alog) -> None:
+        """延迟把动手时刻推到了时段之外（22:59:59 派发、23:00:01 才跑）⇒ 放弃。
+
+        抢注的价值全在「准点」，多等 2 秒也抢不到；但半夜动手会留下脚本痕迹。
+        """
+        client = bot_client()
+        hunter = build(
+            rg_config(delay=0.2, jitter=0, window={"enabled": True, "start": "08:00", "end": "23:00"}),
+            client=client, alog=alog,
+        )
+        hunter._now = lambda: at(22, 59)
+
+        async def close_window() -> None:
+            await asyncio.sleep(0.05)
+            hunter._now = lambda: at(23, 0)
+
+        closer = asyncio.create_task(close_window())
+        outcome = await hunter._run(rg_message(), CODE_VALUE, time.perf_counter())
+        await closer
+
+        assert outcome.result is ChainResult.SKIPPED
+        assert "监听时段" in outcome.detail
+        assert client.sent == [], "时段外不许动手"
+        assert hunter.stats["outside_window"] == 1
+
+    def test_snapshot_exposes_the_window_state(self, alog) -> None:
+        """面板/CLI 靠这两个字段解释「为什么现在没动静」。"""
+        hunter = self._at(
+            build(rg_config(window={"enabled": True, "start": "08:00", "end": "23:00"}), alog=alog),
+            3,
+        )
+        snap = hunter.snapshot()
+        assert snap["in_window"] is False
+        assert snap["window"] == "08:00~23:00"
+        assert snap["outside_window"] == 0
+
+    @pytest.mark.asyncio
+    async def test_register_logs_the_window(self) -> None:
+        """注册那行必须带上时段与「此刻在不在时段内」—— 排查「为什么没动静」全看它。"""
+        lines: list[str] = []
+
+        class _Log:
+            def bind(self, *args, **kwargs):
+                return self
+
+            def info(self, msg, **kw):
+                lines.append(msg + " " + " ".join(f"{k}={v}" for k, v in kw.items()))
+
+            def warning(self, msg, **kw):
+                lines.append(msg)
+
+            def error(self, msg, **kw):
+                lines.append(msg)
+
+            def debug(self, msg, **kw):
+                pass
+
+        hunter = self._at(
+            build(rg_config(window={"enabled": True, "start": "22:00", "end": "06:00"}), alog=_Log()),
+            3,
+        )
+        await hunter.register()
+
+        text = "\n".join(lines)
+        assert "22:00~06:00（跨零点）" in text
+        assert "in_window=True" in text, "凌晨 3 点落在 22:00~06:00 内 ⇒ 应当是 True"
+
+
+# --------------------------------------------------------------------------- #
 class TestDelay:
     """反脚本延迟：默认就该有一点，别秒回。"""
 
@@ -793,6 +1006,54 @@ class TestTestNotifyEndpoint:
             res = client.post("/api/config/acct/reg_grab/test_notify")
         assert res.status_code == 400
         assert "没在运行" in res.json()["detail"]
+
+    def test_get_exposes_the_window_and_the_server_clock(self, tmp_path) -> None:
+        """面板要靠 ``server_now`` 对照时区 —— 只给两个时间框，用户本地时区
+        不一致时是发现不了的（填 08:00 以为是本地时间，实际按北京时间算）。"""
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path)
+        with TestClient(app) as client:
+            res = client.get("/api/config/acct/reg_grab")
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["window"] == {"enabled": False, "start": "08:00", "end": "23:00"}
+        assert data["in_window"] is True, "时段开关没开 ⇒ 恒为「可抢」"
+        assert re.fullmatch(r"\d{2}:\d{2}", data["server_now"]), data["server_now"]
+
+    def test_get_then_put_round_trips(self, tmp_path) -> None:
+        """🔴 回归：GET 的结果原样 PUT 回去必须成功。
+
+        GET 额外带了 ``ready`` / ``in_window`` / ``server_now`` 三个只读字段，
+        而 ``RegGrabConfig`` 是 ``extra="forbid"`` 的 —— 不把它们丢掉就是 400，
+        用户只看到「保存失败」，根本猜不到是这三个字段惹的。
+        """
+        from fastapi.testclient import TestClient
+
+        app, store = self._app_with_account(tmp_path)
+        with TestClient(app) as client:
+            data = client.get("/api/config/acct/reg_grab").json()
+            data["window"] = {"enabled": True, "start": "22:00", "end": "06:00"}
+            res = client.put("/api/config/acct/reg_grab", json=data)
+
+        assert res.status_code == 200, res.text
+        saved = store.load_account_config("acct", create=False).reg_grab.window
+        assert saved.enabled is True
+        assert (saved.start, saved.end) == ("22:00", "06:00")
+
+    def test_put_rejects_an_impossible_window(self, tmp_path) -> None:
+        """开始 == 结束 ⇒ 400，且提示里要说清「想全天就关开关」。"""
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app_with_account(tmp_path)
+        with TestClient(app) as client:
+            data = client.get("/api/config/acct/reg_grab").json()
+            data["window"] = {"enabled": True, "start": "08:00", "end": "08:00"}
+            res = client.put("/api/config/acct/reg_grab", json=data)
+
+        assert res.status_code == 400
+        assert "不能相同" in res.json()["detail"]
 
     def test_submits_through_the_running_notifier(self, tmp_path) -> None:
         """有实例在跑时走的是同一个 notifier、同一个 reg_grab 事件。"""

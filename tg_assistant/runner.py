@@ -739,6 +739,11 @@ class AccountRunner:
                     # 「通知收到不少但剔除一直是 0」通常意味着可见位数不够或正则没对上。
                     "rg_notices": snapshot["usage_notices"],
                     "rg_used_skip": snapshot["used_skipped"],
+                    # 监听时段挡下的次数 + 当前是否在时段内。
+                    # 「时段外发现码」本该是常态（半夜照样有码，只是我们不抢），
+                    # 这个数字 >0 才说明时段真的在起作用。
+                    "rg_window_skip": snapshot["outside_window"],
+                    "rg_in_window": snapshot["in_window"],
                 }
             )
         if self.notifier is not None:
