@@ -283,19 +283,28 @@ def _example_config() -> Any:
             },
             "red_packet": {
                 "enabled": False,
-                "chats": [],
-                "strategy": "auto",
-                "detect": {
-                    "button_keywords": ["领取", "抢", "红包", "🧧"],
-                    "code_pattern": None,
-                    "keyword_template": None,
-                },
-                "reply": {
-                    "enabled": True,
-                    "texts": ["谢谢老板", "xxlb", "感谢大哥"],
-                    "only_on_success": True,
-                    "delay_range": [0.8, 2.5],
-                },
+                "max_concurrency": 3,
+                # 多条互不影响的任务，按顺序匹配：一条红包只被**第一个**命中的任务抢。
+                "tasks": [
+                    {
+                        "id": "main",
+                        "name": "主频道",
+                        "enabled": True,
+                        "chats": [],
+                        "strategy": "auto",
+                        "detect": {
+                            "button_keywords": ["领取", "抢", "红包", "🧧"],
+                            "code_pattern": None,
+                            "keyword_template": None,
+                        },
+                        "reply": {
+                            "enabled": True,
+                            "texts": ["谢谢老板", "xxlb", "感谢大哥"],
+                            "only_on_success": True,
+                            "delay_range": [0.8, 2.5],
+                        },
+                    }
+                ],
             },
             "reg_grab": {
                 "enabled": False,
@@ -781,10 +790,23 @@ async def api_rules_test_global(payload: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 抢红包设置
 # --------------------------------------------------------------------------- #
+#: GET 会在每条任务上多塞的**只读**字段：PUT 时直接丢掉。
+#:
+#: 不丢的话 ``RedPacketTask`` 是 ``extra="forbid"`` 的，把 GET 的结果原样
+#: PUT 回来会 400「Extra inputs are not permitted」，用户只看到"保存失败"。
+_RED_PACKET_TASK_READONLY = ("ready", "problem")
+
+
 @router.get("/config/{name}/red_packet")
 async def api_red_packet_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
     _require_account(store, name)
-    return store.load_account_config(name, create=False).red_packet.model_dump(mode="json")
+    config = store.load_account_config(name, create=False).red_packet
+    data = config.model_dump(mode="json")
+    # 面板要按任务显示「配好了没有」，不用自己重复一遍判断逻辑。
+    for item, task in zip(data["tasks"], config.tasks):
+        item["ready"] = task.ready
+        item["problem"] = task.problem
+    return data
 
 
 @router.put("/config/{name}/red_packet")
@@ -797,12 +819,17 @@ async def api_red_packet_put(
 
     _require_account(store, name)
     config = store.load_account_config(name, create=False)
+    body = dict(payload)
+    body["tasks"] = [
+        {key: value for key, value in task.items() if key not in _RED_PACKET_TASK_READONLY}
+        for task in body.get("tasks", [])
+    ]
     try:
-        config.red_packet = RedPacketConfig.model_validate(payload)
+        config.red_packet = RedPacketConfig.model_validate(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
     store.save_account_config(name, config)
-    return {"ok": True}
+    return {"ok": True, "tasks": len(config.red_packet.tasks)}
 
 
 @router.put("/config/{name}/red_packet/enabled")

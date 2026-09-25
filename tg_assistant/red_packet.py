@@ -39,7 +39,7 @@ from pyrogram.errors import (
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 
 from .client import SessionInvalid, with_flood_retry
-from .config import AccountConfig, RedPacketConfig
+from .config import AccountConfig, RedPacketConfig, RedPacketTask
 from .logging_setup import AccountLogger
 from .matching import (
     DEFAULT_RED_PACKET_TEMPLATE,
@@ -103,6 +103,48 @@ class GrabOutcome:
     evidence: Optional[str] = None
     replied: Optional[str] = None
     attempts: int = 1
+    #: 是哪条任务干的 —— 多任务之后，日志里不写这个就分不清谁抢到的。
+    task: Optional[str] = None
+
+
+@dataclass
+class PreparedTask:
+    """一条抢红包任务 + 预编译好的正则与会话集合。
+
+    正则编译一次、整个进程复用：红包是秒级的事情，每条消息现编译正则
+    会在最不该慢的地方拖后腿。
+    """
+
+    config: RedPacketTask
+    chats: RefSet
+    exclude_chats: RefSet
+    button_keywords: list[str]
+    text_patterns: list[Any]
+    code_pattern: Optional[Any]
+    success_patterns: list[Any]
+    failure_patterns: list[Any]
+
+    @property
+    def id(self) -> str:
+        return self.config.id
+
+    @property
+    def label(self) -> str:
+        return self.config.label
+
+    @classmethod
+    def build(cls, config: RedPacketTask) -> "PreparedTask":
+        detect = config.detect
+        return cls(
+            config=config,
+            chats=RefSet(config.chats),
+            exclude_chats=RefSet(config.exclude_chats),
+            button_keywords=[keyword.lower() for keyword in detect.button_keywords],
+            text_patterns=compile_patterns(detect.text_patterns),
+            code_pattern=re.compile(detect.code_pattern) if detect.code_pattern else None,
+            success_patterns=compile_patterns(config.success.success_patterns),
+            failure_patterns=compile_patterns(config.success.failure_patterns),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -167,15 +209,10 @@ class RedPacketHunter:
         self.alog = alog.bind("redpacket")
         self.notifier = notifier
 
-        self._chats = RefSet(self.config.chats)
-        self._exclude_chats = RefSet(self.config.exclude_chats)
-        self._button_keywords = [k.lower() for k in self.config.detect.button_keywords]
-        self._text_patterns = compile_patterns(self.config.detect.text_patterns)
-        self._code_pattern = (
-            re.compile(self.config.detect.code_pattern) if self.config.detect.code_pattern else None
-        )
-        self._success_patterns = compile_patterns(self.config.success.success_patterns)
-        self._failure_patterns = compile_patterns(self.config.success.failure_patterns)
+        # 只编译**启用**的任务：停用的任务连正则都不该编译。
+        self.prepared: list[PreparedTask] = [
+            PreparedTask.build(task) for task in self.config.active_tasks
+        ]
 
         self._bus = ChatEventBus()
         self._handlers: list[tuple[Any, int]] = []
@@ -194,6 +231,10 @@ class RedPacketHunter:
             "error": 0,
             "replied": 0,
         }
+        #: 每条任务各自的计数。多任务之后「一共抢到 3 个」说明不了是谁干的。
+        self.task_stats: dict[str, dict[str, int]] = {
+            task.id: dict.fromkeys(self.stats, 0) for task in self.config.active_tasks
+        }
 
     # ------------------------------------------------------------------ #
     @property
@@ -201,7 +242,8 @@ class RedPacketHunter:
         return self.config.enabled
 
     def watched_chats(self) -> list[Any]:
-        return list(self.config.chats)
+        """所有任务监听会话的并集；任一任务留空 ⇒ 空列表（= 不过滤，全监听）。"""
+        return list(self.config.watched_chats)
 
     async def register(self) -> None:
         if not self.enabled:
@@ -238,18 +280,23 @@ class RedPacketHunter:
 
         self.alog.info(
             "抢红包引擎已注册",
-            strategy=self.config.strategy,
+            tasks=len(self.prepared),
+            disabled_tasks=len(self.config.tasks) - len(self.prepared),
+            task_labels=" | ".join(task.label for task in self.prepared) or "-",
+            strategies=",".join(task.config.strategy for task in self.prepared) or "-",
             watched_chats=len(chats) or "全部",
-            button_keywords=",".join(self.config.detect.button_keywords),
-            text_patterns=len(self._text_patterns),
-            keyword_template=self.config.detect.keyword_template or "-",
-            delay_s=self.config.delay,
-            jitter_s=self.config.jitter,
-            max_attempts=self.config.max_attempts,
-            reply_enabled=self.config.reply.enabled,
-            reply_count=len(self.config.reply.texts),
-            wait_timeout_s=self.config.success.wait_timeout,
+            max_concurrency=self.config.max_concurrency,
         )
+        for task in self.prepared:
+            if task.config.ready:
+                continue
+            # 配不全的任务照样注册（用户可能正在填），但必须**明确说出来**，
+            # 否则用户只会看到"开了却没动静"。
+            self.alog.warning(
+                "任务配置不完整，不会动手",
+                task=task.label,
+                problem=task.config.problem,
+            )
 
     async def close(self) -> None:
         for handler, group in self._handlers:
@@ -278,11 +325,11 @@ class RedPacketHunter:
         self._bus.feed(chat_id, message)
 
         started = time.perf_counter()
-        decision = self._should_grab(message, chat_id)
-        if decision is None:
+        hit = self._match(message, chat_id)
+        if hit is None:
             return
 
-        button, code = decision
+        task, button, code = hit
         message_id = getattr(message, "id", None)
         key = (chat_id, message_id or 0)
         now = time.monotonic()
@@ -296,9 +343,11 @@ class RedPacketHunter:
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
 
         self.stats["detected"] += 1
+        self.task_stats[task.id]["detected"] += 1
         _, _, chat_title = chat_identity(message)
         self.alog.info(
             "发现红包",
+            task=task.label,
             chat=chat_title or chat_id,
             message_id=message_id,
             button=button.get("text") if button else "-",
@@ -308,20 +357,47 @@ class RedPacketHunter:
             preview=truncate(message_text(message), 80, "…"),
         )
 
-        task = asyncio.create_task(self._grab(message, button, code))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        job = asyncio.create_task(self._grab(task, message, button, code))
+        self._tasks.add(job)
+        job.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------------ #
+    def _match(
+        self, message: Any, chat_id: int
+    ) -> Optional[tuple[PreparedTask, Optional[dict[str, Any]], Optional[str]]]:
+        """按任务顺序找**第一个**愿意处理这条消息的任务。
+
+        🔴 只取第一个。同一条红包被两个任务同时命中就会点两次按钮 ——
+        第二次多半报「已经领取过」，还可能触发风控。任务列表的顺序就是优先级。
+        """
+        for task in self.prepared:
+            decision = self._should_grab_for(task, message, chat_id)
+            if decision is not None:
+                return task, decision[0], decision[1]
+        return None
+
     def _should_grab(
         self, message: Any, chat_id: int
     ) -> Optional[tuple[Optional[dict[str, Any]], Optional[str]]]:
-        """判断是否要抢；返回 ``(按钮信息, 提取到的口令)``，不抢则返回 None。"""
-        config = self.config
-        _, chat_username, _ = chat_identity(message)
-        if self._exclude_chats and self._exclude_chats.matches(chat_id, chat_username):
+        """是否要抢；返回 ``(按钮信息, 提取到的口令)``，不抢则返回 None。
+
+        「所有任务里有没有人愿意接」的入口；单条任务的判定见 :meth:`_should_grab_for`。
+        """
+        hit = self._match(message, chat_id)
+        if hit is None:
             return None
-        if self._chats and not self._chats.matches(chat_id, chat_username):
+        _, button, code = hit
+        return button, code
+
+    def _should_grab_for(
+        self, task: PreparedTask, message: Any, chat_id: int
+    ) -> Optional[tuple[Optional[dict[str, Any]], Optional[str]]]:
+        """单条任务的判定。"""
+        config = task.config
+        _, chat_username, _ = chat_identity(message)
+        if task.exclude_chats and task.exclude_chats.matches(chat_id, chat_username):
+            return None
+        if task.chats and not task.chats.matches(chat_id, chat_username):
             return None
 
         sender_id, _, is_self, is_bot = sender_of(message)
@@ -334,39 +410,39 @@ class RedPacketHunter:
 
         text = message_text(message)
         text_hit = True
-        if self._text_patterns:
-            text_hit = first_match(self._text_patterns, text) is not None
+        if task.text_patterns:
+            text_hit = first_match(task.text_patterns, text) is not None
 
-        button = self._find_button(message)
+        button = self._find_button(task, message)
 
         if config.strategy == "button":
             if button is None:
                 return None
-            if self._text_patterns and not text_hit:
+            if task.text_patterns and not text_hit:
                 return None
-            return button, self._extract_code(text)
+            return button, self._extract_code(task, text)
 
         if config.strategy == "keyword":
             if not text_hit:
                 return None
-            code = self._extract_code(text)
-            if self._code_pattern is not None and code is None:
-                self.alog.debug("正文未提取到口令，跳过", chat_id=chat_id)
+            code = self._extract_code(task, text)
+            if task.code_pattern is not None and code is None:
+                self.alog.debug("正文未提取到口令，跳过", task=task.label, chat_id=chat_id)
                 return None
             return None, code
 
         # auto：优先按钮
-        if button is not None and (text_hit or not self._text_patterns):
-            return button, self._extract_code(text)
-        if config.detect.keyword_template and text_hit and (self._text_patterns or self._code_pattern):
-            code = self._extract_code(text)
-            if self._code_pattern is not None and code is None:
+        if button is not None and (text_hit or not task.text_patterns):
+            return button, self._extract_code(task, text)
+        if config.detect.keyword_template and text_hit and (task.text_patterns or task.code_pattern):
+            code = self._extract_code(task, text)
+            if task.code_pattern is not None and code is None:
                 return None
             return None, code
         del sender_id
         return None
 
-    def _find_button(self, message: Any) -> Optional[dict[str, Any]]:
+    def _find_button(self, task: PreparedTask, message: Any) -> Optional[dict[str, Any]]:
         """在内联/回复键盘里找第一个像"领红包"的按钮。"""
         markup = getattr(message, "reply_markup", None)
         if markup is None:
@@ -376,7 +452,7 @@ class RedPacketHunter:
         for row_index, row in enumerate(inline_rows):
             for col_index, button in enumerate(row):
                 text = str(getattr(button, "text", "") or "")
-                if not self._keyword_hit(text):
+                if not self._keyword_hit(task, text):
                     continue
                 callback_data = getattr(button, "callback_data", None)
                 if callback_data is None:
@@ -398,18 +474,18 @@ class RedPacketHunter:
         for row in reply_rows:
             for button in row:
                 text = str(getattr(button, "text", None) or (button if isinstance(button, str) else ""))
-                if text and self._keyword_hit(text):
+                if text and self._keyword_hit(task, text):
                     return {"text": text, "callback_data": None, "position": "-", "kind": "reply"}
         return None
 
-    def _keyword_hit(self, text: str) -> bool:
+    def _keyword_hit(self, task: PreparedTask, text: str) -> bool:
         lowered = text.lower()
-        return any(keyword in lowered for keyword in self._button_keywords)
+        return any(keyword in lowered for keyword in task.button_keywords)
 
-    def _extract_code(self, text: str) -> Optional[str]:
-        if self._code_pattern is None:
+    def _extract_code(self, task: PreparedTask, text: str) -> Optional[str]:
+        if task.code_pattern is None:
             return None
-        found = self._code_pattern.search(text)
+        found = task.code_pattern.search(text)
         if not found:
             return None
         if found.groups():
@@ -421,6 +497,7 @@ class RedPacketHunter:
     # ------------------------------------------------------------------ #
     async def _grab(
         self,
+        task: PreparedTask,
         message: Any,
         button: Optional[dict[str, Any]],
         code: Optional[str],
@@ -432,24 +509,27 @@ class RedPacketHunter:
         if button is not None and button.get("kind") == "reply":
             strategy = "keyboard-text"
 
-        delay = self.config.delay + (random.uniform(0, self.config.jitter) if self.config.jitter else 0.0)
+        config = task.config
+        delay = config.delay + (random.uniform(0, config.jitter) if config.jitter else 0.0)
         if delay > 0:
-            self.alog.debug("按配置延迟后再抢", delay_s=round(delay, 3), chat_id=chat_id)
+            self.alog.debug(
+                "按配置延迟后再抢", task=task.label, delay_s=round(delay, 3), chat_id=chat_id
+            )
             await asyncio.sleep(delay)
 
-        outcome = await self._execute(message, button, code, strategy, started)
+        outcome = await self._execute(task, message, button, code, strategy, started)
 
-        self._record(outcome)
-        if self._should_reply(outcome.result):
-            replied = await self._maybe_reply(message, outcome)
+        self._record(task, outcome)
+        if self._should_reply(task, outcome.result):
+            replied = await self._maybe_reply(task, message, outcome)
             if replied:
                 outcome.replied = replied
 
         self._log_outcome(outcome, chat_title, message_id)
-        if self.config.notify and self.notifier is not None:
-            self._submit_notify(message, outcome)
+        if config.notify and self.notifier is not None:
+            self._submit_notify(task, message, outcome)
 
-    def _should_reply(self, result: GrabResult) -> bool:
+    def _should_reply(self, task: PreparedTask, result: GrabResult) -> bool:
         """是否该发随机回复。
 
         - 确认抢到 → 回复；
@@ -458,12 +538,13 @@ class RedPacketHunter:
         """
         if result is GrabResult.SUCCESS:
             return True
-        if result is GrabResult.UNKNOWN and not self.config.reply.only_on_success:
+        if result is GrabResult.UNKNOWN and not task.config.reply.only_on_success:
             return True
         return False
 
     async def _execute(
         self,
+        task: PreparedTask,
         message: Any,
         button: Optional[dict[str, Any]],
         code: Optional[str],
@@ -481,10 +562,11 @@ class RedPacketHunter:
             "message_id": message_id,
             "button_text": button.get("text") if button else None,
             "code": code,
+            "task": task.label,
         }
 
         last_error: Optional[str] = None
-        for attempt in range(1, self.config.max_attempts + 1):
+        for attempt in range(1, task.config.max_attempts + 1):
             self.stats["attempted"] += 1
             try:
                 # 先挂上监听，避免"抢完才开始听"导致漏掉瞬间返回的结果消息
@@ -503,15 +585,16 @@ class RedPacketHunter:
                                 callback_timeout = True
                                 self.alog.warning(
                                     "点击按钮后机器人未响应",
+                                    task=task.label,
                                     chat=chat_title or chat_id,
                                     message_id=message_id,
                                     attempt=attempt,
                                     hint="部分红包 bot 不返回 callback answer，将依据后续消息判定",
                                 )
                         elif strategy == "keyboard-text" and button is not None:
-                            await self._send_text(chat_id, str(button.get("text")), message)
+                            await self._send_text(task, chat_id, str(button.get("text")), message)
                         else:
-                            text = self._render_keyword(code, message)
+                            text = self._render_keyword(task, code, message)
                             if not text:
                                 return GrabOutcome(
                                     result=GrabResult.SKIPPED,
@@ -520,12 +603,12 @@ class RedPacketHunter:
                                     attempts=attempt,
                                     **base,
                                 )
-                            await self._send_text(chat_id, text, message)
+                            await self._send_text(task, chat_id, text, message)
 
                     # 判定必须在 watch 上下文内完成：一旦退出这个 with，
                     # queue 就会从 bus 注销，_judge 再也收不到后续消息，
                     # 会直接返回 UNKNOWN。
-                    verdict, evidence = await self._judge(callback_text, queue)
+                    verdict, evidence = await self._judge(task, callback_text, queue)
 
                 detail = _verdict_detail(verdict, callback_text, evidence)
                 if callback_timeout:
@@ -545,6 +628,7 @@ class RedPacketHunter:
                 last_error = f"{type(exc).__name__}: {exc}"
                 self.alog.warning(
                     "红包已失效或按钮数据过期",
+                    task=task.label,
                     chat=chat_title or chat_id,
                     message_id=message_id,
                     error=last_error,
@@ -559,9 +643,10 @@ class RedPacketHunter:
                 )
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                if attempt >= self.config.max_attempts:
+                if attempt >= task.config.max_attempts:
                     self.alog.error(
                         "抢红包失败",
+                        task=task.label,
                         chat=chat_title or chat_id,
                         message_id=message_id,
                         error=last_error,
@@ -588,7 +673,7 @@ class RedPacketHunter:
             result=GrabResult.ERROR,
             detail=last_error or "未知错误",
             cost_ms=(time.perf_counter() - started) * 1000,
-            attempts=self.config.max_attempts,
+            attempts=task.config.max_attempts,
             **base,
         )
 
@@ -623,8 +708,12 @@ class RedPacketHunter:
         )
         return str(text) if text else None
 
-    async def _send_text(self, chat_id: int, text: str, message: Any) -> None:
-        reply_to = getattr(message, "id", None) if self.config.reply.reply_to_message else None
+    async def _send_text(
+        self, task: PreparedTask, chat_id: int, text: str, message: Any
+    ) -> None:
+        reply_to = (
+            getattr(message, "id", None) if task.config.reply.reply_to_message else None
+        )
 
         async def _do() -> Any:
             return await self.client.send_message(
@@ -640,10 +729,12 @@ class RedPacketHunter:
             retries=1,
             max_flood_wait=10.0,
         )
-        self.alog.info("已发送抢红包关键词", text=text, chat_id=chat_id)
+        self.alog.info("已发送抢红包关键词", task=task.label, text=text, chat_id=chat_id)
 
-    def _render_keyword(self, code: Optional[str], message: Any) -> Optional[str]:
-        template = self.config.detect.keyword_template
+    def _render_keyword(
+        self, task: PreparedTask, code: Optional[str], message: Any
+    ) -> Optional[str]:
+        template = task.config.detect.keyword_template
         if not template:
             return None
         variables = build_variables(message, {"code": code or ""})
@@ -652,16 +743,17 @@ class RedPacketHunter:
     # ------------------------------------------------------------------ #
     async def _judge(
         self,
+        task: PreparedTask,
         callback_text: Optional[str],
         queue: Optional[asyncio.Queue[Any]],
     ) -> tuple[GrabResult, Optional[str]]:
         """判定结果。返回 ``(结论, 证据文本)``。"""
         if callback_text:
-            verdict = self._classify(callback_text)
+            verdict = self._classify(task, callback_text)
             if verdict is not None:
                 return verdict, f"callback: {truncate(callback_text, 200, '…')}"
 
-        timeout = self.config.success.wait_timeout
+        timeout = task.config.success.wait_timeout
         if queue is None or timeout <= 0:
             return GrabResult.UNKNOWN, (
                 f"callback: {truncate(callback_text, 200, '…')}" if callback_text else None
@@ -680,17 +772,17 @@ class RedPacketHunter:
             text = message_text(message)
             if not text:
                 continue
-            if self.config.success.require_self_mention and not self._mentions_me(message, text):
+            if task.config.success.require_self_mention and not self._mentions_me(message, text):
                 continue
-            verdict = self._classify(text)
+            verdict = self._classify(task, text)
             if verdict is not None:
                 return verdict, f"消息 {getattr(message, 'id', '?')}: {truncate(text, 200, '…')}"
 
-    def _classify(self, text: str) -> Optional[GrabResult]:
+    def _classify(self, task: PreparedTask, text: str) -> Optional[GrabResult]:
         """失败优先：'已被抢完' 里也含 '抢'，先判失败可避免误报成功。"""
-        if first_match(self._failure_patterns, text):
+        if first_match(task.failure_patterns, text):
             return GrabResult.FAILED
-        if first_match(self._success_patterns, text):
+        if first_match(task.success_patterns, text):
             return GrabResult.SUCCESS
         return None
 
@@ -709,8 +801,10 @@ class RedPacketHunter:
         return False
 
     # ------------------------------------------------------------------ #
-    async def _maybe_reply(self, message: Any, outcome: GrabOutcome) -> Optional[str]:
-        reply = self.config.reply
+    async def _maybe_reply(
+        self, task: PreparedTask, message: Any, outcome: GrabOutcome
+    ) -> Optional[str]:
+        reply = task.config.reply
         if not reply.enabled or not reply.texts:
             return None
         chat_id = outcome.chat_id
@@ -723,6 +817,7 @@ class RedPacketHunter:
             if last is not None and now - last < reply.cooldown:
                 self.alog.info(
                     "回复处于冷却期，跳过",
+                    task=task.label,
                     chat=outcome.chat_title or chat_id,
                     remaining_s=round(reply.cooldown - (now - last), 1),
                 )
@@ -752,6 +847,7 @@ class RedPacketHunter:
         except Exception as exc:
             self.alog.error(
                 "回复失败",
+                task=task.label,
                 chat=outcome.chat_title or chat_id,
                 text=text,
                 error=f"{type(exc).__name__}: {exc}",
@@ -762,6 +858,7 @@ class RedPacketHunter:
         self.stats["replied"] += 1
         self.alog.info(
             "已发送随机回复",
+            task=task.label,
             chat=outcome.chat_title or chat_id,
             text=text,
             delay_s=round(delay, 2),
@@ -770,21 +867,26 @@ class RedPacketHunter:
         return text
 
     # ------------------------------------------------------------------ #
-    def _record(self, outcome: GrabOutcome) -> None:
-        if outcome.result is GrabResult.SUCCESS:
-            self.stats["success"] += 1
-        elif outcome.result is GrabResult.FAILED:
-            self.stats["failed"] += 1
-        elif outcome.result is GrabResult.UNKNOWN:
-            self.stats["unknown"] += 1
-        elif outcome.result is GrabResult.ERROR:
-            self.stats["error"] += 1
+    def _record(self, task: PreparedTask, outcome: GrabOutcome) -> None:
+        bucket = {
+            GrabResult.SUCCESS: "success",
+            GrabResult.FAILED: "failed",
+            GrabResult.UNKNOWN: "unknown",
+            GrabResult.ERROR: "error",
+        }.get(outcome.result)
+        if bucket is None:
+            return
+        self.stats[bucket] += 1
+        per_task = self.task_stats.get(task.id)
+        if per_task is not None:
+            per_task[bucket] += 1
 
     def _log_outcome(
         self, outcome: GrabOutcome, chat_title: Optional[str], message_id: Optional[int]
     ) -> None:
         fields = {
             "result": outcome.result.value,
+            "task": outcome.task or "-",
             "chat": chat_title or outcome.chat_id,
             "message_id": message_id,
             "strategy": outcome.strategy,
@@ -809,11 +911,12 @@ class RedPacketHunter:
         else:
             self.alog.warning(message, **fields)
 
-    def _submit_notify(self, message: Any, outcome: GrabOutcome) -> None:
+    def _submit_notify(self, task: PreparedTask, message: Any, outcome: GrabOutcome) -> None:
         assert self.notifier is not None
         variables = build_variables(
             message,
             {
+                "task": task.label,
                 "result_icon": outcome.result.icon + " ",
                 "result_text": outcome.result.label,
                 "strategy": outcome.strategy,
@@ -835,7 +938,11 @@ class RedPacketHunter:
             NotifyTask(
                 event="red_packet",
                 text=text,
-                context={"result": outcome.result.value, "chat": outcome.chat_title},
+                context={
+                    "result": outcome.result.value,
+                    "chat": outcome.chat_title,
+                    "task": task.label,
+                },
             )
         )
         if submitted:
@@ -847,6 +954,10 @@ class RedPacketHunter:
             "pending_tasks": len(self._tasks),
             "watching_chats": self._bus.watching,
             "seen_cache": len(self._seen),
+            # 任务维度的信息：面板/CLI 靠它显示"几条任务、哪条在干活"。
+            "tasks": len(self.config.tasks),
+            "active_tasks": len(self.prepared),
+            "per_task": {k: dict(v) for k, v in self.task_stats.items()},
         }
 
 
@@ -888,4 +999,10 @@ def _grab_hint(exc: Exception) -> str:
     return "查看错误类型定位原因"
 
 
-__all__ = ["ChatEventBus", "GrabOutcome", "GrabResult", "RedPacketHunter"]
+__all__ = [
+    "ChatEventBus",
+    "GrabOutcome",
+    "GrabResult",
+    "PreparedTask",
+    "RedPacketHunter",
+]

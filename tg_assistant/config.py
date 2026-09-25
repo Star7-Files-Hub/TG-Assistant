@@ -619,13 +619,24 @@ class RedPacketReply(StrictModel):
         low, high = self.delay_range
         if low < 0 or high < low:
             raise ValueError("red_packet.reply.delay_range 必须满足 0 <= low <= high")
-        if self.enabled and not self.texts:
-            raise ValueError("red_packet.reply.enabled=true 时 texts 不能为空")
+        # 刻意**不**因为「开了回复但 texts 为空」而报错 —— 见 RedPacketTask.ready。
+        # 校验器一抛异常，整份配置就存不下去（validate_assignment 会在每次赋值时跑），
+        # 用户连"先把开关打开、回头再填词"都做不到。
         return self
 
 
-class RedPacketConfig(StrictModel):
-    enabled: bool = False
+class RedPacketTask(StrictModel):
+    """一个独立的抢红包任务：来源 + 识别 + 判定 + 回复 各自成套。
+
+    改造成「多任务」之前，这些字段全都挂在 :class:`RedPacketConfig` 上，
+    一个账号只能有一套设置。现在每个任务互不影响 —— 比如 A 频道用按钮策略、
+    B 频道用关键词策略，C 频道抢到后要回复、D 频道不要。
+    """
+
+    id: str
+    name: Optional[str] = None
+    enabled: bool = True
+
     #: 监听的会话；为空表示所有会话。
     chats: list[ChatRef] = Field(default_factory=list)
     exclude_chats: list[ChatRef] = Field(default_factory=list)
@@ -639,12 +650,18 @@ class RedPacketConfig(StrictModel):
     jitter: float = Field(default=0.0, ge=0.0, le=10.0)
     #: 单条红包最多点几次（首次失败可能是网络抖动）。
     max_attempts: int = Field(default=2, ge=1, le=5)
-    #: 同一账号并发抢包上限。
-    max_concurrency: int = Field(default=3, ge=1, le=20)
     #: 是否推送通知。
     notify: bool = True
     #: 也处理消息编辑事件（有些红包 bot 通过编辑消息挂出按钮）。
     include_edited: bool = True
+
+    @field_validator("id")
+    @classmethod
+    def _check_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("任务 id 不能为空")
+        return cleaned
 
     @field_validator("chats", "exclude_chats", mode="before")
     @classmethod
@@ -655,11 +672,126 @@ class RedPacketConfig(StrictModel):
             value = [value]
         return _normalize_refs(value)
 
+    @property
+    def label(self) -> str:
+        return self.name or self.id
+
+    @property
+    def ready(self) -> bool:
+        """配置是否**完整到能干活**。
+
+        🔴 这里刻意**不抛异常**。多任务之后，一条任务的配置没填全，
+        不该让整份 payload 校验失败 —— 那会导致面板连"保存"都按不动，
+        用户改不了任何东西。所以改成「存得下、跑不动、界面上标黄」。
+        （单任务时代是直接 raise 的，改成这样是为了多任务的可用性。）
+
+        同理也不看总开关 ``enabled``：``ready`` 回答的是"配好了没有"，
+        而不是"现在开没开"。
+        """
+        if self.strategy == "keyword" and not (self.detect.keyword_template or "").strip():
+            return False
+        if self.reply.enabled and not self.reply.texts:
+            return False
+        return True
+
+    @property
+    def problem(self) -> Optional[str]:
+        """没配好的话，一句话说清缺什么。界面直接拿来显示。"""
+        if self.strategy == "keyword" and not (self.detect.keyword_template or "").strip():
+            return "策略选了「关键词」，但没填「要发送的内容」—— 这条任务不会动手"
+        if self.reply.enabled and not self.reply.texts:
+            return "勾了「抢包后回复」，但回复语列表是空的 —— 不会回复"
+        return None
+
+
+#: 旧版（单任务）抢红包配置里的字段 —— 它们现在属于「任务」这一层。
+#:
+#: 见 :func:`_migrate_legacy_red_packet`。
+_RED_PACKET_TASK_FIELDS = (
+    "chats",
+    "exclude_chats",
+    "strategy",
+    "detect",
+    "success",
+    "reply",
+    "delay",
+    "jitter",
+    "max_attempts",
+    "notify",
+    "include_edited",
+)
+
+
+def _migrate_legacy_red_packet(data: Any) -> Any:
+    """把旧版扁平配置就地搬成一条任务。
+
+    🔴 必须在 ``mode="before"`` 里做，不能靠 ``extra="forbid"`` 报错：
+    服务器上跑着的 ``config.json`` 就是旧结构，直接拒绝会让**整份账号配置
+    加载失败** —— 连带转发、通知、抢注一起停摆，而不只是抢红包不可用。
+
+    迁移规则：只要出现了任何一个旧字段，就把它们收进一条 id 为 ``default``
+    的任务。旧代码落盘时会把所有字段都写出来，所以「老用户」必然得到
+    一条保留其全部设置的任务；而全新的 ``{}`` 不会凭空多出一条。
+    """
+    if not isinstance(data, dict) or "tasks" in data:
+        return data
+    data = dict(data)
+    legacy = {key: data.pop(key) for key in _RED_PACKET_TASK_FIELDS if key in data}
+    if not legacy:
+        return data
+    data["tasks"] = [{"id": "default", "name": "默认任务", **legacy}]
+    return data
+
+
+class RedPacketConfig(StrictModel):
+    """抢红包：一个账号下挂多条互不影响的任务。"""
+
+    enabled: bool = False
+    #: 任务列表，**按顺序**匹配 —— 同一条红包消息只会被**第一个**命中的任务抢。
+    tasks: list[RedPacketTask] = Field(default_factory=list)
+    #: 同一账号并发抢包上限。这是账号级的资源限制，不属于任何单条任务。
+    max_concurrency: int = Field(default=3, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate(cls, data: Any) -> Any:
+        return _migrate_legacy_red_packet(data)
+
     @model_validator(mode="after")
-    def _check(self) -> "RedPacketConfig":
-        if self.strategy == "keyword" and not self.detect.keyword_template:
-            raise ValueError('strategy="keyword" 时必须设置 detect.keyword_template')
+    def _unique_ids(self) -> "RedPacketConfig":
+        seen: set[str] = set()
+        for task in self.tasks:
+            if task.id in seen:
+                raise ValueError(f"抢红包任务 id 重复: {task.id}")
+            seen.add(task.id)
         return self
+
+    @property
+    def active_tasks(self) -> list[RedPacketTask]:
+        return [task for task in self.tasks if task.enabled]
+
+    @property
+    def watched_chats(self) -> list[ChatRef]:
+        """所有任务监听会话的并集；**任一**任务留空表示监听全部 ⇒ 返回空列表。
+
+        空列表在引擎里的含义就是"不过滤"，所以这里不能只做简单的并集 ——
+        一条"全监听"的任务必须把整体拉成"全监听"。
+        """
+        if any(not task.chats for task in self.tasks):
+            return []
+        merged: list[ChatRef] = []
+        seen: set[Any] = set()
+        for task in self.tasks:
+            for chat in task.chats:
+                if chat not in seen:
+                    seen.add(chat)
+                    merged.append(chat)
+        return merged
+
+    @property
+    def include_edited(self) -> bool:
+        """只要有**任何**一条任务要处理编辑事件，就整体注册那个 handler。"""
+        return any(task.include_edited for task in self.tasks)
 
 
 # --------------------------------------------------------------------------- #
@@ -1133,9 +1265,12 @@ class AccountConfig(StrictModel):
                 return []
             chats.extend(rule.sources)
         if self.red_packet.enabled:
-            if not self.red_packet.chats:
+            # 多任务之后不能再直接看 ``.chats`` —— 那是任务级的字段。
+            # ``watched_chats`` 已经处理了「任一任务留空 ⇒ 全监听」的语义。
+            packet_chats = self.red_packet.watched_chats
+            if not packet_chats:
                 return []
-            chats.extend(self.red_packet.chats)
+            chats.extend(packet_chats)
         if self.reg_grab.enabled:
             if not self.reg_grab.chats:
                 return []
@@ -1339,6 +1474,7 @@ __all__ = [
     "RedPacketDetect",
     "RedPacketReply",
     "RedPacketStrategy",
+    "RedPacketTask",
     "RedPacketSuccess",
     "Settings",
     "StrictModel",

@@ -1615,6 +1615,46 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 .rp-empty h3, .nt-empty h3, .rg-empty h3 { font-size: 18px; font-weight: 600; color: var(--text); }
 .rp-empty p, .nt-empty p, .rg-empty p { font-size: 14px; }
 
+/* 抢红包：任务列表（一个账号下挂多条互不影响的任务） */
+.rp-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.rp-toolbar-right { display: flex; align-items: center; gap: 8px; }
+.rp-toolbar-right label { font-size: 12px; font-weight: 500; color: var(--text-muted); }
+.rp-toolbar-right input {
+    width: 72px; padding: 8px 10px; background: rgba(13,17,23,0.6);
+    border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px;
+    color-scheme: dark;
+}
+.rp-toolbar-right .rp-hint { margin: 0; }
+
+.rp-task-list { display: flex; flex-direction: column; gap: 10px; }
+.rp-task-card {
+    background: rgba(22, 27, 34, 0.8); backdrop-filter: blur(10px);
+    border: 1px solid rgba(48, 54, 61, 0.6); border-radius: 14px;
+    padding: 14px 18px;
+}
+/* 停用的任务压暗：一眼扫出哪几条在干活。 */
+.rp-task-off { opacity: 0.55; }
+.rp-task-head { display: flex; align-items: center; gap: 14px; }
+.rp-task-toggle { display: flex; align-items: center; cursor: pointer; flex-shrink: 0; }
+.rp-task-toggle input { display: none; }
+/* 和总开关同样的坑：少了 :checked 这两条，开关就永远是灰的、滑块也不动。 */
+.rp-task-toggle input:checked + .toggle-slider { background: var(--primary); }
+.rp-task-toggle input:checked + .toggle-slider::after { transform: translateX(18px); }
+.rp-task-title { flex: 1; min-width: 0; }
+.rp-task-title h3 { font-size: 14px; font-weight: 600; }
+.rp-task-title p { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
+.rp-task-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.rp-task-warn {
+    margin-top: 10px; padding: 8px 12px; font-size: 12px; color: #d29922;
+    border: 1px solid rgba(210, 153, 34, 0.4); background: rgba(210, 153, 34, 0.1);
+    border-radius: 8px;
+}
+.rp-danger { color: #f85149; }
+.rp-checks { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 4px; }
+
 /* 保存栏 */
 .rp-save-bar, .nt-save-bar, .rg-save-bar {
     position: sticky; bottom: 20px; display: flex; justify-content: center;

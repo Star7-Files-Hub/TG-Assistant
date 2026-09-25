@@ -673,7 +673,15 @@ def config_validate(ctx: Context, accounts: tuple[str, ...]) -> None:
             )
         _info(f"    抢红包：{'开启' if config.red_packet.enabled else '关闭'}")
         if config.red_packet.enabled:
-            _info(f"      策略：{config.red_packet.strategy}，回复：{'开' if config.red_packet.reply.enabled else '关'}")
+            active = config.red_packet.active_tasks
+            _info(f"      任务：{len(active)} 条启用 / 共 {len(config.red_packet.tasks)} 条")
+            for task in config.red_packet.tasks:
+                mark = "●" if task.enabled else "○"
+                reply = "回复开" if task.reply.enabled else "回复关"
+                _info(
+                    f"        {mark} {task.label}：{task.strategy}，{reply}"
+                    f"{'' if task.ready else f' ⚠️ {task.problem}'}"
+                )
         _info(f"    抢注任务：{'开启' if config.reg_grab.enabled else '关闭'}")
         if config.reg_grab.enabled:
             _info(

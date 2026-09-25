@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -318,12 +321,28 @@ def test_every_master_toggle_shows_its_checked_state() -> None:
     web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
     css = (web_dir / "static" / "css" / "style.css").read_text(encoding="utf-8")
 
+    # 按**结构**探测，而不是猜类名：`<label class="X"><input type=checkbox>
+    # <span class="toggle-slider">` —— X 就是那个需要 :checked 规则的包装类。
+    #
+    # 一开始是按 `endswith("master-toggle")` 找的，于是新加的
+    # `.rp-task-toggle`（任务卡片上的小开关）**完全逃过检查** ——
+    # 它同样是"input 被 display:none 藏起来、全靠 :checked 改滑块"的写法。
     prefixes: set[str] = set()
     for tpl in sorted((web_dir / "templates").glob("*.html")):
-        for cls in _referenced_classes(tpl.read_text(encoding="utf-8")):
-            if cls.endswith("master-toggle"):
-                prefixes.add(cls)
-    assert prefixes, "前提：至少有一个页面用了总开关"
+        html = tpl.read_text(encoding="utf-8")
+        for match in re.finditer(
+            r'<label class="([^"]+)"[^>]*>\s*'
+            r'<input[^>]*type="checkbox"[^>]*>\s*'
+            r'<span class="toggle-slider">',
+            html,
+        ):
+            prefixes.add(match.group(1).strip())
+    assert prefixes, "前提：至少有一个页面用了滑块式开关"
+
+    # 先把注释剥掉：`/* ... */` 里没有花括号，会被下面的正则当成选择器的一部分
+    # 粘在后面 —— `.rp-task-toggle` 那条前面刚好有注释，于是精确匹配失败，
+    # 测试报了个**假**失败。注释不是选择器。
+    css = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
 
     # 把 CSS 拆成「选择器块」，再按逗号拆成**单条**选择器，然后精确比对。
     #
@@ -376,6 +395,189 @@ def test_static_version_follows_the_file_without_a_restart(tmp_path) -> None:
     html = base.read_text(encoding="utf-8")
     assert "{{ static_version() }}" in html, "base.html 里必须写成 static_version()"
     assert "{{ static_version }}" not in html, "漏了括号就渲染成函数对象本身了"
+
+
+# --------------------------------------------------------------------------- #
+# 模板内联 JS 的语法
+# --------------------------------------------------------------------------- #
+_WEB_DIR = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+
+def _inline_scripts(html: str) -> list[str]:
+    """页面里所有**内联** ``<script>`` 的内容（带 ``src=`` 的跳过）。"""
+    return re.findall(
+        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.S | re.I
+    )
+
+
+#: 一个花括号，或一条 ``const|let|var NAME`` 声明。
+_JS_TOKEN_RE = re.compile(r"[{}]|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)")
+_JS_FUNC_RE = re.compile(r"\bfunction\s+([A-Za-z_$\w]*)\s*\([^)]*\)\s*\{")
+
+
+def _strip_js_literals(js: str) -> str:
+    """去掉注释与字符串字面量。
+
+    不去的话，字符串里的 ``"const account"`` 会被当成真声明；
+    注释掉的一行同理。
+    """
+    out: list[str] = []
+    i, n = 0, len(js)
+    while i < n:
+        char = js[i]
+        if char == "/" and i + 1 < n and js[i + 1] == "/":
+            end = js.find("\n", i)
+            i = n if end < 0 else end
+        elif char == "/" and i + 1 < n and js[i + 1] == "*":
+            end = js.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        elif char in "\"'`":
+            quote, i = char, i + 1
+            while i < n:
+                if js[i] == "\\":
+                    i += 2
+                    continue
+                if js[i] == quote:
+                    i += 1
+                    break
+                i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _js_body_end(js: str, start: int) -> int:
+    """``start`` 是函数 ``{`` 之后的下标；返回配对 ``}`` 的下标。"""
+    depth, i = 1, start
+    while i < len(js) and depth:
+        if js[i] == "{":
+            depth += 1
+        elif js[i] == "}":
+            depth -= 1
+        i += 1
+    return i - 1
+
+
+def _mask_js_functions(js: str) -> str:
+    """把每个 ``function`` 的函数体换成等长空白，只留签名。
+
+    扫「顶层」时必须这么做：不抠掉的话，各函数内部的声明会全部落到
+    同一个花括号深度上，``data`` / ``res`` 这种每个函数都在用的局部变量名
+    会被误报 —— 实测能报出 9 处假命中。
+    """
+    out = list(js)
+    for match in _JS_FUNC_RE.finditer(js):
+        for index in range(match.end(), _js_body_end(js, match.end())):
+            out[index] = " "
+    return "".join(out)
+
+
+def _duplicate_js_declarations(body: str) -> list[tuple[int, str, int]]:
+    """同一作用域、**同一花括号深度**上重复声明的名字。"""
+    depth, seen = 0, {}
+    for match in _JS_TOKEN_RE.finditer(body):
+        token = match.group(0)
+        if token == "{":
+            depth += 1
+        elif token == "}":
+            depth -= 1
+        else:
+            seen.setdefault(depth, []).append(match.group(1))
+    found = []
+    for depth, names in seen.items():
+        for name in sorted(set(names)):
+            if names.count(name) > 1:
+                found.append((depth, name, names.count(name)))
+    return found
+
+
+def test_no_duplicate_declarations_in_inline_scripts() -> None:
+    """模板内联 JS 里不许在同一作用域重复声明同一个名字。
+
+    🔴 真实事故：``login.html`` 的 ``sendCode()`` 先
+    ``const account = document.getElementById('code-account')...``，
+    后面又 ``const account = data.account;``。重复声明 ``const`` 是
+    **SyntaxError**，而浏览器是**整块**解析 ``<script>`` 的 —— 于是登录页那
+    12659 个字符的脚本一行都不执行：扫码、验证码、2FA、切换标签的按钮
+    全部变成哑巴，控制台里只有一句
+    ``Identifier 'account' has already been declared``。
+
+    这种错**不会**被任何「页面打得开吗」的测试发现 —— 页面 200、HTML 完全正常、
+    HTTP 状态码一个不差，只有真去点一下才知道。所以这里做静态检查。
+
+    纯 Python 实现：生产服务器上没有 node，不能为了这条检查给部署环境加依赖。
+    更严格的「整块语法检查」见 :func:`test_inline_script_is_valid_javascript`。
+    """
+    problems: list[str] = []
+    for template in sorted(_WEB_DIR.joinpath("templates").glob("*.html")):
+        html = template.read_text(encoding="utf-8")
+        for code in _inline_scripts(html):
+            if not code.strip():
+                continue
+            clean = _strip_js_literals(code)
+            # 顶层：先抠掉所有函数体。
+            for depth, name, count in _duplicate_js_declarations(_mask_js_functions(clean)):
+                problems.append(f"{template.name} 顶层(深度{depth})：`{name}` 声明了 {count} 次")
+            # 每个函数体：再抠掉它里面的嵌套函数。
+            for match in _JS_FUNC_RE.finditer(clean):
+                body = clean[match.end() : _js_body_end(clean, match.end())]
+                scope = match.group(1) or "<匿名函数>"
+                for depth, name, count in _duplicate_js_declarations(_mask_js_functions(body)):
+                    problems.append(
+                        f"{template.name} {scope}()(深度{depth})：`{name}` 声明了 {count} 次"
+                    )
+
+    assert not problems, (
+        "同一作用域里重复声明会让**整块**脚本解析失败、页面上所有按钮失效：\n  "
+        + "\n  ".join(problems)
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="需要 node 才能做 JS 语法检查")
+@pytest.mark.parametrize(
+    "template", sorted(p.name for p in _WEB_DIR.joinpath("templates").glob("*.html"))
+)
+def test_inline_script_is_valid_javascript(template: str) -> None:
+    """页面里的内联 JS 必须**能解析**。
+
+    🔴 真实事故：``login.html`` 的 ``sendCode()`` 里声明了两次 ``const account``。
+    同一作用域里重复声明 const 是 SyntaxError，而浏览器是**整块**解析脚本的 ——
+    于是登录页那 12659 个字符的脚本一行都不执行：扫码、验证码、2FA、切换标签
+    的按钮全部变成哑巴，控制台里只有一句
+    ``Identifier 'account' has already been declared``。
+
+    这种错**不会**被任何「页面打得开吗」的测试发现 —— 页面 200、HTML 完全正常、
+    HTTP 状态码一个不差，只有真去点一下才知道。所以这里用 node 把每块脚本
+    解析一遍。
+
+    服务器上没装 node 时跳过：不要为了这条检查去给生产环境加依赖。
+    """
+    html = (_WEB_DIR / "templates" / template).read_text(encoding="utf-8")
+    blocks = _inline_scripts(html)
+    assert blocks, f"{template} 里一块内联脚本都没有？选择器可能失效了"
+
+    for index, code in enumerate(blocks):
+        if not code.strip():
+            continue
+        # Jinja 表达式会让 JS 解析失败，先换成占位符。本项目模板的 script 块里
+        # 目前一个 Jinja 标签都没有，这一步只是防止将来误报。
+        code = re.sub(r"\{\{.*?\}\}", "0", code, flags=re.S)
+        code = re.sub(r"\{%.*?%\}", "", code, flags=re.S)
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".js", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(code)
+            path = handle.name
+        try:
+            proc = subprocess.run(
+                ["node", "--check", path], capture_output=True, text=True, timeout=30
+            )
+        finally:
+            os.unlink(path)
+        assert proc.returncode == 0, (
+            f"{template} 第 {index + 1} 块内联 JS 解析失败 —— "
+            f"整块脚本一行都不会执行：\n{proc.stderr}"
+        )
 
 
 def test_time_inputs_render_in_dark_mode() -> None:

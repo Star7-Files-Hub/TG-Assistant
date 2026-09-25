@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from pyrogram.errors import BotResponseTimeout, QueryIdInvalid
@@ -10,6 +11,7 @@ from pyrogram.errors import BotResponseTimeout, QueryIdInvalid
 from tg_assistant.config import AccountConfig
 from tg_assistant.red_packet import (
     ChatEventBus,
+    GrabOutcome,
     GrabResult,
     RedPacketHunter,
 )
@@ -50,6 +52,52 @@ def rp_message(text: str = "🧧 红包来了", *, markup=None, sender=None, **k
 
 def button_markup(*buttons: tuple[str, bytes | None]):
     return FakeMarkup([[FakeButton(text, callback_data=data) for text, data in buttons]])
+
+
+def rp_multi(*tasks: dict, **overrides) -> AccountConfig:
+    """多任务配置。``tasks`` 的顺序**就是优先级**。"""
+    base: dict = {"red_packet": {"enabled": True, "tasks": list(tasks)}}
+    base["red_packet"].update(overrides)
+    return AccountConfig.model_validate(base)
+
+
+class CapturingLog:
+    """把日志收进列表 —— 用来断言"该说的说出来了"。"""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def bind(self, *args, **kwargs):
+        return self
+
+    def _add(self, msg, **kw):
+        self.lines.append(msg + " " + " ".join(f"{k}={v}" for k, v in kw.items()))
+
+    def info(self, msg, **kw):
+        self._add(msg, **kw)
+
+    def warning(self, msg, **kw):
+        self._add(msg, **kw)
+
+    def error(self, msg, **kw):
+        self._add(msg, **kw)
+
+    def debug(self, msg, **kw):
+        pass
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def task_of(hunter: RedPacketHunter):
+    """这条引擎的**第一条任务**。
+
+    引擎里所有动作现在都挂在某条具体任务上（延迟、重试次数、成功判定、
+    回复语……全都是任务级的），所以测试里要把「哪条任务」显式带出来。
+    这些用例都只配了一条任务。
+    """
+    return hunter.prepared[0]
 
 
 class TestDetection:
@@ -157,7 +205,7 @@ class TestDetection:
         hunter = RedPacketHunter(FakeClient(), rp_config(), alog)
         markup = FakeMarkup([[FakeButton("领取", url="https://t.me/x")]])
         msg = rp_message("红包", markup=markup)
-        assert hunter._find_button(msg) is None
+        assert hunter._find_button(task_of(hunter), msg) is None
 
 
 class TestClassification:
@@ -174,7 +222,7 @@ class TestClassification:
     )
     def test_classify(self, text, expected, alog):
         hunter = RedPacketHunter(FakeClient(), rp_config(), alog)
-        assert hunter._classify(text) is expected
+        assert hunter._classify(task_of(hunter), text) is expected
 
 
 class TestExecution:
@@ -184,7 +232,12 @@ class TestExecution:
         hunter = RedPacketHunter(client, rp_config(), alog)
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
         assert outcome.result is GrabResult.SUCCESS
         assert outcome.callback_text == "恭喜抢到 1 元"
@@ -197,7 +250,12 @@ class TestExecution:
         hunter = RedPacketHunter(client, rp_config(), alog)
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
         assert outcome.result is GrabResult.FAILED
         assert "失效" in outcome.detail
@@ -209,7 +267,12 @@ class TestExecution:
         hunter = RedPacketHunter(client, rp_config(success={"wait_timeout": 0.05}), alog)
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
         assert outcome.result is GrabResult.UNKNOWN
 
@@ -231,7 +294,12 @@ class TestExecution:
 
         feeder = asyncio.create_task(feed_result())
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
         await feeder
         assert outcome.result is GrabResult.SUCCESS
@@ -244,9 +312,11 @@ class TestExecution:
             client, rp_config(strategy="keyword", detect={"keyword_template": "抢"})
         , alog)
         msg = rp_message("红包", markup=FakeMarkup([[FakeButton("抢")]], inline=False))
-        button = hunter._find_button(msg)
+        button = hunter._find_button(task_of(hunter), msg)
         assert button is not None
-        await hunter._execute(msg, button, None, "keyboard-text", asyncio.get_event_loop().time())
+        await hunter._execute(
+            task_of(hunter), msg, button, None, "keyboard-text", asyncio.get_event_loop().time()
+        )
         assert client.sent
         assert client.sent[0]["text"] == "抢"
 
@@ -256,15 +326,15 @@ class TestReply:
         hunter = RedPacketHunter(
             FakeClient(), rp_config(reply={"only_on_success": True}), alog
         )
-        assert hunter._should_reply(GrabResult.SUCCESS)
-        assert not hunter._should_reply(GrabResult.UNKNOWN)
-        assert not hunter._should_reply(GrabResult.FAILED)
+        assert hunter._should_reply(task_of(hunter), GrabResult.SUCCESS)
+        assert not hunter._should_reply(task_of(hunter), GrabResult.UNKNOWN)
+        assert not hunter._should_reply(task_of(hunter), GrabResult.FAILED)
 
         hunter = RedPacketHunter(
             FakeClient(), rp_config(reply={"only_on_success": False}), alog
         )
-        assert hunter._should_reply(GrabResult.SUCCESS)
-        assert hunter._should_reply(GrabResult.UNKNOWN)
+        assert hunter._should_reply(task_of(hunter), GrabResult.SUCCESS)
+        assert hunter._should_reply(task_of(hunter), GrabResult.UNKNOWN)
 
     @pytest.mark.asyncio
     async def test_reply_sent_on_success(self, alog):
@@ -278,10 +348,15 @@ class TestReply:
         )
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
         assert outcome.result is GrabResult.SUCCESS
-        replied = await hunter._maybe_reply(msg, outcome)
+        replied = await hunter._maybe_reply(task_of(hunter), msg, outcome)
         assert replied == "谢谢老板"
 
     @pytest.mark.asyncio
@@ -301,16 +376,227 @@ class TestReply:
         )
         msg = rp_message("红包", markup=button_markup(("领取", b"x")))
         outcome = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
-        replied = await hunter._maybe_reply(msg, outcome)
+        replied = await hunter._maybe_reply(task_of(hunter), msg, outcome)
         assert replied == "谢谢"
         # 第二次被冷却挡住
         outcome2 = await hunter._execute(
-            msg, hunter._find_button(msg), None, "button", asyncio.get_event_loop().time()
+            task_of(hunter),
+            msg,
+            hunter._find_button(task_of(hunter), msg),
+            None,
+            "button",
+            asyncio.get_event_loop().time(),
         )
-        replied2 = await hunter._maybe_reply(msg, outcome2)
+        replied2 = await hunter._maybe_reply(task_of(hunter), msg, outcome2)
         assert replied2 is None
+
+
+class TestMultipleTasks:
+    """多任务：各条互不影响，但一条红包只被**第一个**命中的任务抢。"""
+
+    def test_first_matching_task_wins(self, alog):
+        """🔴 两个任务都命中时只取第一个。
+
+        两个都动手就会点两次按钮，第二次多半报「已经领取过」，
+        还可能因为"秒点两次"触发风控。列表顺序就是优先级。
+        """
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi({"id": "a", "strategy": "button"}, {"id": "b", "strategy": "button"}),
+            alog,
+        )
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+        task, _, _ = hunter._match(msg, CHAT)
+        assert task.id == "a"
+
+    def test_disabled_task_is_skipped(self, alog):
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi(
+                {"id": "a", "enabled": False, "strategy": "button"},
+                {"id": "b", "strategy": "button"},
+            ),
+            alog,
+        )
+        assert [t.id for t in hunter.prepared] == ["b"]
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+        assert hunter._match(msg, CHAT)[0].id == "b"
+
+    def test_chat_filter_is_per_task(self, alog):
+        other = -1008888888888
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi(
+                {"id": "a", "chats": [CHAT], "strategy": "button"},
+                {"id": "b", "chats": [other], "strategy": "button"},
+            ),
+            alog,
+        )
+        here = rp_message("红包", markup=button_markup(("领取", b"x")))
+        assert hunter._match(here, CHAT)[0].id == "a"
+        there = rp_message(
+            "红包", chat=FakeChat(other, title="别的群"), markup=button_markup(("领取", b"x"))
+        )
+        assert hunter._match(there, other)[0].id == "b"
+
+    def test_strategy_is_per_task(self, alog):
+        """A 用按钮、B 用关键词 —— 同一个引擎里两套策略互不干扰。"""
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi(
+                {"id": "btn", "strategy": "button"},
+                {
+                    "id": "kw",
+                    "strategy": "keyword",
+                    "detect": {"keyword_template": "抢", "text_patterns": ["红包"]},
+                },
+            ),
+            alog,
+        )
+        # 有按钮 ⇒ 第一个任务（button 策略）接走
+        with_button = rp_message("红包", markup=button_markup(("领取", b"x")))
+        assert hunter._match(with_button, CHAT)[0].id == "btn"
+        # 没按钮 ⇒ 第一个接不了，落到关键词任务
+        task, button, _ = hunter._match(rp_message("红包来了"), CHAT)
+        assert task.id == "kw"
+        assert button is None
+
+    def test_exclude_chats_is_per_task(self, alog):
+        """A 任务排除了这个群，消息要落到没排除的 B 任务上。"""
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi(
+                {"id": "a", "exclude_chats": [CHAT], "strategy": "button"},
+                {"id": "b", "strategy": "button"},
+            ),
+            alog,
+        )
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+        assert hunter._match(msg, CHAT)[0].id == "b"
+
+    def test_watched_chats_unions_tasks(self, alog):
+        other = -1008888888888
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi({"id": "a", "chats": [CHAT]}, {"id": "b", "chats": [other]}),
+            alog,
+        )
+        # 这条只看监听范围，不涉及"能不能接住某条消息"，所以策略用默认的即可。
+        assert sorted(hunter.watched_chats()) == sorted([CHAT, other])
+
+    def test_any_task_watching_all_means_watch_everything(self, alog):
+        """一条留空 ⇒ 整体全监听，否则那条留空的会被无声忽略。"""
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi({"id": "a", "chats": [CHAT]}, {"id": "b", "chats": []}),
+            alog,
+        )
+        assert hunter.watched_chats() == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_grabs_only_once(self, alog):
+        """端到端：两个任务都能接，实际只点了一次按钮。"""
+        client = FakeClient(callback_answer="抢到了")
+        hunter = RedPacketHunter(
+            client,
+            rp_multi(
+                {"id": "a", "strategy": "button", "success": {"wait_timeout": 0}},
+                {"id": "b", "strategy": "button", "success": {"wait_timeout": 0}},
+            ),
+            alog,
+        )
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+        hunter._dispatch(msg, edited=False)
+        await asyncio.gather(*list(hunter._tasks))
+
+        assert len(client.callbacks) == 1, "点两次按钮会触发风控"
+        assert hunter.stats["detected"] == 1
+        assert hunter.task_stats["a"]["success"] == 1
+        assert hunter.task_stats["b"]["success"] == 0
+
+    @pytest.mark.asyncio
+    async def test_delay_is_per_task(self, alog):
+        """延迟是任务级的：这条任务配了 0.2 秒就必须真的等。"""
+        client = FakeClient(callback_answer="抢到了")
+        hunter = RedPacketHunter(
+            client,
+            rp_multi(
+                {"id": "off", "enabled": False},
+                {"id": "slow", "delay": 0.2, "jitter": 0, "success": {"wait_timeout": 0}},
+            ),
+            alog,
+        )
+        task = hunter.prepared[0]
+        assert task.id == "slow"
+        msg = rp_message("红包", markup=button_markup(("领取", b"x")))
+
+        started = time.perf_counter()
+        await hunter._grab(task, msg, hunter._find_button(task, msg), None)
+        assert time.perf_counter() - started >= 0.2
+
+    def test_per_task_stats_are_tracked(self, alog):
+        """多任务之后「一共抢到 3 个」说明不了是谁干的 —— 必须分任务记。"""
+        hunter = RedPacketHunter(FakeClient(), rp_multi({"id": "a"}, {"id": "b"}), alog)
+        task = hunter.prepared[0]
+        outcome = GrabOutcome(
+            result=GrabResult.SUCCESS,
+            strategy="button",
+            detail="",
+            chat_id=CHAT,
+            chat_title="红包群",
+            message_id=1,
+            cost_ms=1.0,
+            task=task.label,
+        )
+        hunter._record(task, outcome)
+
+        assert hunter.stats["success"] == 1
+        assert hunter.task_stats["a"]["success"] == 1
+        assert hunter.task_stats["b"]["success"] == 0
+
+    def test_snapshot_reports_tasks(self, alog):
+        hunter = RedPacketHunter(
+            FakeClient(), rp_multi({"id": "a"}, {"id": "b", "enabled": False}), alog
+        )
+        snap = hunter.snapshot()
+        assert snap["tasks"] == 2
+        assert snap["active_tasks"] == 1
+        assert set(snap["per_task"]) == {"a"}
+
+    @pytest.mark.asyncio
+    async def test_register_logs_tasks_and_warns_about_broken_ones(self):
+        """配不全的任务照样注册，但必须**明确说出来** —— 否则用户只看到"开了没动静"。"""
+        log = CapturingLog()
+        hunter = RedPacketHunter(
+            FakeClient(),
+            rp_multi({"id": "good"}, {"id": "bad", "strategy": "keyword"}),
+            log,
+        )
+        await hunter.register()
+
+        assert "tasks=2" in log.text
+        assert "任务配置不完整" in log.text
+        assert "bad" in log.text
+
+    @pytest.mark.asyncio
+    async def test_include_edited_is_any(self, alog):
+        """只要有一条任务要处理编辑事件，就整体注册那个 handler。"""
+        client = FakeClient()
+        hunter = RedPacketHunter(
+            client,
+            rp_multi({"id": "a", "include_edited": False}, {"id": "b", "include_edited": True}),
+            alog,
+        )
+        await hunter.register()
+        groups = sorted(group for _, group in client.handlers)
+        assert groups == [hunter.HANDLER_GROUP, hunter.HANDLER_GROUP]
 
 
 class TestChatEventBus:

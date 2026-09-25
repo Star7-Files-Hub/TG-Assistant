@@ -372,11 +372,17 @@
         });
         const data = await resp.json();
         if (!data.ok) { toast(data.detail || '登录失败', false); return; }
-        // 使用返回的 account 名
-        const account = data.account;
+        // 用服务端返回的规范化账号名（用户填的可能是大小写/空格不同的变体）。
+        //
+        // 🔴 这里**不能**再叫 account：上面第 4 行已经 `const account` 过了。
+        // 同一个函数作用域里重复声明 const 是 **SyntaxError**，而且它会让
+        // **整个 <script> 块**解析失败 —— 登录页所有按钮（扫码、验证码、2FA、
+        // 切换标签）会一起失效，控制台只报一句 "Identifier 'account' has
+        // already been declared"，不点根本发现不了。
+        const resolvedAccount = data.account;
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         // 同样把令牌留在 Cookie 里，交给 WebSocket 握手自动携带。
-        const wsUrl = `${proto}//${location.host}/ws/login-code/${account}?proxy=${encodeURIComponent(proxy)}`;
+        const wsUrl = `${proto}//${location.host}/ws/login-code/${resolvedAccount}?proxy=${encodeURIComponent(proxy)}`;
         if (ws) ws.close();
         ws = new WebSocket(wsUrl);
         ws.onopen = () => { ws.send(JSON.stringify({type: 'send_code', phone: phone})); };

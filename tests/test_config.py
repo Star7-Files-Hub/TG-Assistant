@@ -13,6 +13,7 @@ from tg_assistant.config import (
     NotifyConfig,
     ProxyConfig,
     RedPacketConfig,
+    RedPacketTask,
     Settings,
     expand_env,
     mask_phone,
@@ -237,28 +238,157 @@ class TestNotifyConfig:
             NotifyConfig(enabled=True, bot_token="${TGA_NOT_SET_TOKEN}", chat_id=1)
 
 
-class TestRedPacketConfig:
-    def test_defaults_are_conservative(self):
-        config = RedPacketConfig()
-        assert config.enabled is False
-        assert config.reply.only_on_success is True
-        assert config.max_attempts >= 1
+def rp_task(**overrides) -> dict:
+    """一条抢红包任务的最小可用配置。"""
+    task = {"id": "t", **overrides}
+    return task
 
-    def test_reply_enabled_requires_texts(self):
-        with pytest.raises(ValidationError):
-            RedPacketConfig(enabled=True, reply={"enabled": True, "texts": []})
+
+class TestRedPacketTask:
+    """任务级的校验与 ready 判定。"""
+
+    def test_defaults_are_conservative(self):
+        task = RedPacketTask(id="t")
+        assert task.enabled is True
+        assert task.strategy == "auto"
+        assert task.reply.only_on_success is True
+        assert task.max_attempts >= 1
+        assert task.ready is True
+
+    def test_reply_enabled_without_texts_is_not_ready(self):
+        """🔴 不再抛异常 —— 多任务下一条没填全不该让整份配置存不下去。
+
+        单任务时代这里是 ``pytest.raises(ValidationError)``；改成
+        「存得下、跑不动、界面标黄」是为了让用户能先开开关再回头填词。
+        """
+        task = RedPacketTask(id="t", reply={"enabled": True, "texts": []})
+        assert task.ready is False
+        assert "回复语" in (task.problem or "")
 
     def test_delay_range_must_be_ordered(self):
         with pytest.raises(ValidationError):
-            RedPacketConfig(reply={"enabled": True, "texts": ["a"], "delay_range": [3, 1]})
+            RedPacketTask(id="t", reply={"enabled": True, "texts": ["a"], "delay_range": [3, 1]})
 
-    def test_keyword_strategy_requires_template(self):
-        with pytest.raises(ValidationError):
-            RedPacketConfig(enabled=True, strategy="keyword")
+    def test_keyword_strategy_without_template_is_not_ready(self):
+        task = RedPacketTask(id="t", strategy="keyword")
+        assert task.ready is False
+        assert "关键词" in (task.problem or "")
 
     def test_bad_success_pattern(self):
         with pytest.raises(ValidationError):
-            RedPacketConfig(success={"success_patterns": ["(("]})
+            RedPacketTask(id="t", success={"success_patterns": ["(("]})
+
+    def test_blank_id_rejected(self):
+        with pytest.raises(ValidationError):
+            RedPacketTask(id="   ")
+
+    def test_label_falls_back_to_id(self):
+        assert RedPacketTask(id="a").label == "a"
+        assert RedPacketTask(id="a", name="主频道").label == "主频道"
+
+
+class TestRedPacketConfig:
+    """账号级：任务列表 + 并发上限。"""
+
+    def test_defaults_are_conservative(self):
+        config = RedPacketConfig()
+        assert config.enabled is False
+        assert config.tasks == []
+        assert config.active_tasks == []
+        assert config.max_concurrency >= 1
+
+    def test_duplicate_task_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            RedPacketConfig(tasks=[{"id": "same"}, {"id": "same"}])
+
+    def test_active_tasks_skips_disabled(self):
+        config = RedPacketConfig(
+            tasks=[{"id": "a"}, {"id": "b", "enabled": False}, {"id": "c"}]
+        )
+        assert [t.id for t in config.active_tasks] == ["a", "c"]
+
+    def test_watched_chats_unions_tasks(self):
+        config = RedPacketConfig(
+            tasks=[{"id": "a", "chats": [-1]}, {"id": "b", "chats": [-2]}]
+        )
+        assert config.watched_chats == [-1, -2]
+
+    def test_watched_chats_empty_when_any_task_watches_all(self):
+        """🔴 一条「全监听」的任务必须把整体拉成全监听。
+
+        只做简单并集的话，那条留空的会被无声忽略 —— 用户会以为
+        「我都留空了怎么还是只监听那两个频道」。
+        """
+        config = RedPacketConfig(tasks=[{"id": "a", "chats": [-1]}, {"id": "b", "chats": []}])
+        assert config.watched_chats == []
+
+    def test_include_edited_is_any(self):
+        config = RedPacketConfig(
+            tasks=[{"id": "a", "include_edited": False}, {"id": "b", "include_edited": True}]
+        )
+        assert config.include_edited is True
+        assert RedPacketConfig(tasks=[{"id": "a"}]).include_edited is True
+
+
+class TestRedPacketLegacyMigration:
+    """旧版扁平配置必须能**无缝**读进来。"""
+
+    def test_flat_config_becomes_one_task(self):
+        """🔴 服务器上跑着的 config.json 就是旧结构。
+
+        直接因为 extra="forbid" 报错会让**整份账号配置加载失败** ——
+        连带转发、通知、抢注一起停摆，而不只是抢红包不可用。
+        """
+        config = RedPacketConfig.model_validate(
+            {
+                "enabled": True,
+                "chats": [-100],
+                "strategy": "keyword",
+                "detect": {"keyword_template": "/grab {code}"},
+                "delay": 1.5,
+                "max_concurrency": 5,
+                "reply": {"enabled": True, "texts": ["xxlb"]},
+            }
+        )
+        assert len(config.tasks) == 1
+        task = config.tasks[0]
+        assert task.id == "default"
+        assert task.label == "默认任务"
+        assert task.chats == [-100]
+        assert task.strategy == "keyword"
+        assert task.detect.keyword_template == "/grab {code}"
+        assert task.delay == 1.5
+        assert task.reply.texts == ["xxlb"]
+        # 账号级字段留在外层，没被卷进任务里。
+        assert config.max_concurrency == 5
+        assert config.enabled is True
+
+    def test_new_shape_is_left_alone(self):
+        config = RedPacketConfig.model_validate(
+            {"tasks": [{"id": "a", "chats": [-1]}], "max_concurrency": 7}
+        )
+        assert [t.id for t in config.tasks] == ["a"]
+        assert config.max_concurrency == 7
+
+    def test_empty_config_does_not_invent_a_task(self):
+        assert RedPacketConfig.model_validate({}).tasks == []
+        assert RedPacketConfig.model_validate({"enabled": True}).tasks == []
+
+    def test_account_config_loads_a_legacy_file(self):
+        """从 AccountConfig 那一层进来也要能迁移（真实加载路径）。"""
+        account = AccountConfig.model_validate(
+            {"red_packet": {"enabled": True, "chats": [-5], "delay": 2.0}}
+        )
+        assert len(account.red_packet.tasks) == 1
+        assert account.red_packet.tasks[0].delay == 2.0
+
+    def test_migrated_config_is_stable_across_round_trips(self):
+        """迁移只发生一次：再存再读不会又多出一条任务。"""
+        first = RedPacketConfig.model_validate({"chats": [-1], "delay": 1.0})
+        dumped = first.model_dump(mode="json")
+        assert "chats" not in dumped, "旧字段不该被再写出去"
+        second = RedPacketConfig.model_validate(dumped)
+        assert len(second.tasks) == 1
 
 
 class TestAccountConfig:
