@@ -241,7 +241,13 @@
     const tagFields = ['chats', 'exclude_chats', 'button_keywords', 'text_patterns', 'success_patterns', 'failure_patterns', 'reply_texts'];
     const tagInputs = {};
 
+    // 空态这块被两种场景复用（没选账号 / 选了账号但一条任务都没有），
+    // 所以先把「没选账号」的原始文案存下来 —— 不存的话，选过一个空账号再切回
+    // 「选择账号...」，页面会挂着「还没有抢红包任务」，看着像账号选错了。
+    let emptyHtml = '';
+
     function init() {
+        emptyHtml = document.getElementById('rp-empty').innerHTML;
         tagFields.forEach(f => { tagInputs[f] = []; initTagInput(f); });
         document.getElementById('rp-strategy').addEventListener('change', syncStrategyVisibility);
         document.getElementById('rp-reply-enabled').addEventListener('change', syncReplyVisibility);
@@ -299,6 +305,7 @@
         currentAccount = sel.value;
         if (!currentAccount) {
             document.getElementById('rp-content').style.display = 'none';
+            document.getElementById('rp-empty').innerHTML = emptyHtml;
             document.getElementById('rp-empty').style.display = 'flex';
             return;
         }
