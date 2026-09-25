@@ -13,7 +13,13 @@ import pytest
 from pyrogram.enums import ParseMode
 from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWait
 
-from tg_assistant.config import AccountConfig, AccountRecord, ForwardRule, NotifyConfig
+from tg_assistant.config import (
+    AccountConfig,
+    AccountRecord,
+    ForwardRule,
+    MatchConfig,
+    NotifyConfig,
+)
 from tg_assistant.forwarder import (
     ChannelGroupDedupe,
     CrossAccountDedupe,
@@ -25,6 +31,7 @@ from tg_assistant.forwarder import (
     _sent_ids,
     content_fingerprint,
 )
+from tg_assistant.matching import CompiledMatcher
 from tg_assistant.runner import AccountRunner, MultiRunner
 
 from .conftest import FakeChat, FakeClient, FakeUser, make_message
@@ -654,6 +661,119 @@ class TestForwardEngine:
         engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
         await drain(engine)
         assert client.forwarded == []
+
+
+class TestMultilineForwardsOnce:
+    """多行正则里命中多行时，一条消息也只转发**一次**。
+
+    加了 ``re.MULTILINE`` 之后 ``^`` / ``$`` 按行匹配，一条消息里可能有**好几行**
+    都符合（比如公告里连着贴了三个码）。用户第一个担心的就是这个：
+    会不会"每行命中一次、每行发一遍"？
+
+    不会。整条链路上没有任何地方按"匹配次数"扇出：
+
+    - ``CompiledMatcher.match_text`` 命中第一个 pattern 就 ``return``；
+    - 它用的是 ``pattern.search()``，只取**最左的一个**匹配（不是 ``findall``）；
+    - 转发器对一条消息只走一次 ``_forward_one``。
+
+    全项目只有两处 ``finditer``：``cloudflare_ip`` 解析 IP 列表，以及抢注的
+    「注册码已被使用」通知（那处是把通知里露出的多个码记进内存字典，
+    不发任何东西）。
+    """
+
+    #: 三行都符合 ``^MSKY-...$``，前后还有干扰行。
+    MULTI = "📢 公告\nMSKY-AAA-1\nMSKY-BBB-2\nMSKY-CCC-3\n请尽快注册"
+
+    def test_the_fixture_message_really_has_three_matches(self):
+        """前置断言：不钉住这一点，下面那条测试可能是**空过**的 ——
+        消息里要是只有一行符合，"只转发一次"就什么都没证明。"""
+        import re
+
+        assert len(re.findall(r"^MSKY-[A-Z0-9-]+$", self.MULTI, re.MULTILINE)) == 3
+
+    @pytest.mark.asyncio
+    async def test_many_matching_lines_still_forward_once(self, client, alog):
+        engine = ForwardEngine(
+            client,
+            build_config(match={"mode": "regex", "patterns": [r"^MSKY-[A-Z0-9-]+$"]}),
+            alog,
+        )
+        engine.register()
+        engine._handle(src_message(self.MULTI), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1, "命中三行也只能转发一次，不是三次"
+        assert engine.stats["forwarded"] == 1
+        assert engine.stats["matched"] == 1
+
+    @pytest.mark.asyncio
+    async def test_several_matching_patterns_still_forward_once(self, client, alog):
+        """同一个规则里配了多条正则、且多条都命中，也只发一次。"""
+        import re
+
+        for pattern in (r"^MSKY-", r"公告", r"注册$"):
+            assert re.search(pattern, self.MULTI, re.MULTILINE), f"前提：{pattern} 应当命中"
+
+        engine = ForwardEngine(
+            client,
+            build_config(match={"mode": "regex", "patterns": [r"^MSKY-", r"公告", r"注册$"]}),
+            alog,
+        )
+        engine.register()
+        engine._handle(src_message(self.MULTI), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+
+    def test_groups_come_from_the_leftmost_match(self):
+        """``{g1}`` 取的是**最左**那个匹配，不是最后一行。
+
+        否则模板里的码会莫名其妙变成消息末尾那个，而且用户完全看不出规律。
+        """
+        matcher = CompiledMatcher(
+            MatchConfig(mode="regex", patterns=[r"^码:(\w+)$"], ignore_case=False)
+        )
+        result = matcher.match_text("码:AAA\n码:BBB\n码:CCC")
+        assert result.matched is True
+        assert result.groups == ("AAA",)
+
+    def test_match_is_a_boolean_decision_not_a_count(self):
+        """``MatchResult`` 里根本没有"匹配了几处"这个信息 —— 结构上就发不出多份。"""
+        matcher = CompiledMatcher(MatchConfig(mode="regex", patterns=[r"^MSKY-[A-Z0-9-]+$"]))
+        result = matcher.match_text(self.MULTI)
+        assert result.matched is True
+        assert not hasattr(result, "count")
+        assert not hasattr(result, "matches")
+
+    @pytest.mark.asyncio
+    async def test_two_rules_each_forward_once(self, client, alog):
+        """**不同规则**各转发一次是设计如此（它们通常发往不同频道）。
+
+        这条钉的是边界：用户问"会不会重复发"，答案是"同一条规则内不会；
+        不同规则命中同一条消息，每条规则各发一次 —— 这是它存在的意义"。
+        """
+        # 不能走 build_config —— 它的 **rule_overrides 是改**单条**规则，
+        # 不是替换规则列表（传 rules=[...] 会变成规则里的一个非法字段）。
+        def rule(rule_id: str, name: str, target: int) -> dict:
+            return {
+                "id": rule_id,
+                "name": name,
+                "sources": [SRC],
+                "targets": [target],
+                "match": {"mode": "regex", "patterns": [r"^MSKY-[A-Z0-9-]+$"]},
+                "mode": "forward",
+            }
+
+        config = AccountConfig.model_validate(
+            {"forward": {"enabled": True, "rules": [rule("r1", "规则一", DST), rule("r2", "规则二", DST + 1)]}}
+        )
+        engine = ForwardEngine(client, config, alog)
+        engine.register()
+        engine._handle(src_message(self.MULTI), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 2, "两条规则各一次"
+        assert {call["chat_id"] for call in client.forwarded} == {DST, DST + 1}
 
 
 class TestRulesHotReload:
