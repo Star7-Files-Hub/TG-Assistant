@@ -370,6 +370,70 @@ class TestUserPatternsAreMultiline:
         assert pattern.search("第一行\n恭喜你抢到\n第三行") is not None
 
 
+class TestWholeMessageAnchors:
+    """「整条消息」语义必须用 ``\\A`` / ``\\Z``，``^`` / ``$`` 表达不了。
+
+    🔴 2026-09-26 真实反馈：用户写了
+
+        ^(?=[\\s\\S]*本期尊贵赞助商)(?![\\s\\S]*(?:幸运抽奖结果公布|开奖已揭晓|抽奖即将开奖提醒))[\\s\\S]*$
+
+    用来排除「抽奖即将开奖提醒」，结果**照样转发**了。
+
+    这不是用户写错，而是多行模式的必然结果：``^`` 在**每一行**行首都成立，
+    引擎在第 1 行判定失败后会退到第 2 行**重新开始**。而 ``(?![\\s\\S]*关键词)``
+    是向**前**看的 —— 从第 2 行起，第 1 行那个关键词已经"在身后"，看不见，
+    守卫于是放行，``[\\s\\S]*$`` 把余下内容整个吃掉 → 命中。
+
+    换成白话：**同一份正则，在多行模式下会从「整条消息」悄悄退化成「某一行往后」**，
+    而且不报任何错。要表达"整条消息"，只能用 ``\\A`` / ``\\Z``（不受 MULTILINE 影响）。
+    """
+
+    #: 真实原文（2026-09-26 23:06 纳泰云官方交流）：要排除的词在第 1 行。
+    MESSAGE = (
+        "⏰ 【抽奖即将开奖提醒】 🎁\n"
+        "\n"
+        "👑 本期尊贵赞助商：@Feria5 (马克斯)\n"
+        "🏆 抽奖奖品：#1262 US-弗里蒙特 (PEER17-US1)"
+    )
+
+    #: 首行同形状、但**不在**排除词里 —— 这条该转，别一起误杀。
+    WANTED = (
+        "⏳ 【开奖倒计时：30分钟】 🎁\n"
+        "\n"
+        "👑 本期尊贵赞助商：@blackmao112\n"
+        "⏳ 距离开奖还有 30 分钟"
+    )
+
+    EXCLUDE = r"(?:幸运抽奖结果公布|开奖已揭晓|抽奖即将开奖提醒)"
+    OLD = rf"^(?=[\s\S]*本期尊贵赞助商)(?![\s\S]*{EXCLUDE})[\s\S]*$"
+    NEW = rf"\A(?=[\s\S]*本期尊贵赞助商)(?![\s\S]*{EXCLUDE})[\s\S]*\Z"
+
+    def test_caret_version_really_leaks(self):
+        """先把病钉住：``^`` 版本会从第 2 行重新命中，守卫形同虚设。"""
+        match = compile_user_pattern(self.OLD).search(self.MESSAGE)
+        assert match is not None, "旧写法应当（错误地）命中 —— 病没复现说明测试本身失效了"
+        assert not match.group(0).startswith("⏰"), (
+            "命中位置应当**不是**第 1 行 —— 正是「退到后面某行重新开始」才让守卫失效"
+        )
+
+    def test_absolute_version_excludes(self):
+        """``\\A`` 版本从整条消息开头检查，守卫才真正生效。"""
+        assert compile_user_pattern(self.NEW).search(self.MESSAGE) is None, (
+            "首行就写着排除词，绝不该命中"
+        )
+        assert compile_user_pattern(self.NEW).search(self.WANTED) is not None, (
+            "不在排除词里的「开奖倒计时」必须照常命中，不能连坐"
+        )
+
+    def test_engine_path_agrees(self):
+        """走 ``CompiledMatcher``（引擎真正用的那条路），结论必须一致。"""
+        leaking = CompiledMatcher(MatchConfig(mode="regex", patterns=[self.OLD]))
+        fixed = CompiledMatcher(MatchConfig(mode="regex", patterns=[self.NEW]))
+        assert leaking.match_text(self.MESSAGE).matched is True
+        assert fixed.match_text(self.MESSAGE).matched is False
+        assert fixed.match_text(self.WANTED).matched is True
+
+
 class TestHelpers:
     def test_compile_and_first_match(self):
         patterns = compile_patterns(["抢到", "恭喜"])

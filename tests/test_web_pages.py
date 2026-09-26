@@ -760,6 +760,27 @@ def test_rules_page_exposes_both_sender_lists() -> None:
     assert "excludeListRow(acc, 'exclude-users')" in html, "账号级黑名单没有渲染出来"
 
 
+def test_rules_page_warns_that_caret_is_per_line() -> None:
+    """面板必须讲清楚「整条消息」要用 ``\\A`` / ``\\Z``。
+
+    🔴 2026-09-26 用户反馈：他写了
+    ``^(?=[\\s\\S]*本期尊贵赞助商)(?![\\s\\S]*(?:…抽奖即将开奖提醒))[\\s\\S]*$``
+    来排除「抽奖即将开奖提醒」，结果**照转**。根因是多行模式下 ``^`` 在每一行都成立，
+    引擎会退到后面某行重新匹配，让 ``(?!…)`` 看不见前面的关键词。
+
+    这类坑的共同点是**不报错、只是结果不对**，用户没有任何线索可循 ——
+    所以这段提示语本身就是功能的一部分，不能被当成装饰删掉。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    assert "\\A" in html and "\\Z" in html, "缺少 \\A / \\Z 的写法说明"
+    assert "整条消息" in html, "没点明 \\A / \\Z 是给「整条消息」用的"
+    assert "form-hint-warn" in html, (
+        "这种会静默出错的坑要用独立样式，不能混在普通提示里"
+    )
+
+
 def test_rules_page_only_binds_static_inline_handlers() -> None:
     """规则页的内联 handler 只允许是零参数的静态调用。
 

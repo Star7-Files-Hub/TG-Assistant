@@ -1344,6 +1344,17 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     color: var(--text-muted);
     margin-bottom: 8px;
 }
+/* 会「静默出错」的那类提示（例如 ^ 在多行模式下不表示整条消息）。
+   这类坑的共同点是：配错了不报错、只是结果不对，所以必须比普通提示更显眼。 */
+.form-hint-warn {
+    color: var(--warning, #d29922);
+    border-left: 2px solid var(--warning, #d29922);
+    padding-left: 8px;
+    line-height: 1.7;
+}
+.form-hint-warn code {
+    color: var(--warning, #d29922);
+}
 .form-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
