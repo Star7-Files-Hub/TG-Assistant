@@ -208,6 +208,65 @@ def test_forward_exclude_chats_does_not_clobber_rules(client, app, account) -> N
 
 
 # --------------------------------------------------------------------------- #
+# 账号级「发送者黑名单」
+# --------------------------------------------------------------------------- #
+def test_forward_exclude_users_round_trip(client, app, account) -> None:
+    """写进去能读回来，且 @ 前缀 / 大小写会被归一化。"""
+    resp = client.put(
+        f"/api/config/{NAME}/forward-exclude-users",
+        json={"exclude_users": [555, "@Spammer"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["exclude_users"] == [555, "spammer"]
+
+    # 总览接口也要带上，否则面板刷新后黑名单就"消失"了
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["exclude_users"] == [555, "spammer"]
+
+
+def test_forward_exclude_users_can_be_cleared(client, app, account) -> None:
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-users", json={"exclude_users": [555]}).status_code
+        == 200
+    )
+    for body in ({"exclude_users": []}, {}, {"exclude_users": None}):
+        resp = client.put(f"/api/config/{NAME}/forward-exclude-users", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["exclude_users"] == []
+
+
+def test_forward_exclude_users_rejects_non_list(client, app, account) -> None:
+    resp = client.put(f"/api/config/{NAME}/forward-exclude-users", json={"exclude_users": "nope"})
+    assert resp.status_code == 400
+
+
+def test_forward_exclude_users_unknown_account_is_404(client, app) -> None:
+    resp = client.put("/api/config/ghost/forward-exclude-users", json={"exclude_users": []})
+    assert resp.status_code == 404
+
+
+def test_forward_exclude_users_is_independent_of_chats_and_rules(client, app, account) -> None:
+    """三个东西互不覆盖。
+
+    两个名单都是「整个 forward 对象重建」的写法，很容易在重建时把另一个顺手清掉 ——
+    那会变成"加个黑名单，排除频道就没了"，而且**没有任何报错**。
+    """
+    assert client.post(f"/api/config/{NAME}/rules", json=_rule_payload()).status_code == 200
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-users", json={"exclude_users": [555]}).status_code
+        == 200
+    )
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["exclude_chats"] == [-100999], "写黑名单不能把「排除频道」清掉"
+    assert row["exclude_users"] == [555]
+    assert [r["id"] for r in row["rules"]] == ["r1"], "写黑名单不能把规则清掉"
+
+
+# --------------------------------------------------------------------------- #
 # 规则试跑
 # --------------------------------------------------------------------------- #
 def test_rules_test_regex_match_and_groups(client, app, account) -> None:

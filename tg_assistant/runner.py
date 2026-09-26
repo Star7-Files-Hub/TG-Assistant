@@ -710,6 +710,15 @@ class AccountRunner:
                     # 这个数字 >0 就说明确实有过并发抢跑、而且被拦住了 —— 否则
                     # 「去重到底有没有挡住并发」在日志里没有任何可直接观察的口径。
                     "gated": (snapshot.get("recent_dedupe") or {}).get("gated", 0),
+                    # 启动时从磁盘恢复的去重条数 / 这张表有没有接上落盘。
+                    # 🔴 没有这两个数字，「重启后一天内不重复」到底成不成立在线上
+                    # **无法自证** —— 而它正是 2026-09-26 那次重复转发的根因
+                    # （内存表被一次重启清零）。``dedupe_restored=0`` 配
+                    # ``dedupe_persisted=False`` 就是"重启必然失忆"的现场。
+                    "dedupe_restored": (snapshot.get("recent_dedupe") or {}).get("restored", 0),
+                    "dedupe_persisted": (snapshot.get("recent_dedupe") or {}).get(
+                        "persisted", False
+                    ),
                     "downgraded": snapshot["downgraded"],
                 }
             )

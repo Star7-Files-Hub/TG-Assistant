@@ -42,11 +42,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
+import os
 import random
 import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from pyrogram import Client, filters
@@ -410,9 +413,18 @@ class RecentContentDedupe:
     两个都是 0 ⇒ 关掉这一层。
 
     ⚠️ 分桶键是**目标**：同一个内容发到不同目标互不影响，不会互相吃掉。
+
+    ⚠️ **这张表必须落盘**（``state_path``）：它的窗口是 24 小时，但内存表一重启就清零，
+    于是「一天内不重复」会被一次重启作废（2026-09-26 线上实测，见 :meth:`_load`）。
+    不传 ``state_path`` 时退回纯内存，行为与从前完全一致（单测 / 离线场景）。
     """
 
-    def __init__(self, limit: int = 5, ttl: float = 86400.0) -> None:
+    def __init__(
+        self,
+        limit: int = 5,
+        ttl: float = 86400.0,
+        state_path: Optional[Any] = None,
+    ) -> None:
         self.limit = max(0, int(limit))
         self.ttl = float(ttl)
         #: 目标 -> deque[(时间戳, 指纹)]，左旧右新。
@@ -422,6 +434,96 @@ class RecentContentDedupe:
         self._gates: dict[tuple[str, str], list] = {}
         #: 因为闸门串行而**省下来**的重复发送次数（诊断用）。
         self.gated = 0
+        #: 落盘位置。``None`` = 纯内存（单测 / 离线场景，行为与从前完全一致）。
+        self.state_path = Path(state_path) if state_path is not None else None
+        #: 从磁盘恢复的条目数（诊断用：启动时一眼看出"记性"有没有接上）。
+        self.restored = 0
+        if self.state_path is not None:
+            self._load()
+
+    # ------------------------------------------------------------------ #
+    # 落盘（重启后仍然记得"这条内容发过了"）
+    # ------------------------------------------------------------------ #
+    # 🔴 为什么要有这一段：本表的窗口是 24 小时（用户原话「一天内」），但它原来只在
+    #    内存里 —— 进程一重启就清零，「一天内不重复」的承诺被一次重启作废。
+    #    2026-09-26 线上取证：``text:ded5df56…`` 09-25 23:50:36 转发，
+    #    00:32:40 重启，10:33:16 同一条内容**又发了一遍**，中间只隔了一次重启。
+    #
+    #    只持久化这一张表，不碰 CrossAccountDedupe / ChannelGroupDedupe：
+    #    那两张的 TTL 是账号级 ``dedupe_window``（默认 **300 秒**），重启丢掉最多
+    #    多花一条；而本表覆盖的是**同内容**，只要它在，重启后同一条内容仍然拦得住。
+    def _load(self) -> None:
+        """启动时把磁盘上的记录读回来。任何异常都只当"没有记录"，绝不阻塞启动。"""
+        assert self.state_path is not None
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception:
+            # 文件被写坏（断电 / 手工编辑）时**不能**让转发起不来：
+            # 最坏的结果只是"重启后可能重复一条"，远比整个服务拒绝启动轻。
+            return
+        if not isinstance(raw, dict):
+            return
+        buckets = raw.get("buckets")
+        if not isinstance(buckets, dict):
+            return
+        now = time.time()
+        for target, items in buckets.items():
+            if not isinstance(items, list):
+                continue
+            restored: list[tuple[float, str]] = []
+            for item in items:
+                try:
+                    ts = float(item[0])
+                    fingerprint = str(item[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                # 已经超出 TTL 的直接不读回来 —— 留着只会白占内存。
+                if self.ttl > 0 and (now - ts) > self.ttl:
+                    continue
+                restored.append((ts, fingerprint))
+            if not restored:
+                continue
+            restored.sort(key=lambda pair: pair[0])
+            self._by_target[str(target)] = deque(restored)
+            self.restored += len(restored)
+        if self.restored:
+            self._compact()
+
+    def _save(self) -> None:
+        """把当前记录原子地写回磁盘。失败只吞掉 —— 转发永远不能被日志盘拖垮。"""
+        assert self.state_path is not None
+        try:
+            payload = {
+                "version": 1,
+                "buckets": {
+                    target: [[ts, fp] for ts, fp in bucket]
+                    for target, bucket in self._by_target.items()
+                    if bucket
+                },
+            }
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_name(self.state_path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            # 原子替换：断电时最坏是留一个 .tmp，绝不会出现写了一半的主文件。
+            os.replace(tmp, self.state_path)
+        except Exception:
+            return
+
+    def _compact(self) -> None:
+        """按 TTL 丢掉过期条目后重写一次（只在启动时调用，避免文件无限增长）。"""
+        now = time.time()
+        if self.ttl > 0:
+            for bucket in self._by_target.values():
+                while bucket and (now - bucket[0][0]) > self.ttl:
+                    bucket.popleft()
+        for target in [t for t, b in self._by_target.items() if not b]:
+            self._by_target.pop(target, None)
+        self._save()
 
     @property
     def enabled(self) -> bool:
@@ -506,6 +608,12 @@ class RecentContentDedupe:
                 bucket.remove(item)
         bucket.append((time.time(), fingerprint))
         self._prune(bucket)
+        # 落盘：**记完就写**。写在发送成功之后（调用点保证），所以重启丢掉的最多是
+        # "最后一条还没记完的"，不会出现"发过了却没记住"。
+        # 同步写、不 await：本表每次转发只写一次（线上实测每天几十次），
+        # 文件几 KB，代价远小于"重启后重复转发"给用户带来的困扰。
+        if self.state_path is not None:
+            self._save()
 
     def __len__(self) -> int:
         return sum(len(b) for b in self._by_target.values())
@@ -519,6 +627,10 @@ class RecentContentDedupe:
             "ttl": self.ttl,
             #: 曾因闸门排队等待的条数（≈ 本来会重复发送的条数）。
             "gated": self.gated,
+            #: 启动时从磁盘恢复的条数。``persisted`` 为 False 表示这张表没接落盘
+            #: （单测 / 离线场景），重启后"一天内不重复"的承诺不成立。
+            "restored": self.restored,
+            "persisted": self.state_path is not None,
         }
 
 
@@ -677,6 +789,9 @@ class ForwardEngine:
         ]
         #: 账号级全局排除：这些会话任何规则都不监听（与每条规则的 exclude_sources 互补）。
         self._exclude_chats = RefSet(config.forward.exclude_chats)
+        #: 账号级黑名单：这些人发的消息**任何规则**都不转发（与每条规则的
+        #: ``exclude_users`` 互补）。判定在规则循环**之前**做，见 ``_handle``。
+        self._exclude_users = RefSet(config.forward.exclude_users)
         self.dedupe = DedupeCache(config.forward.dedupe_window)
         #: 跨账号去重表（同一条消息发往同一个目标只允许一个账号发）。
         #: 由 ``MultiRunner`` 创建、多个账号**共享同一个实例**；不传（单测 / 离线场景）
@@ -726,6 +841,10 @@ class ForwardEngine:
             "recent_deduped": 0,
             #: 源会话禁止转发、自动改用复制的次数。
             "downgraded": 0,
+            #: 发送者在**黑名单**里（账号级 ``forward.exclude_users`` 或规则级
+            #: ``exclude_users``），且这条消息本来会命中 —— 因而没转发的次数。
+            #: 只统计"本来要发"的：黑名单里的人闲聊不该把日志和这个数字刷起来。
+            "blocked_senders": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -754,6 +873,10 @@ class ForwardEngine:
             self.config.forward.enabled,
             tuple(rule.model_dump(mode="json") for rule in self.config.forward.active_rules),
             tuple(str(chat) for chat in self.config.forward.exclude_chats),
+            # 账号级黑名单必须一起进指纹：不然「只改黑名单、不动规则」时指纹不变，
+            # 热重载会判定"没变化"直接返回，黑名单要等重启才生效 ——
+            # 而用户改完黑名单**立刻**就会去群里验证，看到没拦住只会以为功能坏了。
+            tuple(str(user) for user in self.config.forward.exclude_users),
         )
 
     def reload_rules(self) -> bool:
@@ -778,6 +901,7 @@ class ForwardEngine:
         self.config = config
         self.rules = [PreparedRule.build(rule) for rule in config.forward.active_rules]
         self._exclude_chats = RefSet(config.forward.exclude_chats)
+        self._exclude_users = RefSet(config.forward.exclude_users)
         if self._rules_signature() == before:
             return False
 
@@ -786,6 +910,7 @@ class ForwardEngine:
             rules=len(self.rules),
             enabled=config.forward.enabled,
             exclude_chats=len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
+            exclude_users=len(self._exclude_users.ids) + len(self._exclude_users.usernames),
             rule_ids=",".join(prepared.id for prepared in self.rules),
         )
         self._refresh_handlers()
@@ -935,6 +1060,19 @@ class ForwardEngine:
             )
             return
 
+        # 账号级黑名单（``forward.exclude_users``）。
+        #
+        # ⚠️ 这里**只算标志、不 return**，判定放到"正则命中之后"。用户要的是
+        # 「黑名单里的人发的、**且符合正则**的消息不转发」——
+        # 转发结果上两种写法完全一样（没命中的消息本来也不会转发），
+        # 但日志差别很大：提前 return 会把这个人**所有**闲聊都记一遍
+        # （群里一天几百条），而放在命中之后，只有"本来真要发出去的那几条"
+        # 才会留下记录。查黑名单有没有生效时，看到的就是干净的证据。
+        sender_blocked = bool(
+            self._exclude_users
+            and self._exclude_users.matches(sender_id, sender_username, is_self=is_self)
+        )
+
         for prepared in self.rules:
             rule = prepared.rule
             if edited and not rule.include_edited:
@@ -983,6 +1121,23 @@ class ForwardEngine:
                     chat=chat_title,
                     message_id=message_id,
                     preview=preview,
+                )
+                continue
+
+            # 黑名单拦在这里：消息**已经命中**、本来要发出去了。
+            # 放在 ``interval_ok`` 和三层去重**之前**是刻意的 —— 否则被黑名单
+            # 拦下的这条会白白占用最小间隔的名额、还会在去重表里留下记录，
+            # 把后面真正该发的那条顶掉。
+            if sender_blocked:
+                self.stats["blocked_senders"] += 1
+                prepared.stats["skipped"] += 1
+                self.alog.info(
+                    "发送者在黑名单中，不转发",
+                    rule=prepared.label,
+                    sender=sender_username or sender_id,
+                    sender_id=sender_id,
+                    chat=chat_title or chat_id,
+                    message_id=message_id,
                 )
                 continue
 
@@ -1591,6 +1746,10 @@ class ForwardEngine:
             "pending_tasks": len(self._tasks),
             "media_group_buffers": len(self._media_groups),
             "rules": {prepared.id: dict(prepared.stats) for prepared in self.rules},
+            # 黑名单规模：面板和 status 靠它显示「配了几个人」。
+            # 配了却不生效时，第一个要确认的就是"它到底读进去了没有"。
+            "exclude_chats": len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
+            "exclude_users": len(self._exclude_users.ids) + len(self._exclude_users.usernames),
         }
         if self._shared_dedupe is not None:
             # ⚠️ 这是**跨账号共享表**的数字（所有账号合计），不是本账号的。

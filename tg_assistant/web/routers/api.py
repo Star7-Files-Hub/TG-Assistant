@@ -542,6 +542,42 @@ async def api_forward_set_exclude_chats(
     return {"ok": True, "exclude_chats": list(config.forward.exclude_chats)}
 
 
+@router.put("/config/{name}/forward-exclude-users")
+async def api_forward_set_exclude_users(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """账号级「发送者黑名单」：这些人发的消息**所有规则**都不转发。
+
+    与每条规则自己的 ``exclude_users`` 互补：这里是写一次管全部的全局名单。
+
+    判定条件是「在黑名单里 **且** 命中规则」—— 转发结果上等价于"黑名单里的人
+    发什么都不转发"（没命中的消息本来也不会转发），但日志只在"本来真要发出去"
+    的那几条上留痕，不会被这个人的闲聊刷屏。
+    """
+    from tg_assistant.config import ForwardConfig
+
+    _require_account(store, name)
+    raw = payload.get("exclude_users")
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="exclude_users 必须是数组")
+
+    config = store.load_account_config(name, create=False)
+    # 与「排除频道」走同一套模型校验（自动去 @ / 去空白 / 拒绝非法引用），
+    # 不在路由里手写第二份归一化 —— 「同一个判断抄两份」是这个项目踩过的坑。
+    try:
+        config.forward = ForwardConfig.model_validate(
+            {**config.forward.model_dump(), "exclude_users": raw}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"黑名单校验失败：{exc}") from exc
+    store.save_account_config(name, config)
+    return {"ok": True, "exclude_users": list(config.forward.exclude_users)}
+
+
 # --------------------------------------------------------------------------- #
 # 全局转发规则（跨账号）
 #
@@ -647,6 +683,7 @@ async def api_rules_overview(
                 "session_exists": bool(info.get("session_exists")),
                 "forward_enabled": config.forward.enabled,
                 "exclude_chats": list(config.forward.exclude_chats),
+                "exclude_users": list(config.forward.exclude_users),
                 "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
             }
         )

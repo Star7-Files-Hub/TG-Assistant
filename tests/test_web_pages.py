@@ -734,6 +734,32 @@ def test_rules_page_does_not_require_picking_an_account_first() -> None:
     )
 
 
+def test_rules_page_exposes_both_sender_lists() -> None:
+    """面板必须能配「发送者黑名单」—— 后端早就有了，但曾经**根本没有入口**。
+
+    🔴 2026-09-26 用户原话：「给转发模块加上一个黑名单功能，当检测到是黑名单内人员
+    发送的符合正则的消息，不予转发」。当时 ``ForwardRule.exclude_users``、
+    ``PreparedRule.sender_allowed`` 全都实现好了、也有测试，但面板里只有白名单
+    ``from_users``，**账户级连字段都没有** —— 功能在、用户摸不到，等于没有。
+
+    所以这里钉住三层：弹窗里的规则级输入框、分组标题下的账号级名单、
+    以及保存时真的把字段带上（漏了就是"界面上加了、存盘就丢"）。
+    """
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    html = (web_dir / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    # 规则级（弹窗内，紧挨白名单）
+    assert 'id="exclude-users-input"' in html, "弹窗里缺少规则级黑名单输入框"
+    assert 'id="exclude-users-field"' in html
+    assert "exclude_users: tagInputs.exclude_users" in html, "保存时没带上黑名单字段"
+    assert "tagInputs.exclude_users = " in html, "编辑规则时没把已有黑名单回填"
+
+    # 账号级（分组标题下，和「排除频道」并排）
+    assert "'exclude-users'" in html, "缺少账号级黑名单的名单定义"
+    assert "forward-exclude-users" in html, "账号级黑名单没有对应的保存端点"
+    assert "excludeListRow(acc, 'exclude-users')" in html, "账号级黑名单没有渲染出来"
+
+
 def test_rules_page_only_binds_static_inline_handlers() -> None:
     """规则页的内联 handler 只允许是零参数的静态调用。
 

@@ -863,6 +863,13 @@ class TestWindowInEngine:
         text = "\n".join(lines)
         assert "22:00~06:00（跨零点）" in text
         assert "in_window=True" in text, "凌晨 3 点落在 22:00~06:00 内 ⇒ 应当是 True"
+        # 🔴 日志必须和**判定**同源。原来这行读的是 ``self.config.in_window``
+        # （真实时钟），而放行与否读的是 ``self._in_window()``（可注入时钟）——
+        # 两者在线上一致、在测试里不一致，于是这个用例会**随一天中的时刻时好时坏**：
+        # 只有真实时间恰好落在 22:00~06:00 内才通过。把同源性钉死，别再靠运气。
+        assert f"in_window={hunter._in_window()}" in text, (
+            "日志里的 in_window 必须来自 _in_window()，不能用另一个时钟"
+        )
 
 
 # --------------------------------------------------------------------------- #

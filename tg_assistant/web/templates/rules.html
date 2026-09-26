@@ -110,6 +110,14 @@
                                 <input type="text" id="from-users-field" placeholder="只转发这些人..." />
                             </div>
                         </div>
+                        <div class="tg-input-group">
+                            <label>发送者黑名单</label>
+                            <div class="tag-input" id="exclude-users-input">
+                                <div class="tag-list" id="exclude-users-list"></div>
+                                <input type="text" id="exclude-users-field" placeholder="这些人发的一律不转发..." />
+                            </div>
+                            <p class="form-hint">只对<strong>本规则</strong>生效；要全账号通用，请用分组标题下的「发送者黑名单」。</p>
+                        </div>
                     </div>
                 </div>
 
@@ -264,7 +272,7 @@
     // Tag input 数据
     const tagInputs = {
         sources: [], exclude_sources: [], targets: [],
-        from_users: [], patterns: [], exclude_patterns: []
+        from_users: [], exclude_users: [], patterns: [], exclude_patterns: []
     };
 
     // 初始化
@@ -289,8 +297,8 @@
         const list = document.getElementById('rules-list');
         list.addEventListener('click', onRuleListClick);
         list.addEventListener('change', onRuleListChange);
-        // 「排除频道」的输入框是列表渲染出来的，用委托比每渲染一次挂一次监听可靠
-        list.addEventListener('keydown', onExcludeChatsKeydown);
+        // 「排除频道 / 黑名单」的输入框是列表渲染出来的，用委托比每渲染一次挂一次监听可靠
+        list.addEventListener('keydown', onExcludeListKeydown);
         // 标签上的删除按钮同理（虽然 field 来自固定列表、index 是数字，
         // 但让「内联 handler 不带数据」这条约束没有例外更省心）
         document.getElementById('rule-modal').addEventListener('click', onModalClick);
@@ -354,7 +362,7 @@
             return;
         }
         list.innerHTML = accounts.map(renderAccountGroup).join('');
-        renderExcludeChats();
+        renderExcludeLists();
     }
 
     function emptyBlock(title, desc) {
@@ -406,25 +414,53 @@
             </div>`;
     }
 
-    // 账号级「排除频道」。放在分组标题下面而不是规则弹窗里，是因为它是**账号级**的：
-    // 写一次，该账号所有规则都不监听这些会话。规则弹窗是「一条规则扇出到多个账号」，
-    // 把账号级配置塞进去会让人以为只对当前这条规则生效。
-    function excludeChatsRow(acc) {
-        const items = acc.exclude_chats || [];
+    // 账号级过滤（排除频道 / 发送者黑名单）。放在分组标题下面而不是规则弹窗里，
+    // 是因为它们是**账号级**的：写一次，该账号所有规则都生效。规则弹窗是
+    // 「一条规则扇出到多个账号」，把账号级配置塞进去会让人以为只对当前这条规则生效。
+    //
+    // 两个名单的交互完全一样，只有「字段名 / 端点 / 文案」不同，所以用一张表驱动 ——
+    // 抄两遍的话，下次改交互一定会漏掉其中一份。
+    const EXCLUDE_LISTS = {
+        'exclude-chats': {
+            key: 'exclude_chats',
+            endpoint: 'forward-exclude-chats',
+            label: '排除频道',
+            placeholder: '频道 ID 或 @username，回车添加；留空 = 不排除任何频道',
+            hint: '这些会话所有规则都不监听。转发目标已由后端自动排除，不用重复填。',
+            added: n => `已排除 ${n} 个频道`,
+            cleared: '已清空排除列表'
+        },
+        'exclude-users': {
+            key: 'exclude_users',
+            endpoint: 'forward-exclude-users',
+            label: '发送者黑名单',
+            placeholder: '用户 ID 或 @username，回车添加；留空 = 不拉黑任何人',
+            hint: '这些人发的消息，即使命中了规则也不转发（该账号所有规则通用）。',
+            added: n => `已拉黑 ${n} 个人`,
+            cleared: '已清空黑名单'
+        }
+    };
+
+    function excludeListRow(acc, role) {
+        const spec = EXCLUDE_LISTS[role];
+        const items = acc[spec.key] || [];
         return `
             <div class="rules-account-exclude">
-                <span class="rules-account-exclude-label"
-                      title="这些会话所有规则都不监听。转发目标已由后端自动排除，不用重复填。">
-                    排除频道
+                <span class="rules-account-exclude-label" title="${escapeHtml(spec.hint)}">
+                    ${spec.label}
                     ${items.length ? `<span class="rules-account-exclude-count">${items.length}</span>` : ''}
                 </span>
-                <div class="tag-input tag-input-compact" data-role="exclude-chats"
+                <div class="tag-input tag-input-compact" data-role="${role}"
                      data-account="${escapeHtml(acc.name)}">
-                    <div class="tag-list" data-role="exclude-chats-list"></div>
-                    <input type="text" data-role="exclude-chats-field"
-                           placeholder="频道 ID 或 @username，回车添加；留空 = 不排除任何频道" />
+                    <div class="tag-list" data-role="${role}-list"></div>
+                    <input type="text" data-role="${role}-field"
+                           placeholder="${escapeHtml(spec.placeholder)}" />
                 </div>
             </div>`;
+    }
+
+    function excludeChatsRow(acc) {
+        return excludeListRow(acc, 'exclude-chats') + excludeListRow(acc, 'exclude-users');
     }
 
     function renderRuleCard(acc, rule) {
@@ -482,6 +518,16 @@
                             ${patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('')}
                         </div>
                     </div>` : ''}
+                    ${(rule.from_users || []).length || (rule.exclude_users || []).length ? `
+                    <div class="rule-match">
+                        <div class="rule-match-label">
+                            <span class="badge-mode">发送者</span>
+                        </div>
+                        <div class="rule-patterns">
+                            ${(rule.from_users || []).length ? `<span class="rule-tag">白名单 ${(rule.from_users || []).length}</span>` : ''}
+                            ${(rule.exclude_users || []).length ? `<span class="rule-tag rule-tag-block">黑名单 ${(rule.exclude_users || []).length}</span>` : ''}
+                        </div>
+                    </div>` : ''}
                     ${shared.length > 0 ? `<p class="rule-shared">这条规则也存在于 ${shared.map(escapeHtml).join('、')} —— 编辑 / 删除 / 启停会对所有账号一起生效</p>` : ''}
                 </div>
             </div>`;
@@ -500,11 +546,16 @@
 
     // ==================== 列表事件（委托） ====================
     function onRuleListClick(event) {
-        // 「排除频道」标签上的 × 不是 data-action，得放在下面的早退判断之前处理
+        // 「排除频道 / 黑名单」标签上的 × 不是 data-action，得放在下面的早退判断之前处理
         const removeBtn = event.target.closest('[data-exclude-remove]');
         if (removeBtn) {
-            const box = removeBtn.closest('[data-role="exclude-chats"]');
-            if (box) removeExcludeChat(box.dataset.account, Number(removeBtn.dataset.excludeRemove));
+            // 先认按钮所在的那个名单，再决定删哪个字段 —— 两个名单的 × 长得一样，
+            // 认错就会「删频道把黑名单删了」。
+            const box = removeBtn.closest('[data-role]');
+            const role = box && EXCLUDE_LISTS[box.dataset.role] ? box.dataset.role : '';
+            if (role) {
+                removeExcludeItem(role, box.dataset.account, Number(removeBtn.dataset.excludeRemove));
+            }
             return;
         }
         const btn = event.target.closest('[data-action]');
@@ -580,25 +631,29 @@
         await loadAll();
     }
 
-    // ==================== 账号级「排除频道」 ====================
-    // 数据源就是 /api/rules 响应里的 acc.exclude_chats，改完直接 PUT 回后端，
-    // 不在前端另存一份状态 —— 避免"界面显示的和磁盘里的不一致"。
-    function renderExcludeChats() {
-        document.querySelectorAll('[data-role="exclude-chats"]').forEach(box => {
-            const acc = accountByName(box.dataset.account);
-            const list = box.querySelector('[data-role="exclude-chats-list"]');
-            if (!acc || !list) return;
-            list.innerHTML = (acc.exclude_chats || []).map((tag, i) => `
-                <span class="tag">${escapeHtml(String(tag))}<button type="button"
-                      data-exclude-remove="${i}" title="移除">×</button></span>`).join('');
+    // ==================== 账号级过滤名单（排除频道 / 发送者黑名单） ====================
+    // 数据源就是 /api/rules 响应里的 acc.exclude_chats / acc.exclude_users，改完直接
+    // PUT 回后端，不在前端另存一份状态 —— 避免"界面显示的和磁盘里的不一致"。
+    function renderExcludeLists() {
+        Object.keys(EXCLUDE_LISTS).forEach(role => {
+            const spec = EXCLUDE_LISTS[role];
+            document.querySelectorAll(`[data-role="${role}"]`).forEach(box => {
+                const acc = accountByName(box.dataset.account);
+                const list = box.querySelector(`[data-role="${role}-list"]`);
+                if (!acc || !list) return;
+                list.innerHTML = (acc[spec.key] || []).map((tag, i) => `
+                    <span class="tag">${escapeHtml(String(tag))}<button type="button"
+                          data-exclude-remove="${i}" title="移除">×</button></span>`).join('');
+            });
         });
     }
 
-    async function saveExcludeChats(name, items) {
-        const res = await fetch(`/api/config/${encodeURIComponent(name)}/forward-exclude-chats`, {
+    async function saveExcludeList(role, name, items) {
+        const spec = EXCLUDE_LISTS[role];
+        const res = await fetch(`/api/config/${encodeURIComponent(name)}/${spec.endpoint}`, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({exclude_chats: items})
+            body: JSON.stringify({[spec.key]: items})
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -606,45 +661,47 @@
             await loadAll();   // 失败时重拉，把界面拨回磁盘上的真实状态
             return false;
         }
-        toast(items.length ? `已排除 ${items.length} 个频道` : '已清空排除列表', true);
+        toast(items.length ? spec.added(items.length) : spec.cleared, true);
         await loadAll();
         return true;
     }
 
-    async function addExcludeChat(name, value) {
+    async function addExcludeItem(role, name, value) {
         const acc = accountByName(name);
         if (!acc || !value) return;
-        const items = [...(acc.exclude_chats || [])];
+        const items = [...(acc[EXCLUDE_LISTS[role].key] || [])];
         if (items.some(x => String(x).toLowerCase() === value.toLowerCase())) return;
         items.push(value);
-        await saveExcludeChats(name, items);
+        await saveExcludeList(role, name, items);
     }
 
-    async function removeExcludeChat(name, index) {
+    async function removeExcludeItem(role, name, index) {
         const acc = accountByName(name);
         if (!acc) return;
-        const items = [...(acc.exclude_chats || [])];
+        const items = [...(acc[EXCLUDE_LISTS[role].key] || [])];
         items.splice(index, 1);
-        await saveExcludeChats(name, items);
+        await saveExcludeList(role, name, items);
     }
 
-    function onExcludeChatsKeydown(event) {
+    function onExcludeListKeydown(event) {
         const field = event.target;
-        if (!field.dataset || field.dataset.role !== 'exclude-chats-field') return;
-        const box = field.closest('[data-role="exclude-chats"]');
+        if (!field.dataset || !field.dataset.role) return;
+        // 输入框的 data-role 是 `<名单>-field`，去掉后缀就是名单名。
+        const role = String(field.dataset.role).replace(/-field$/, '');
+        if (!EXCLUDE_LISTS[role]) return;
+        const box = field.closest(`[data-role="${role}"]`);
         if (!box) return;
         if (event.key === 'Enter') {
             event.preventDefault();
             const value = field.value.trim();
             if (!value) return;
             field.value = '';
-            addExcludeChat(box.dataset.account, value);
+            addExcludeItem(role, box.dataset.account, value);
         } else if (event.key === 'Backspace' && !field.value) {
             // 空输入框按退格 = 删掉最后一个，和弹窗里的 tag 输入保持一致
             const acc = accountByName(box.dataset.account);
-            if (acc && (acc.exclude_chats || []).length) {
-                removeExcludeChat(box.dataset.account, acc.exclude_chats.length - 1);
-            }
+            const items = (acc && acc[EXCLUDE_LISTS[role].key]) || [];
+            if (items.length) removeExcludeItem(role, box.dataset.account, items.length - 1);
         }
     }
 
@@ -698,7 +755,7 @@
 
     // ==================== Tag Input ====================
     function initTagInputs() {
-        const fields = ['sources', 'exclude_sources', 'targets', 'from_users', 'patterns', 'exclude_patterns'];
+        const fields = ['sources', 'exclude_sources', 'targets', 'from_users', 'exclude_users', 'patterns', 'exclude_patterns'];
         fields.forEach(field => {
             const input = document.getElementById(`${field}-field`);
             if (!input) return;
@@ -854,6 +911,7 @@
         tagInputs.exclude_sources = [...(rule.exclude_sources || [])];
         tagInputs.targets = [...(rule.targets || [])];
         tagInputs.from_users = [...(rule.from_users || [])];
+        tagInputs.exclude_users = [...(rule.exclude_users || [])];
         tagInputs.patterns = [...(rule.match?.patterns || [])];
         tagInputs.exclude_patterns = [...(rule.match?.exclude_patterns || [])];
         Object.keys(tagInputs).forEach(renderTags);
@@ -887,6 +945,7 @@
             exclude_sources: tagInputs.exclude_sources,
             targets: tagInputs.targets,
             from_users: tagInputs.from_users,
+            exclude_users: tagInputs.exclude_users,
             match: {
                 mode: mode,
                 patterns: tagInputs.patterns,

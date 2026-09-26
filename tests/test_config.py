@@ -199,6 +199,33 @@ class TestForwardConfig:
         again = ForwardConfig.model_validate(config.model_dump(mode="json"))
         assert again.exclude_chats == config.exclude_chats
 
+    # ---- 发送者黑名单（账号级）----
+    def test_exclude_users_defaults_to_empty(self):
+        assert ForwardConfig().exclude_users == []
+
+    def test_exclude_users_normalizes_refs(self):
+        config = ForwardConfig(exclude_users=["@Spammer", "-1001234567890", None])
+        # 与「排除频道」共用同一套归一化：@ 与大小写被抹平、数字字符串转 int、None 丢弃
+        assert config.exclude_users == ["spammer", -1001234567890]
+
+    def test_exclude_users_accepts_bare_string(self):
+        assert ForwardConfig(exclude_users="@only_one").exclude_users == ["only_one"]
+
+    def test_exclude_users_accepts_bare_int(self):
+        """用户从面板 / CLI 只填一个数字时不该报错 —— 和 exclude_chats 一致。"""
+        assert ForwardConfig(exclude_users=555).exclude_users == [555]
+
+    def test_exclude_users_round_trips(self):
+        config = ForwardConfig(exclude_users=[555, "@a_b"])
+        again = ForwardConfig.model_validate(config.model_dump(mode="json"))
+        assert again.exclude_users == config.exclude_users
+
+    def test_exclude_users_and_chats_are_independent(self):
+        """两个名单不能互相串 —— 串了就会「拉黑一个人结果屏蔽了一个群」。"""
+        config = ForwardConfig(exclude_chats=[-100999], exclude_users=[555])
+        assert config.exclude_chats == [-100999]
+        assert config.exclude_users == [555]
+
     def test_exclude_chats_does_not_affect_rules(self):
         """排除列表是账号级的，不该和规则校验互相干扰。"""
         config = ForwardConfig(

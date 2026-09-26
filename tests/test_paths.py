@@ -167,3 +167,19 @@ def test_unicode_account_files_land_in_its_own_dir(paths: Paths) -> None:
     assert acct.session_file.parent == acct.root
     assert acct.root.name == "我的账号"
     assert (paths.accounts_dir / "我的账号").is_dir()
+
+
+def test_dedupe_file_lives_in_the_data_root(paths: Paths) -> None:
+    """去重表落在 ``data/`` 根下，**不按账号拆**。
+
+    这张表本来就是多账号共享的（同一个内容发往同一个目标，只允许一个账号发出去），
+    按账号拆开等于把它拆坏：两个账号各记一半，谁也不知道对方发过 ——
+    重启后两边都"失忆"，重复照样发生。
+
+    🔴 它存在的理由是：``RecentContentDedupe`` 的窗口是 24 小时，
+    但内存表一重启就清零（2026-09-26 线上实测到一次重启导致的重复转发）。
+    """
+    paths.ensure()
+    assert paths.dedupe_file == paths.data_dir / "dedupe.json"
+    assert paths.dedupe_file.parent == paths.data_dir
+    assert not paths.dedupe_file.exists(), "只是给个路径，不该顺手把文件建出来"

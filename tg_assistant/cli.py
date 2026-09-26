@@ -465,7 +465,9 @@ def run_cmd(
         ctx.settings,
         dedupe=CrossAccountDedupe(),
         pair_dedupe=ChannelGroupDedupe(),
-        recent_dedupe=RecentContentDedupe(),
+        # 「最近已转发的内容」必须**落盘**：它的窗口是 24 小时，纯内存的话进程一重启
+        # 就清零，「一天内不重复」被一次重启作废（见 RecentContentDedupe._load 的取证）。
+        recent_dedupe=RecentContentDedupe(state_path=ctx.store.paths.dedupe_file),
     )
     run_options = {
         "heartbeat": heartbeat,

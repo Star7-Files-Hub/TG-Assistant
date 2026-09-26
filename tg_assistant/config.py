@@ -368,9 +368,16 @@ class ForwardConfig(StrictModel):
     #: 不需要在这里重复填；这个列表是给"目标之外、但同样不想监听"的会话用的。
     exclude_chats: list[ChatRef] = Field(default_factory=list)
 
-    @field_validator("exclude_chats", mode="before")
+    #: 全局排除的发送者（黑名单）：**所有规则**都不转发这些人发的消息。
+    #:
+    #: 与每条规则自己的 ``exclude_users`` 互补：这里是账号级的，写一次管全部。
+    #: 判定放在**规则循环之前** —— 黑名单里的人发什么都不会被转发，
+    #: 不需要给每条规则各配一遍（配 N 遍就一定会漏配一条）。
+    exclude_users: list[ChatRef] = Field(default_factory=list)
+
+    @field_validator("exclude_chats", "exclude_users", mode="before")
     @classmethod
-    def _normalize_exclude_chats(cls, value: Any) -> Any:
+    def _normalize_exclude_lists(cls, value: Any) -> Any:
         if value is None:
             return []
         if isinstance(value, (str, int)):

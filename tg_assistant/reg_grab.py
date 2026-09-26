@@ -359,7 +359,12 @@ class RegGrabHunter:
             code_ttl_s=self.config.code_ttl,
             max_concurrency=self.config.max_concurrency,
             window=self.config.window.describe(),
-            in_window=self.config.in_window,
+            # 🔴 必须用 ``self._in_window()``（走可注入的 ``self._now()``），
+            # **不能**用 ``self.config.in_window`` —— 后者是 ``window.contains()``，
+            # 直接读真实时钟。两个时钟在线上一致，但在测试里不一致，于是这行日志
+            # 会和实际判定各说各话。这行字存在的唯一意义就是回答
+            # 「为什么没动静」，说错了比没有更坏。
+            in_window=self._in_window(),
         )
 
     async def close(self) -> None:

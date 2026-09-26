@@ -118,6 +118,23 @@ class Paths:
     def registry_file(self) -> Path:
         return self.data_dir / "accounts.json"
 
+    @property
+    def dedupe_file(self) -> Path:
+        """转发去重表（「最近已转发过的内容」）的落盘位置。
+
+        🔴 **为什么必须落盘**：这张表的窗口是 ``recent_dedupe_window``（默认 **24 小时**，
+        用户原话「一天内」），但它原来是**纯内存**的 —— 进程一重启就清零，
+        「一天内不重复」的承诺被一次重启作废。
+
+        2026-09-26 线上取证：``text:ded5df56…`` 于 09-25 23:50:36 转发，
+        00:32:40 服务重启，10:33:16 同一条内容**又被转发了一次** ——
+        中间只隔了一次重启。重启越频繁，重复越密。
+
+        放在 ``data/`` 根下而不是按账号分：这张表本来就是**多账号共享**的
+        （同一个内容发往同一个目标，只允许一个账号发出去），按账号拆开等于把它拆坏。
+        """
+        return self.data_dir / "dedupe.json"
+
     def account(self, name: str) -> AccountPaths:
         safe = validate_account_name(name)
         return AccountPaths(name=safe, root=self.accounts_dir / safe)

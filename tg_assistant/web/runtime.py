@@ -434,8 +434,16 @@ class RuntimeManager:
             if self._pair_dedupe is None:
                 self._pair_dedupe = ChannelGroupDedupe()
             # 「最近已转发的内容」去重表同理：换表 = 「前 5 条 / 一天内」的记录全没了。
+            # 🔴 还要**落盘**：只复用实例只能扛住"面板上点一次重启"，扛不住**进程**重启
+            # （systemctl restart / 崩溃自愈）。这张表的窗口是 24 小时，纯内存时
+            # 「一天内不重复」会被一次进程重启作废 —— 见 RecentContentDedupe._load。
             if self._recent_dedupe is None:
-                self._recent_dedupe = RecentContentDedupe()
+                # ``paths`` 取不到时退回纯内存：真实的 Store 一定有它，
+                # 但没有它**绝不能**让「启动」这个按钮报错 —— 去重是优化，
+                # 转发能不能跑才是主线。
+                self._recent_dedupe = RecentContentDedupe(
+                    state_path=getattr(getattr(self.store, "paths", None), "dedupe_file", None)
+                )
             await self._launch(
                 MultiRunner(
                     self.store,

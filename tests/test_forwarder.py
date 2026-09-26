@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import os
 import time
 import types
@@ -16,6 +17,7 @@ from pyrogram.errors import ChatForwardsRestricted, ChatWriteForbidden, FloodWai
 from tg_assistant.config import (
     AccountConfig,
     AccountRecord,
+    ForwardConfig,
     ForwardRule,
     MatchConfig,
     NotifyConfig,
@@ -661,6 +663,109 @@ class TestForwardEngine:
         engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
         await drain(engine)
         assert client.forwarded == []
+
+
+class TestAccountLevelBlacklist:
+    """账号级发送者黑名单（``forward.exclude_users``）。
+
+    与**规则级** ``exclude_users``（见 ``test_exclude_user``）互补：这里是账号级的，
+    写一次管全部 —— 让用户给 N 条规则各配一遍，一定会漏配一条。
+
+    判定条件是「在黑名单里 **且** 命中规则」。转发结果上等价于"黑名单里的人发什么都
+    不转发"（没命中的消息本来也不会转发），但日志只落在"本来真要发出去"的那几条上，
+    不会被这个人的闲聊刷屏 —— 群组一天几百条消息。
+    """
+
+    @staticmethod
+    def with_blacklist(entries):
+        config = build_config()
+        config.forward = ForwardConfig.model_validate(
+            {**config.forward.model_dump(), "exclude_users": entries}
+        )
+        return config
+
+    @pytest.mark.asyncio
+    async def test_blacklisted_sender_is_not_forwarded(self, client, alog):
+        engine = ForwardEngine(client, self.with_blacklist([555]), alog)
+        engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
+        await drain(engine)
+        assert client.forwarded == []
+        assert engine.stats["blocked_senders"] == 1
+
+    @pytest.mark.asyncio
+    async def test_other_senders_still_go_through(self, client, alog):
+        """黑名单只拦名单上的人 —— 不能把整个群都拦掉。"""
+        engine = ForwardEngine(client, self.with_blacklist([555]), alog)
+        engine._handle(src_message("关键词1", sender=FakeUser(777)), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1
+        assert engine.stats["blocked_senders"] == 0
+
+    @pytest.mark.asyncio
+    async def test_blacklist_also_covers_every_rule(self, client, alog):
+        """账号级名单必须**在规则循环之外**判定：两条规则都得拦住。"""
+        config = self.with_blacklist([555])
+        config.forward.rules.append(
+            ForwardRule.model_validate(
+                {
+                    "id": "r2",
+                    "name": "第二条",
+                    "sources": [SRC],
+                    "targets": [DST],
+                    "match": {"mode": "contains", "patterns": ["关键词"]},
+                }
+            )
+        )
+        engine = ForwardEngine(client, config, alog)
+        engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
+        await drain(engine)
+        assert client.forwarded == []
+
+    @pytest.mark.asyncio
+    async def test_non_matching_chatter_does_not_inflate_the_counter(self, client, alog):
+        """黑名单里的人闲聊不该让计数 / 日志涨起来 —— 只有"本来要发"的才算。"""
+        engine = ForwardEngine(client, self.with_blacklist([555]), alog)
+        engine._handle(src_message("随便聊两句", sender=FakeUser(555)), edited=False)
+        await drain(engine)
+        assert engine.stats["blocked_senders"] == 0
+
+    @pytest.mark.asyncio
+    async def test_blacklist_matches_username_too(self, client, alog):
+        engine = ForwardEngine(client, self.with_blacklist(["@spammer"]), alog)
+        engine._handle(
+            src_message("关键词1", sender=FakeUser(555, username="spammer")), edited=False
+        )
+        await drain(engine)
+        assert client.forwarded == []
+        assert engine.stats["blocked_senders"] == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_blacklist_changes_nothing(self, client, alog):
+        engine = ForwardEngine(client, self.with_blacklist([]), alog)
+        engine._handle(src_message("关键词1", sender=FakeUser(555)), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1
+
+    def test_blacklist_is_part_of_the_reload_signature(self, alog):
+        """只改黑名单、不动规则时，热重载必须能察觉。
+
+        否则用户改完黑名单**立刻**去群里验证，看到没拦住只会以为功能坏了 ——
+        而实际上要等重启才生效。
+        """
+        config = self.with_blacklist([])
+        engine = ForwardEngine(FakeClient(), config, alog)
+        before = engine._rules_signature()
+        config.forward = ForwardConfig.model_validate(
+            {**config.forward.model_dump(), "exclude_users": [555]}
+        )
+        engine.config = config
+        assert engine._rules_signature() != before
+
+    def test_snapshot_reports_the_blacklist_size(self, alog):
+        engine = ForwardEngine(FakeClient(), self.with_blacklist([555, "@x"]), alog)
+        snap = engine.snapshot()
+        assert snap["exclude_users"] == 2
+        assert snap["exclude_chats"] == 0
 
 
 class TestMultilineForwardsOnce:
@@ -2425,6 +2530,107 @@ class TestRecentContentDedupe:
         dedupe.add("fp", DST)
         snap = dedupe.snapshot()
         assert snap["size"] == 1 and snap["limit"] == 5 and snap["ttl"] == 3600
+
+
+class TestRecentContentDedupePersists:
+    """「一天内不重复」必须在**进程重启**之后仍然成立。
+
+    🔴 线上取证（2026-09-26）：``text:ded5df56…`` 于 09-25 23:50:36 转发，
+    00:32:40 服务重启，10:33:16 同一条内容**又被转发了一次** ——
+    这张表的窗口是 24 小时，但它原来只在内存里，一次重启就把承诺作废了。
+    """
+
+    def test_survives_a_restart(self, tmp_path):
+        path = tmp_path / "dedupe.json"
+        before = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        before.add("text:abc", DST)
+        assert path.exists(), "记完就应该落盘，否则重启必丢"
+
+        # 模拟进程重启：换一个对象、读同一个文件。
+        after = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        assert after.contains("text:abc", DST) is True
+        assert after.restored == 1, "恢复条数要能自证「记性」真的接上了"
+
+    def test_restart_does_not_leak_across_targets(self, tmp_path):
+        path = tmp_path / "dedupe.json"
+        before = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        before.add("text:abc", DST)
+
+        after = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        assert after.contains("text:abc", SRC) is False, "同内容发到不同目标互不影响"
+
+    def test_without_state_path_it_stays_in_memory(self, tmp_path):
+        """不传 state_path 时行为必须和从前**完全一致**（单测 / 离线场景）。"""
+        dedupe = RecentContentDedupe(limit=5, ttl=86400)
+        dedupe.add("text:abc", DST)
+        # 只看这个文件：tmp_path 里可能有 conftest 建出来的 data/ 目录，别误判。
+        assert not (tmp_path / "dedupe.json").exists()
+        assert dedupe.snapshot()["persisted"] is False
+        assert dedupe.contains("text:abc", DST) is True
+
+    def test_expired_entries_are_not_restored(self, tmp_path):
+        path = tmp_path / "dedupe.json"
+        path.write_text(
+            json.dumps(
+                {"version": 1, "buckets": {str(DST): [[time.time() - 10, "text:old"]]}}
+            ),
+            encoding="utf-8",
+        )
+        dedupe = RecentContentDedupe(limit=5, ttl=5, state_path=path)
+        assert dedupe.contains("text:old", DST) is False, "过了 TTL 的不该读回来"
+        assert dedupe.restored == 0
+
+    def test_corrupt_file_does_not_block_startup(self, tmp_path):
+        """写坏的文件最坏只该导致「可能重复一条」，绝不能让服务起不来。"""
+        path = tmp_path / "dedupe.json"
+        path.write_text("{ 这不是 JSON", encoding="utf-8")
+        dedupe = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        assert len(dedupe) == 0
+        # 而且之后的落盘还得正常 —— 不能因为读到坏文件就永久瘫痪。
+        dedupe.add("text:new", DST)
+        assert RecentContentDedupe(limit=5, ttl=86400, state_path=path).contains(
+            "text:new", DST
+        )
+
+    def test_bad_entry_shape_is_skipped_not_fatal(self, tmp_path):
+        path = tmp_path / "dedupe.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "buckets": {
+                        str(DST): [["不是时间", "text:x"], [time.time(), "text:ok"]]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        dedupe = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
+        assert dedupe.contains("text:ok", DST) is True
+        assert dedupe.contains("text:x", DST) is False
+
+    @pytest.mark.asyncio
+    async def test_engine_records_after_a_real_forward(self, tmp_path, alog):
+        """端到端：引擎转发成功 ⇒ 落盘 ⇒ "重启"后仍然认得这条内容。
+
+        这才是用户真正在意的链路 —— 单测 ``add`` 落盘还不够，
+        要证明**引擎真的会调它**。
+        """
+        path = tmp_path / "dedupe.json"
+        engine = ForwardEngine(
+            FakeClient(),
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600, state_path=path),
+        )
+        message = group_message("关键词123")
+        engine._handle(message, edited=False)
+        await drain(engine)
+        assert engine.stats["forwarded"] == 1
+        assert path.exists(), "转发成功就该落盘"
+
+        reborn = RecentContentDedupe(limit=5, ttl=3600, state_path=path)
+        assert reborn.contains(content_fingerprint(message), DST) is True
 
 
 class TestRecentContentDedupeInEngine:
