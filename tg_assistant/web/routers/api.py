@@ -892,12 +892,17 @@ async def api_red_packet_enabled(
 # --------------------------------------------------------------------------- #
 # 抢注任务
 # --------------------------------------------------------------------------- #
-#: GET 里额外塞给面板的**只读**字段：PUT 时直接丢掉。
+#: GET 会在每条任务上多塞的**只读**字段：PUT 时直接丢掉。
 #:
-#: 不丢的话，`RegGrabConfig` 是 ``extra="forbid"`` 的 —— 面板（或任何脚本）
-#: 把 GET 的结果原样 PUT 回来会直接 400「Extra inputs are not permitted」，
-#: 而用户看到的是「保存失败」，根本猜不到是这三个字段惹的。
-_REG_GRAB_READONLY = ("ready", "in_window", "server_now")
+#: 不丢的话 ``RegGrabTask`` 是 ``extra="forbid"`` 的，把 GET 的结果原样
+#: PUT 回来会 400「Extra inputs are not permitted」，用户只看到「保存失败」。
+_REG_GRAB_TASK_READONLY = ("ready", "problem", "in_window")
+
+#: GET 会在**顶层**多塞的只读字段：一样要在 PUT 时丢掉。
+#:
+#: ``server_now`` 是「服务端现在几点」，纯展示用；``RegGrabConfig`` 同样是
+#: ``extra="forbid"``，带上去就 400。
+_REG_GRAB_READONLY = ("server_now",)
 
 
 @router.get("/config/{name}/reg_grab")
@@ -905,12 +910,14 @@ async def api_reg_grab_get(name: str, store=Depends(get_store)) -> dict[str, Any
     _require_account(store, name)
     config = store.load_account_config(name, create=False).reg_grab
     data = config.model_dump(mode="json")
-    # 面板要拿它来提示「开关开了但还没配好」，不用自己重复一遍判断逻辑。
-    data["ready"] = config.ready
-    # 时段是「**此刻**能不能动手」，会随时间跳变 ⇒ 每次 GET 现算，不落盘。
-    # 同时把**服务端当前时间**给出去：时间框里填的是服务端时区（Asia/Shanghai），
-    # 用户本地时区不一致时，光看那两个时间框是发现不了的 —— 必须有个「现在几点」对照。
-    data["in_window"] = config.in_window
+    # 面板要按任务显示「配好了没有」和「此刻在不在时段内」，不用自己重复一遍判断逻辑。
+    # 时段会随时间跳变 ⇒ 每次 GET 现算，不落盘。
+    for item, task in zip(data["tasks"], config.tasks):
+        item["ready"] = task.ready
+        item["problem"] = task.problem
+        item["in_window"] = task.in_window
+    # 时间框里填的是服务端时区（Asia/Shanghai），用户本地时区不一致时，
+    # 光看那两个时间框是发现不了的 —— 必须有个「现在几点」对照。
     data["server_now"] = datetime.now().strftime("%H:%M")
     return data
 
@@ -925,14 +932,22 @@ async def api_reg_grab_put(
 
     _require_account(store, name)
     config = store.load_account_config(name, create=False)
-    # 只读字段直接丢掉，让「GET 回来改一改再 PUT 回去」这种用法也能work。
-    body = {k: v for k, v in payload.items() if k not in _REG_GRAB_READONLY}
+    # 只读字段直接丢掉，让「GET 回来改一改再 PUT 回去」这种用法也能 work。
+    body = {key: value for key, value in payload.items() if key not in _REG_GRAB_READONLY}
+    body["tasks"] = [
+        (
+            {key: value for key, value in task.items() if key not in _REG_GRAB_TASK_READONLY}
+            if isinstance(task, dict)
+            else task
+        )
+        for task in body.get("tasks", [])
+    ]
     try:
         config.reg_grab = RegGrabConfig.model_validate(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"配置校验失败：{exc}") from exc
     store.save_account_config(name, config)
-    return {"ok": True, "ready": config.reg_grab.ready}
+    return {"ok": True, "tasks": len(config.reg_grab.tasks)}
 
 
 @router.put("/config/{name}/reg_grab/enabled")
@@ -943,25 +958,28 @@ async def api_reg_grab_enabled(
 ) -> dict[str, Any]:
     """总开关。
 
-    开启时**拒绝**「还没配好」的配置 —— 否则用户打开开关后什么都不发生，
-    日志里也只有一条容易被忽略的警告，很难判断到底哪里没填。
+    开启时**拒绝**「一条配好的任务都没有」的配置 —— 否则用户打开开关后什么都
+    不发生，日志里也只有一条容易被忽略的警告，很难判断到底哪里没填。
+
+    ⚠️ 校验只到「至少有一条 :attr:`RegGrabTask.ready` 的任务」这一层，不再
+    逐字段去挑刺：多任务下用户经常先把开关打开、再一条条慢慢填，卡得太死
+    反而每次都要先编一条假的出来。
     """
     _require_account(store, name)
     config = store.load_account_config(name, create=False)
     enabled = bool(payload.get("enabled", False))
-    if enabled and not config.reg_grab.detect.code_pattern:
+    ready = any(task.ready for task in config.reg_grab.tasks)
+    if enabled and not ready:
         raise HTTPException(
             status_code=400,
-            detail="还没填「注册码提取正则」，开了也不会执行。请先填好再打开开关。",
-        )
-    if enabled and not config.reg_grab.steps:
-        raise HTTPException(
-            status_code=400,
-            detail="还没有添加任何步骤，开了也不会执行。请先在「步骤链」里加至少一步。",
+            detail=(
+                "还没有任何一条配置完整的抢注任务（每条都要有「注册码提取正则」"
+                "和至少一条步骤），开了也不会执行。请先配好一条再打开开关。"
+            ),
         )
     config.reg_grab.enabled = enabled
     store.save_account_config(name, config)
-    return {"ok": True, "enabled": config.reg_grab.enabled, "ready": config.reg_grab.ready}
+    return {"ok": True, "enabled": config.reg_grab.enabled, "ready": ready}
 
 
 @router.post("/config/{name}/reg_grab/test_notify")

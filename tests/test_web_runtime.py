@@ -537,6 +537,41 @@ def test_account_status_reports_feature_flags(monkeypatch: pytest.MonkeyPatch) -
     assert by_name["SevenStar"]["features"]["cloudflare_ip"] is True
 
 
+def test_feature_flags_read_the_multitask_reg_grab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """🔴 回归方向：抢注改成多任务后，功能标记只许读账号级的 ``enabled``。
+
+    ``ready`` / ``detect`` / ``steps`` 这些扁平字段已经迁到**任务**上，
+    web 层再碰 ``config.reg_grab.ready`` 之类就是 ``AttributeError`` ——
+    账号下拉（``/api/accounts``）直接 500。这里用**真的** ``AccountConfig``
+    装一条任务跑一遍，把那类读法钉死。
+    """
+    from tg_assistant.config import AccountConfig
+
+    config = AccountConfig(
+        reg_grab={
+            "enabled": True,
+            "max_concurrency": 2,
+            "tasks": [
+                {
+                    "id": "main",
+                    "detect": {"code_pattern": r"Register_([A-Za-z0-9]{10})"},
+                    "steps": [
+                        {"type": "send", "chat": "@example_bot", "text": "/bind {code}"}
+                    ],
+                }
+            ],
+        }
+    )
+    manager = _manager_with_configs(monkeypatch, {"抓码号": config})
+
+    items = manager.account_status(with_features=True)
+    by_name = {i["name"]: i for i in items}
+
+    assert by_name["抓码号"]["features"]["reg_grab"] is True
+
+
 def test_broken_config_does_not_break_the_account_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

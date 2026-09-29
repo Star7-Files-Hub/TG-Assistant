@@ -14,6 +14,8 @@ from tg_assistant.config import (
     ProxyConfig,
     RedPacketConfig,
     RedPacketTask,
+    RegGrabConfig,
+    RegGrabTask,
     Settings,
     expand_env,
     mask_phone,
@@ -415,6 +417,118 @@ class TestRedPacketLegacyMigration:
         dumped = first.model_dump(mode="json")
         assert "chats" not in dumped, "旧字段不该被再写出去"
         second = RedPacketConfig.model_validate(dumped)
+        assert len(second.tasks) == 1
+
+
+class TestRegGrabConfig:
+    """账号级：任务列表 + 并发上限（对齐抢红包）。"""
+
+    def test_defaults_are_conservative(self):
+        config = RegGrabConfig()
+        assert config.enabled is False
+        assert config.tasks == []
+        assert config.active_tasks == []
+        assert config.max_concurrency >= 1
+
+    def test_duplicate_task_ids_rejected(self):
+        with pytest.raises(ValidationError):
+            RegGrabConfig(tasks=[{"id": "same"}, {"id": "same"}])
+
+    def test_active_tasks_skips_disabled(self):
+        config = RegGrabConfig(
+            tasks=[{"id": "a"}, {"id": "b", "enabled": False}, {"id": "c"}]
+        )
+        assert [t.id for t in config.active_tasks] == ["a", "c"]
+
+    def test_watched_chats_unions_tasks(self):
+        config = RegGrabConfig(
+            tasks=[{"id": "a", "chats": [-1]}, {"id": "b", "chats": [-2]}]
+        )
+        assert config.watched_chats == [-1, -2]
+
+    def test_watched_chats_empty_when_any_task_watches_all(self):
+        config = RegGrabConfig(tasks=[{"id": "a", "chats": [-1]}, {"id": "b", "chats": []}])
+        assert config.watched_chats == []
+
+    def test_include_edited_is_any(self):
+        config = RegGrabConfig(
+            tasks=[{"id": "a", "include_edited": False}, {"id": "b", "include_edited": True}]
+        )
+        assert config.include_edited is True
+        assert RegGrabConfig(tasks=[{"id": "a"}]).include_edited is True
+
+    def test_task_ready_needs_code_pattern_and_steps(self):
+        empty = RegGrabTask(id="a")
+        assert empty.ready is False
+        assert empty.problem is not None
+        ready = RegGrabTask(
+            id="b",
+            detect={"code_pattern": r"([A-Z]{4}-\d+)"},
+            steps=[{"type": "send", "text": "/bind {code}"}],
+        )
+        assert ready.ready is True
+        assert ready.problem is None
+
+
+class TestRegGrabLegacyMigration:
+    """旧版扁平配置必须能**无缝**读进来。"""
+
+    def test_flat_config_becomes_one_task(self):
+        """🔴 服务器上跑着的 config.json 就是旧结构。
+
+        直接因为 extra="forbid" 报错会让**整份账号配置加载失败** ——
+        连带转发、通知、抢红包一起停摆，而不只是抢注不可用。
+        """
+        config = RegGrabConfig.model_validate(
+            {
+                "enabled": True,
+                "chats": [-100],
+                "detect": {"code_pattern": r"([A-Z]{4}-\d+)"},
+                "steps": [{"type": "send", "text": "/bind {code}"}],
+                "delay": 1.5,
+                "code_ttl": 1200,
+                "max_concurrency": 5,
+                "window": {"enabled": True, "start": "09:00", "end": "22:00"},
+            }
+        )
+        assert len(config.tasks) == 1
+        task = config.tasks[0]
+        assert task.id == "default"
+        assert task.label == "默认任务"
+        assert task.chats == [-100]
+        assert task.detect.code_pattern == r"([A-Z]{4}-\d+)"
+        assert task.delay == 1.5
+        assert task.code_ttl == 1200
+        assert task.window.start == "09:00"
+        # 账号级字段留在外层，没被卷进任务里。
+        assert config.max_concurrency == 5
+        assert config.enabled is True
+
+    def test_new_shape_is_left_alone(self):
+        config = RegGrabConfig.model_validate(
+            {"tasks": [{"id": "a", "chats": [-1]}], "max_concurrency": 7}
+        )
+        assert [t.id for t in config.tasks] == ["a"]
+        assert config.max_concurrency == 7
+
+    def test_empty_config_does_not_invent_a_task(self):
+        assert RegGrabConfig.model_validate({}).tasks == []
+        assert RegGrabConfig.model_validate({"enabled": True}).tasks == []
+
+    def test_account_config_loads_a_legacy_file(self):
+        """从 AccountConfig 那一层进来也要能迁移（真实加载路径）。"""
+        account = AccountConfig.model_validate(
+            {"reg_grab": {"enabled": True, "chats": [-5], "delay": 2.0}}
+        )
+        assert len(account.reg_grab.tasks) == 1
+        assert account.reg_grab.tasks[0].delay == 2.0
+
+    def test_migrated_config_is_stable_across_round_trips(self):
+        """迁移只发生一次：再存再读不会又多出一条任务。"""
+        first = RegGrabConfig.model_validate({"chats": [-1], "delay": 1.0})
+        dumped = first.model_dump(mode="json")
+        assert "chats" not in dumped, "旧字段不该被再写出去"
+        second = RegGrabConfig.model_validate(dumped)
         assert len(second.tasks) == 1
 
 

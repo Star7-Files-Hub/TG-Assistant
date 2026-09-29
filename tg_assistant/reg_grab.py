@@ -52,6 +52,7 @@ from .config import (
     AccountConfig,
     RegGrabConfig,
     RegGrabStep,
+    RegGrabTask,
 )
 from .logging_setup import AccountLogger
 from .matching import (
@@ -135,6 +136,8 @@ class ChainOutcome:
     steps: list[StepOutcome] = field(default_factory=list)
     detail: str = ""
     cost_ms: float = 0.0
+    #: 是哪条任务干的 —— 多任务之后，日志里不写这个就分不清是哪条链跑的。
+    task: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +198,68 @@ def code_value_of(token: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 单个任务（预编译）
+# --------------------------------------------------------------------------- #
+@dataclass
+class PreparedTask:
+    """一条抢注任务 + 预编译好的正则、步骤链与会话集合。
+
+    正则/步骤只编译一次、整个进程复用：抢注是秒级的事情，每条消息现编译正则
+    会在最不该慢的地方拖后腿（对齐 :class:`~tg_assistant.red_packet.PreparedTask`）。
+    """
+
+    config: RegGrabTask
+    chats: RefSet
+    exclude_chats: RefSet
+    text_patterns: list[Any]
+    code_pattern: Optional[Any]
+    used_pattern: Optional[Any]
+    steps: list[RegGrabStep]
+    #: 与 ``steps`` 一一对应的按钮正则（``click`` 用）。
+    button_patterns: list[Optional[re.Pattern[str]]]
+    #: 与 ``steps`` 一一对应的回执正则（``wait_reply`` 用）。
+    reply_patterns: list[Optional[re.Pattern[str]]]
+
+    @property
+    def id(self) -> str:
+        return self.config.id
+
+    @property
+    def label(self) -> str:
+        return self.config.label
+
+    @classmethod
+    def build(cls, config: RegGrabTask) -> "PreparedTask":
+        detect = config.detect
+        steps = list(config.steps)
+        return cls(
+            config=config,
+            chats=RefSet(config.chats),
+            exclude_chats=RefSet(config.exclude_chats),
+            text_patterns=compile_patterns(detect.text_patterns),
+            code_pattern=(
+                compile_user_pattern(detect.code_pattern) if detect.code_pattern else None
+            ),
+            used_pattern=(
+                compile_user_pattern(detect.used_pattern) if detect.used_pattern else None
+            ),
+            steps=steps,
+            button_patterns=[
+                compile_user_pattern(step.button)
+                if step.type == "click" and step.button
+                else None
+                for step in steps
+            ],
+            reply_patterns=[
+                compile_user_pattern(step.pattern)
+                if step.type == "wait_reply" and step.pattern
+                else None
+                for step in steps
+            ],
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
 class RegGrabHunter:
@@ -216,43 +281,18 @@ class RegGrabHunter:
         self.alog = alog.bind("reggrab")
         self.notifier = notifier
 
-        self._chats = RefSet(self.config.chats)
-        self._exclude_chats = RefSet(self.config.exclude_chats)
-        self._text_patterns = compile_patterns(self.config.detect.text_patterns)
-        self._code_pattern = (
-            compile_user_pattern(self.config.detect.code_pattern)
-            if self.config.detect.code_pattern
-            else None
-        )
-        self._steps: list[RegGrabStep] = list(self.config.steps)
-        #: 与 ``_steps`` 一一对应的按钮正则（``click`` 用）。
-        self._button_patterns: list[Optional[re.Pattern[str]]] = [
-            compile_user_pattern(step.button)
-            if step.type == "click" and step.button
-            else None
-            for step in self._steps
+        # 只编译**启用**的任务：停用的任务连正则都不该编译。
+        self.prepared: list[PreparedTask] = [
+            PreparedTask.build(task) for task in self.config.active_tasks
         ]
-        #: 与 ``_steps`` 一一对应的回执正则（``wait_reply`` 用）。
-        self._reply_patterns: list[Optional[re.Pattern[str]]] = [
-            compile_user_pattern(step.pattern)
-            if step.type == "wait_reply" and step.pattern
-            else None
-            for step in self._steps
-        ]
-        #: 「注册码已被使用」通知的正则（``None`` = 不做这项判定）。
-        self._used_pattern: Optional[re.Pattern[str]] = (
-            compile_user_pattern(self.config.detect.used_pattern)
-            if self.config.detect.used_pattern
-            else None
-        )
 
         self._bus = ChatEventBus()
         self._handlers: list[tuple[Any, int]] = []
         self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
-        #: 注册码 → 最近一次处理时间，用来避免同一条码被重复抢。
+        #: 注册码 → 最近一次处理时间，用来避免同一条码被重复抢（账号级共享）。
         self._seen_codes: dict[str, float] = {}
-        #: 「已被使用的码值」→ 记录时间。使用通知里只有前几位可见，
+        #: 「已被使用的码值」→ 记录时间（账号级共享）。使用通知里只有前几位可见，
         #: 所以存的是可见前缀；判重时按前缀比对（见 ``_is_used``）。
         self._used: dict[str, float] = {}
         #: 每个会话最近一条消息，供 ``click`` 在没有 ``wait_reply`` 时兜底找按钮。
@@ -276,6 +316,10 @@ class RegGrabHunter:
             "steps_ok": 0,
             "steps_failed": 0,
         }
+        #: 每条任务各自的计数。多任务之后「一共抢到 3 个」说明不了是哪条任务干的。
+        self.task_stats: dict[str, dict[str, int]] = {
+            task.id: dict.fromkeys(self.stats, 0) for task in self.config.active_tasks
+        }
 
     # ------------------------------------------------------------------ #
     @property
@@ -283,36 +327,33 @@ class RegGrabHunter:
         return self.config.enabled
 
     def watched_chats(self) -> list[Any]:
-        return list(self.config.chats)
+        """所有启用任务监听会话的并集；任一任务留空 ⇒ 空列表（= 不过滤，全监听）。"""
+        return list(self.config.watched_chats)
 
     def _watch_chats(self) -> list[Any]:
         """handler 过滤器要覆盖的会话。
 
-        = 来源会话 + 步骤链里点名要操作的会话（通常是机器人私聊）。
+        = 所有任务的来源会话 + 步骤链里点名要操作的会话（通常是机器人私聊）。
         后者**必须**也收得到消息，否则 ``wait_reply`` 永远等不到回执。
-        触发判断仍然只看 ``config.chats``（见 :meth:`_should_grab`），所以多收不会误触发。
+        触发判断仍然只看每条任务的 ``chats``（见 :meth:`_should_grab_for`），
+        所以多收不会误触发。
 
-        返回空列表 = 不加过滤器（全部消息都进得来）。
+        返回空列表 = 不加过滤器（全部消息都进得来）。任一启用任务的 ``chats``
+        留空时，:attr:`RegGrabConfig.watched_chats` 已返回 ``[]``，这里照样放行全部。
         """
-        if not self.config.chats:
+        base = list(self.config.watched_chats)
+        if not base:
             return []
-        chats: list[Any] = list(self.config.chats)
-        for step in self._steps:
-            if step.chat is not None and step.chat not in chats:
-                chats.append(step.chat)
+        chats: list[Any] = list(base)
+        for task in self.prepared:
+            for step in task.steps:
+                if step.chat is not None and step.chat not in chats:
+                    chats.append(step.chat)
         return chats
 
     async def register(self) -> None:
         if not self.enabled:
             self.alog.info("抢注任务未启用")
-            return
-        if not self.config.ready:
-            self.alog.warning(
-                "抢注任务已开启但配置不完整，不会执行任何操作",
-                has_code_pattern=bool(self.config.detect.code_pattern),
-                steps=len(self._steps),
-                hint="需要在面板里填好「注册码提取正则」并至少添加一条步骤",
-            )
             return
 
         me = getattr(self.client, "me", None)
@@ -345,27 +386,48 @@ class RegGrabHunter:
 
         self.alog.info(
             "抢注引擎已注册",
-            watched_chats=len(self.config.chats) or "全部",
+            tasks=len(self.prepared),
+            disabled_tasks=len(self.config.tasks) - len(self.prepared),
+            task_labels=" | ".join(task.label for task in self.prepared) or "-",
+            watched_chats=len(self.watched_chats()) or "全部",
             handler_chats=len(chats) or "全部",
-            code_pattern=self.config.detect.code_pattern,
-            text_patterns=len(self._text_patterns),
-            used_pattern=self.config.detect.used_pattern or "（未启用使用通知判定）",
-            used_min_len=self.config.detect.used_min_len,
-            steps=len(self._steps),
-            step_chain=" → ".join(step_label(step) for step in self._steps),
-            delay_s=self.config.delay,
-            jitter_s=self.config.jitter,
-            delay_range_s=f"{self.config.delay:.1f}~{self.config.delay + self.config.jitter:.1f}",
-            code_ttl_s=self.config.code_ttl,
             max_concurrency=self.config.max_concurrency,
-            window=self.config.window.describe(),
-            # 🔴 必须用 ``self._in_window()``（走可注入的 ``self._now()``），
-            # **不能**用 ``self.config.in_window`` —— 后者是 ``window.contains()``，
-            # 直接读真实时钟。两个时钟在线上一致，但在测试里不一致，于是这行日志
-            # 会和实际判定各说各话。这行字存在的唯一意义就是回答
-            # 「为什么没动静」，说错了比没有更坏。
-            in_window=self._in_window(),
         )
+        for task in self.prepared:
+            if not task.config.ready:
+                # 配不全的任务照样注册（用户可能正在填），但必须**明确说出来**，
+                # 否则用户只会看到"开了却没动静"。
+                self.alog.warning(
+                    "抢注任务配置不完整，不会执行",
+                    task=task.label,
+                    problem=task.config.problem,
+                )
+                continue
+            self.alog.info(
+                "抢注任务已就绪",
+                task=task.label,
+                chats=len(task.config.chats) or "全部",
+                code_pattern=task.config.detect.code_pattern,
+                text_patterns=len(task.text_patterns),
+                used_pattern=task.config.detect.used_pattern or "（未启用使用通知判定）",
+                used_min_len=task.config.detect.used_min_len,
+                steps=len(task.steps),
+                step_chain=" → ".join(step_label(step) for step in task.steps),
+                delay_s=task.config.delay,
+                jitter_s=task.config.jitter,
+                delay_range_s=(
+                    f"{task.config.delay:.1f}~{task.config.delay + task.config.jitter:.1f}"
+                ),
+                code_ttl_s=task.config.code_ttl,
+                include_edited=task.config.include_edited,
+                window=task.config.window.describe(),
+                # 🔴 必须用 ``self._in_window(task)``（走可注入的 ``self._now()``），
+                # **不能**用 ``task.config.in_window`` —— 后者是 ``window.contains()``，
+                # 直接读真实时钟。两个时钟在线上一致，但在测试里不一致，于是这行日志
+                # 会和实际判定各说各话。这行字存在的唯一意义就是回答
+                # 「为什么没动静」，说错了比没有更坏。
+                in_window=self._in_window(task),
+            )
 
     async def close(self) -> None:
         for handler, group in self._handlers:
@@ -395,9 +457,9 @@ class RegGrabHunter:
         """
         return datetime.now()
 
-    def _in_window(self) -> bool:
-        """此刻是否允许动手。``window.enabled=False`` 时恒为 ``True``（全天）。"""
-        return self.config.window.contains(self._now())
+    def _in_window(self, task: PreparedTask) -> bool:
+        """此刻是否允许该任务动手。``window.enabled=False`` 时恒为 ``True``（全天）。"""
+        return task.config.window.contains(self._now())
 
     def _dispatch(self, message: Any, *, edited: bool) -> None:
         chat_id, _, _ = chat_identity(message)
@@ -413,41 +475,41 @@ class RegGrabHunter:
 
         # 「使用通知」要先记下来：它自己提不出码（尾部被遮罩），
         # 但它决定了**后面出现的码还要不要抢**。
-        self._note_usage(message)
+        self._note_usage(message, chat_id)
 
         started = time.perf_counter()
-        code = self._should_grab(message, chat_id)
-        if code is None:
-            return
-
-        _, _, chat_title = chat_identity(message)
-
-        # 监听时段：不在时段内就只记一笔、**不动手**。
+        # 只在**此刻处于自己监听时段内**的任务里找命中。
         #
-        # 🔴 位置很讲究 —— 必须在下面「记去重名额」**之前**：
-        #    时段外把名额占掉的话，时段内同一条码再来时会被当成重复而跳过，
-        #    等于白白错过一次机会。
+        # 🔴 时段是「这条任务此刻到底算不算数」的一部分，不是命中之后的额外过滤。
+        #    若先取「首命中」再判时段，排在前面的任务只要 ``chats`` 覆盖到了这条
+        #    消息，就能在自己时段外把码**吃掉**，排在后面、本正处于自己时段内的
+        #    任务永远轮不到 —— 用户专门为夜班建的那条任务会一直不工作，还没有任何
+        #    提示。这正是「时段外的目击不该占用机会」那条规则的跨任务版本。
         #
         # 为什么要有这个开关：抢注是秒级响应的行为，半夜三点还能精准抢到码是脚本
         # 最好认的特征之一。把动手时间限制在人类活动时段能明显降低被识别的概率。
-        if not self._in_window():
-            self.stats["outside_window"] += 1
-            self.alog.info(
-                "发现注册码，但不在监听时段内，跳过",
-                chat=chat_title or chat_id,
-                message_id=getattr(message, "id", None),
-                code=code,
-                window=self.config.window.describe(),
-            )
+        #
+        # 时段判定必须在下文「记去重名额」**之前**：时段外把名额占掉的话，时段内
+        # 同一条码再来时会被当成重复而跳过，等于白白错过一次机会。
+        hit = self._match(message, chat_id)
+        if hit is None:
+            # 没任务可动手。如果其实是「命中了但都不在自己的时段内」，要说清楚，
+            # 否则用户看到的就是「明明发现了码却什么也没发生」。
+            self._report_out_of_window(message, chat_id)
             return
+
+        task, code = hit
+        _, _, chat_title = chat_identity(message)
 
         # 群里已经播报过「这个码被用掉了」—— 再抢就是白跑一趟，
         # 还会在群里多留一次脚本痕迹，直接剔除。
-        used = self._is_used(code)
+        used = self._is_used(code, task)
         if used is not None:
             self.stats["used_skipped"] += 1
+            self.task_stats[task.id]["used_skipped"] += 1
             self.alog.info(
                 "该注册码群里已有使用通知，剔除",
+                task=task.label,
                 code=code,
                 used_visible=used,
                 chat=chat_title or chat_id,
@@ -458,45 +520,113 @@ class RegGrabHunter:
         now = time.monotonic()
         key = code.strip().lower()
         last = self._seen_codes.get(key)
-        if last is not None and now - last < self.config.code_ttl:
+        if last is not None and now - last < task.config.code_ttl:
             self.stats["duplicate_code"] += 1
+            self.task_stats[task.id]["duplicate_code"] += 1
             self.alog.debug(
                 "该注册码最近已处理过，跳过",
+                task=task.label,
                 code=code,
                 chat_id=chat_id,
-                ttl_s=self.config.code_ttl,
+                ttl_s=task.config.code_ttl,
             )
             return
         self._seen_codes[key] = now
         if len(self._seen_codes) > 4096:
-            cutoff = now - max(self.config.code_ttl, 300.0)
+            cutoff = now - max(task.config.code_ttl, 300.0)
             self._seen_codes = {k: v for k, v in self._seen_codes.items() if v > cutoff}
 
         self.stats["detected"] += 1
+        self.task_stats[task.id]["detected"] += 1
         message_id = getattr(message, "id", None)
         self.alog.info(
             "发现注册码",
+            task=task.label,
             chat=chat_title or chat_id,
             message_id=message_id,
             code=code,
             edited=edited,
-            steps=len(self._steps),
+            steps=len(task.steps),
             detect_ms=round((time.perf_counter() - started) * 1000, 3),
             preview=truncate(message_text(message), 80, "…"),
         )
 
-        task = asyncio.create_task(self._run(message, code, started))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        job = asyncio.create_task(self._run(task, message, code, started))
+        self._tasks.add(job)
+        job.add_done_callback(self._tasks.discard)
 
     # ------------------------------------------------------------------ #
+    def _match(self, message: Any, chat_id: int) -> Optional[tuple[PreparedTask, str]]:
+        """按任务顺序找第一条**命中且此刻处于自己监听时段内**的任务。
+
+        🔴 **只取第一条**：同一条注册码可能同时落进多条任务的监听范围，若每条都
+        去跑一遍步骤链，等于对同一个码重复 ``/bind``，机器人只会回「已注册」，
+        还平白多留脚本痕迹。任务列表顺序即优先级。
+
+        ⚠️ 时段外的任务**不算命中**（直接跳过、顺延给后面的任务），理由见
+        :meth:`_dispatch` 里那段注释 —— 否则前序任务能在时段外把码吃掉，让后面
+        正处于自己时段内的任务永远轮不到。
+        """
+        for task in self.prepared:
+            code = self._should_grab_for(task, message, chat_id)
+            if code is None:
+                continue
+            if not self._in_window(task):
+                continue
+            return task, code
+        return None
+
+    def _match_ignoring_window(
+        self, message: Any, chat_id: int
+    ) -> Optional[tuple[PreparedTask, str]]:
+        """第一条命中该消息的任务，**不管它在不在时段内**。
+
+        只用来回答「这条码其实有人能抢，只是都不在时段内」这一种情况（提示与计数），
+        不参与是否动手的决策。
+        """
+        for task in self.prepared:
+            code = self._should_grab_for(task, message, chat_id)
+            if code is not None:
+                return task, code
+        return None
+
+    def _report_out_of_window(self, message: Any, chat_id: int) -> None:
+        """没有可动手的任务时，若原因是「命中但不在时段内」，记一笔并说清楚。"""
+        hit = self._match_ignoring_window(message, chat_id)
+        if hit is None:
+            return
+        task, code = hit
+        self.stats["outside_window"] += 1
+        self.task_stats[task.id]["outside_window"] += 1
+        _, _, chat_title = chat_identity(message)
+        self.alog.info(
+            "发现注册码，但不在监听时段内，跳过",
+            task=task.label,
+            chat=chat_title or chat_id,
+            message_id=getattr(message, "id", None),
+            code=code,
+            window=task.config.window.describe(),
+        )
+
     def _should_grab(self, message: Any, chat_id: int) -> Optional[str]:
-        """判断这条消息要不要抢注；要的话返回提取到的注册码。"""
-        config = self.config
+        """兼容旧接口：返回第一条命中任务提取到的注册码（没有则 ``None``）。
+
+        ⚠️ 这里**不看时段** —— 它回答的是「正则能不能把码提出来」。是否动手由
+        :meth:`_match` 决定；两者分开，才能把「不匹配」和「匹配但不在时段内」
+        讲成两件不同的事。
+        """
+        hit = self._match_ignoring_window(message, chat_id)
+        return hit[1] if hit is not None else None
+
+    def _should_grab_for(
+        self, task: PreparedTask, message: Any, chat_id: int
+    ) -> Optional[str]:
+        """判断这条消息要不要按**这条任务**抢注；要的话返回提取到的注册码。"""
+        config = task.config
         _, chat_username, _ = chat_identity(message)
-        if self._exclude_chats and self._exclude_chats.matches(chat_id, chat_username):
+        if task.exclude_chats and task.exclude_chats.matches(chat_id, chat_username):
             return None
-        if self._chats and not self._chats.matches(chat_id, chat_username):
+        if task.chats and not task.chats.matches(chat_id, chat_username):
             return None
 
         _, _, is_self, is_bot = sender_of(message)
@@ -508,15 +638,17 @@ class RegGrabHunter:
             return None
 
         text = message_text(message)
-        if self._text_patterns and first_match(self._text_patterns, text) is None:
+        if task.text_patterns and first_match(task.text_patterns, text) is None:
             return None
-        return self._extract_code(text)
+        return self._extract_code(task, text)
 
-    def _extract_code(self, text: str) -> Optional[str]:
-        """按 ``code_pattern`` 提取注册码：第一个非空捕获组，没有捕获组就用整个匹配。"""
-        if self._code_pattern is None:
+    @staticmethod
+    def _extract_code(task: PreparedTask, text: str) -> Optional[str]:
+        """按任务的 ``code_pattern`` 提取注册码：第一个非空捕获组，没有捕获组就用整个匹配。"""
+        pattern = task.code_pattern
+        if pattern is None:
             return None
-        found = self._code_pattern.search(text)
+        found = pattern.search(text)
         if not found:
             return None
         if found.groups():
@@ -526,62 +658,79 @@ class RegGrabHunter:
         return found.group(0)
 
     # ------------------------------------------------------------------ #
-    def _note_usage(self, message: Any) -> None:
-        """记下「注册码已被使用」通知里露出的那几位。
+    def _note_usage(self, message: Any, chat_id: int) -> None:
+        """记下「注册码已被使用」通知里露出的那几位（账号级共享 ``_used``）。
 
         通知形如 ``🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░``：
         尾部被遮罩，只留前几位。存进 ``_used`` 供后面的码比对。
+
+        多任务后各任务可能有各自的 ``used_pattern`` / ``used_min_len``；这里对每条
+        启用任务的正则各扫一遍，命中的可见前缀都汇进账号级 ``_used``。同一条通知里
+        同一个值只记一次（避免多任务重复计数）。
         """
-        if self._used_pattern is None:
-            return
         text = message_text(message)
         if not text:
             return
 
-        min_len = self.config.detect.used_min_len
         now = time.monotonic()
-        for found in self._used_pattern.finditer(text):
-            token = next((group for group in found.groups() if group), None) or found.group(0)
-            visible = visible_code_part(token)
-            value = code_value_of(visible)
-            if len(value) < min_len:
-                # 只露一两位时几乎任何码都能「对得上」，宁可不记。
-                self.alog.debug(
-                    "使用通知可见位数太少，忽略",
-                    token=visible,
-                    visible=value,
-                    min_len=min_len,
-                )
+        recorded: set[str] = set()
+        for task in self.prepared:
+            pattern = task.used_pattern
+            if pattern is None:
                 continue
-            is_new = value not in self._used
-            self._used[value] = now
-            self.stats["usage_notices"] += 1
-            if is_new:
-                chat_id, _, chat_title = chat_identity(message)
-                self.alog.info(
-                    "记录注册码使用通知",
-                    visible=visible,
-                    code_prefix=value,
-                    chat=chat_title or chat_id,
-                    message_id=getattr(message, "id", None),
+            min_len = task.config.detect.used_min_len
+            for found in pattern.finditer(text):
+                token = (
+                    next((group for group in found.groups() if group), None)
+                    or found.group(0)
                 )
+                visible = visible_code_part(token)
+                value = code_value_of(visible)
+                if len(value) < min_len:
+                    # 只露一两位时几乎任何码都能「对得上」，宁可不记。
+                    self.alog.debug(
+                        "使用通知可见位数太少，忽略",
+                        task=task.label,
+                        token=visible,
+                        visible=value,
+                        min_len=min_len,
+                    )
+                    continue
+                if value in recorded:
+                    continue
+                recorded.add(value)
+                is_new = value not in self._used
+                self._used[value] = now
+                self.stats["usage_notices"] += 1
+                self.task_stats[task.id]["usage_notices"] += 1
+                if is_new:
+                    _, _, chat_title = chat_identity(message)
+                    self.alog.info(
+                        "记录注册码使用通知",
+                        task=task.label,
+                        visible=visible,
+                        code_prefix=value,
+                        chat=chat_title or chat_id,
+                        message_id=getattr(message, "id", None),
+                    )
 
-    def _is_used(self, code: str) -> Optional[str]:
+    def _is_used(self, code: str, task: PreparedTask) -> Optional[str]:
         """这个码是不是已经出现在使用通知里了？是的话返回匹配到的可见前缀。
 
-        通知里只有前几位可见，所以按**前缀**比对（``code`` 以可见部分开头，
-        或者反过来 —— 通知印了完整码而配置只抓了前几位）。
+        ``_used`` 是账号级共享的，但判定口径（``used_min_len`` / ``code_ttl``）取自
+        命中的那条任务。通知里只有前几位可见，所以按**前缀**比对（``code`` 以可见
+        部分开头，或者反过来 —— 通知印了完整码而配置只抓了前几位）。
         """
         if not self._used:
             return None
 
-        min_len = self.config.detect.used_min_len
+        min_len = task.config.detect.used_min_len
         probe = code_value_of(code)
         if len(probe) < min_len:
             return None
 
         now = time.monotonic()
-        ttl = self.config.code_ttl
+        ttl = task.config.code_ttl
         if ttl > 0:
             cutoff = now - ttl
             for key in [k for k, seen in self._used.items() if seen < cutoff]:
@@ -595,13 +744,17 @@ class RegGrabHunter:
         return None
 
     # ------------------------------------------------------------------ #
-    async def _run(self, message: Any, code: str, started: float) -> ChainOutcome:
+    async def _run(
+        self, task: PreparedTask, message: Any, code: str, started: float
+    ) -> ChainOutcome:
         """执行一条注册码的完整步骤链，返回整条链的结果。"""
-        delay = self.config.delay + (
-            random.uniform(0, self.config.jitter) if self.config.jitter else 0.0
+        delay = task.config.delay + (
+            random.uniform(0, task.config.jitter) if task.config.jitter else 0.0
         )
         if delay > 0:
-            self.alog.debug("按配置延迟后再抢注", delay_s=round(delay, 3), code=code)
+            self.alog.debug(
+                "按配置延迟后再抢注", task=task.label, delay_s=round(delay, 3), code=code
+            )
             await asyncio.sleep(delay)
 
         chat_id, _, chat_title = chat_identity(message)
@@ -612,29 +765,35 @@ class RegGrabHunter:
             chat_id=chat_id,
             chat_title=chat_title,
             message_id=getattr(message, "id", None),
+            task=task.label,
         )
         self.stats["started"] += 1
+        self.task_stats[task.id]["started"] += 1
 
         # 延迟可能刚好把动手时刻推到了时段之外（比如 22:59:59 派发、23:00:01 才跑）。
         # 抢注的价值全在「准点」，多等 2 秒也抢不到，但半夜动手会留下脚本痕迹 ⇒ 直接放弃。
-        if not self._in_window():
+        if not self._in_window(task):
             outcome.result = ChainResult.SKIPPED
-            outcome.detail = f"延迟结束时已不在监听时段（{self.config.window.describe()}），已放弃"
+            outcome.detail = (
+                f"延迟结束时已不在监听时段（{task.config.window.describe()}），已放弃"
+            )
             outcome.cost_ms = (time.perf_counter() - started) * 1000
             self.stats["outside_window"] += 1
-            self._record(outcome)
+            self.task_stats[task.id]["outside_window"] += 1
+            self._record(task, outcome)
             self._log_outcome(outcome)
             return outcome
 
         # 延迟期间群里可能已经冒出使用通知 —— 这段等待正好是个免费的检测窗口：
         # 真被别人抢了，在这里刹车就行，不必等步骤链跑完才发现白干。
-        used = self._is_used(code)
+        used = self._is_used(code, task)
         if used is not None:
             outcome.result = ChainResult.SKIPPED
             outcome.detail = f"延迟期间群里出现了使用通知（可见 {used}），已放弃"
             outcome.cost_ms = (time.perf_counter() - started) * 1000
             self.stats["used_skipped"] += 1
-            self._record(outcome)
+            self.task_stats[task.id]["used_skipped"] += 1
+            self._record(task, outcome)
             self._log_outcome(outcome)
             return outcome
 
@@ -644,7 +803,7 @@ class RegGrabHunter:
         chain_target: Any = chat_id
 
         async with self._semaphore:
-            for index, step in enumerate(self._steps, start=1):
+            for index, step in enumerate(task.steps, start=1):
                 variables["step"] = step_label(step)
                 variables["step_index"] = index
                 if step.delay > 0:
@@ -654,7 +813,7 @@ class RegGrabHunter:
                 target = step.chat if step.chat is not None else chain_target
                 try:
                     detail, current, chain_target = await self._run_step(
-                        index, step, message, current, chain_target, variables
+                        task, index, step, message, current, chain_target, variables
                     )
                     result = StepResult.OK
                 except Exception as exc:  # noqa: BLE001 - 单步失败不能拖垮整条链的记账
@@ -674,10 +833,12 @@ class RegGrabHunter:
                 )
                 if result is StepResult.OK:
                     self.stats["steps_ok"] += 1
+                    self.task_stats[task.id]["steps_ok"] += 1
                     self.alog.info(
                         "抢注步骤完成",
+                        task=task.label,
                         step=index,
-                        total=len(self._steps),
+                        total=len(task.steps),
                         type=REG_GRAB_STEP_LABELS.get(step.type, step.type),
                         name=step_label(step),
                         target=str(target),
@@ -687,10 +848,12 @@ class RegGrabHunter:
                     continue
 
                 self.stats["steps_failed"] += 1
+                self.task_stats[task.id]["steps_failed"] += 1
                 self.alog.warning(
                     "抢注步骤失败",
+                    task=task.label,
                     step=index,
-                    total=len(self._steps),
+                    total=len(task.steps),
                     type=REG_GRAB_STEP_LABELS.get(step.type, step.type),
                     name=step_label(step),
                     target=str(target),
@@ -706,15 +869,20 @@ class RegGrabHunter:
 
         outcome.cost_ms = (time.perf_counter() - started) * 1000
         outcome.detail = self._summarize(outcome)
-        self._record(outcome)
+        self._record(task, outcome)
         self._log_outcome(outcome)
         # SKIPPED 只记日志不推通知：码已经被别人用掉这种事，推给用户纯属噪音。
-        if self.config.notify and self.notifier is not None and outcome.result is not ChainResult.SKIPPED:
-            self._submit_notify(message, outcome)
+        if (
+            task.config.notify
+            and self.notifier is not None
+            and outcome.result is not ChainResult.SKIPPED
+        ):
+            self._submit_notify(task, message, outcome)
         return outcome
 
     async def _run_step(
         self,
+        task: PreparedTask,
         index: int,
         step: RegGrabStep,
         source: Any,
@@ -729,7 +897,7 @@ class RegGrabHunter:
             return await self._step_send(step, variables, target, current)
 
         if step.type == "click":
-            detail, message = await self._step_click(index, step, target, current)
+            detail, message = await self._step_click(task, index, step, target, current)
             return detail, message, chain_target
 
         if step.type == "wait":
@@ -738,7 +906,7 @@ class RegGrabHunter:
             return f"等待 {step.seconds}s", current, chain_target
 
         if step.type == "wait_reply":
-            detail, message = await self._step_wait_reply(index, step, target)
+            detail, message = await self._step_wait_reply(task, index, step, target)
             return detail, message, chain_target
 
         raise ValueError(f"未知步骤类型 {step.type!r}")
@@ -786,13 +954,14 @@ class RegGrabHunter:
 
     async def _step_click(
         self,
+        task: PreparedTask,
         index: int,
         step: RegGrabStep,
         target: Any,
         current: Any,
     ) -> tuple[str, Any]:
         """点掉一个内联按钮：先在「当前消息」上找，再退回目标会话最近一条消息。"""
-        pattern = self._button_patterns[index - 1]
+        pattern = task.button_patterns[index - 1]
         if pattern is None:  # pragma: no cover - 配置校验已经拦住了
             raise ValueError("click 步骤缺少按钮正则")
 
@@ -834,12 +1003,13 @@ class RegGrabHunter:
 
     async def _step_wait_reply(
         self,
+        task: PreparedTask,
         index: int,
         step: RegGrabStep,
         target: Any,
     ) -> tuple[str, Any]:
         """等目标会话的下一条消息；命中正则才算成功。"""
-        pattern = self._reply_patterns[index - 1]
+        pattern = task.reply_patterns[index - 1]
         chat_id = await self._resolve_chat_id(target)
         if chat_id is None:
             raise ValueError(
@@ -957,7 +1127,7 @@ class RegGrabHunter:
             return f"第 {first.index} 步「{first.label}」失败：{truncate(first.detail, 200, '…')}"
         return "没有可执行的步骤"
 
-    def _record(self, outcome: ChainOutcome) -> None:
+    def _record(self, task: PreparedTask, outcome: ChainOutcome) -> None:
         key = {
             ChainResult.SUCCESS: "success",
             ChainResult.PARTIAL: "partial",
@@ -965,12 +1135,14 @@ class RegGrabHunter:
             ChainResult.SKIPPED: "skipped",
         }[outcome.result]
         self.stats[key] += 1
+        self.task_stats[task.id][key] += 1
 
     def _log_outcome(self, outcome: ChainOutcome) -> None:
         chain = " → ".join(
             f"{step.index}.{step.label}:{step.result.value}" for step in outcome.steps
         )
         fields: dict[str, Any] = {
+            "task": outcome.task or "-",
             "code": outcome.code,
             "chat": outcome.chat_title or outcome.chat_id,
             "message_id": outcome.message_id,
@@ -990,11 +1162,14 @@ class RegGrabHunter:
         else:
             self.alog.error(message, **fields)
 
-    def _submit_notify(self, source: Any, outcome: ChainOutcome) -> None:
+    def _submit_notify(
+        self, task: PreparedTask, source: Any, outcome: ChainOutcome
+    ) -> None:
         assert self.notifier is not None
         variables = build_variables(
             source,
             {
+                "task": task.label,
                 "result_icon": outcome.result.icon,
                 "result_text": outcome.result.label,
                 "code": outcome.code,
@@ -1013,31 +1188,42 @@ class RegGrabHunter:
             NotifyTask(
                 event="reg_grab",
                 text=text,
-                context={"result": outcome.result.value, "code": outcome.code},
+                context={
+                    "task": task.id,
+                    "result": outcome.result.value,
+                    "code": outcome.code,
+                },
             )
         )
         if not submitted:
             self.alog.debug(
                 "抢注通知未提交（通知未启用或未勾选 reg_grab 事件）",
+                task=task.label,
                 result=outcome.result.value,
             )
 
     def snapshot(self) -> dict[str, Any]:
+        cfg = self.config
         return {
             **self.stats,
             "pending_tasks": len(self._tasks),
             "watching_chats": self._bus.watching,
             "seen_codes": len(self._seen_codes),
             "used_codes": len(self._used),
-            #: 当前是否在监听时段内 —— 面板/CLI 靠它解释「为什么现在没动静」。
-            "in_window": self._in_window(),
-            "window": self.config.window.describe(),
+            "tasks": len(cfg.tasks),
+            "active_tasks": len(self.prepared),
+            "per_task": {k: dict(v) for k, v in self.task_stats.items()},
+            #: 每条启用任务当前是否在监听时段内 —— 面板/CLI 用它解释「为什么现在没动静」。
+            "windows": {task.id: self._in_window(task) for task in self.prepared},
+            #: 只要有任意一条任务在时段内就算「在时段内」，兼容旧面板/CLI 的单值读取。
+            "in_window": any(self._in_window(task) for task in self.prepared),
         }
 
 
 __all__ = [
     "ChainOutcome",
     "ChainResult",
+    "PreparedTask",
     "RegGrabHunter",
     "StepOutcome",
     "StepResult",

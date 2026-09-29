@@ -283,8 +283,10 @@ def accounts_list(ctx: Context, as_json: bool) -> None:
                 "监听会话": source_count,
                 "抢红包": "开" if config.red_packet.enabled else "关",
                 "抢注任务": "开" if config.reg_grab.enabled else "关",
-                # 时段直接进表格：一眼能看出哪个账号半夜还在动手。
-                "抢注时段": config.reg_grab.window.describe(),
+                # 多任务后没有单一时段，改成「启用几条 / 共几条」，一眼看出规模。
+                "抢注条数": (
+                    f"{len(config.reg_grab.active_tasks)}/{len(config.reg_grab.tasks)}"
+                ),
                 "通知": "开" if config.notify.enabled else "关",
                 "最后登录": record.last_login_at or "-",
             }
@@ -686,19 +688,20 @@ def config_validate(ctx: Context, accounts: tuple[str, ...]) -> None:
                 )
         _info(f"    抢注任务：{'开启' if config.reg_grab.enabled else '关闭'}")
         if config.reg_grab.enabled:
-            _info(
-                f"      提取正则：{config.reg_grab.detect.code_pattern or '（未填）'}"
-                f"，步骤：{len(config.reg_grab.steps)} 步"
-                f"{'' if config.reg_grab.ready else ' ⚠️ 配置不完整，不会执行'}"
-            )
-            # 时段单独一行：它是「此刻到底会不会动手」的直接答案，
-            # 用户排查「为什么没动静」时第一个要看的就是它。
-            window = config.reg_grab.window
-            state = "在时段内" if config.reg_grab.in_window else "不在时段内，不会动手"
-            _info(
-                f"      监听时段：{window.describe()}"
-                f"（服务端现在 {datetime.now().strftime('%H:%M')}，{state}）"
-            )
+            active = config.reg_grab.active_tasks
+            _info(f"      任务：{len(active)} 条启用 / 共 {len(config.reg_grab.tasks)} 条")
+            for task in config.reg_grab.tasks:
+                mark = "●" if task.enabled else "○"
+                # 时段单独标注：它是「此刻到底会不会动手」的直接答案，
+                # 用户排查「为什么没动静」时第一个要看的就是它。
+                state = "在时段内" if task.in_window else "不在时段内"
+                _info(
+                    f"        {mark} {task.label}："
+                    f"提取正则 {task.detect.code_pattern or '（未填）'}，"
+                    f"{len(task.steps)} 步，时段 {task.window.describe()}（{state}）"
+                    f"{'' if task.ready else f' ⚠️ {task.problem}'}"
+                )
+            _info(f"      服务端现在 {datetime.now().strftime('%H:%M')}")
         _info(f"    通知：{'开启' if config.notify.enabled else '关闭'}（模式 {config.notify.mode}）")
         if watched:
             _info(f"    监听会话：{len(watched)} 个")

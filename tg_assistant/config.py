@@ -1030,19 +1030,21 @@ class RegGrabWindow(StrictModel):
         return f"{self.start}~{self.end}{suffix}"
 
 
-class RegGrabConfig(StrictModel):
-    """抢注任务：监听到符合正则的注册码后，按**步骤链**自动操作。
+class RegGrabTask(StrictModel):
+    """单个抢注任务：监听若干会话，命中注册码后按**步骤链**自动操作。
 
-    与抢红包的区别：红包是「点一下就完事」，抢注是**多步流程** ——
+    和抢红包一样是**多任务**模型 —— 一个任务一套「监听会话 + 识别正则 + 步骤链 +
+    时段」，互不干扰。与抢红包的区别：红包是「点一下就完事」，抢注是**多步流程** ——
     典型用法是把 ``/bind {code}`` 发给某个机器人，再等它的回执。
 
-    ⚠️ 这里**故意不校验**「enabled 时必须配好正则和步骤」：``StrictModel`` 开了
-    ``validate_assignment``，而面板的总开关就是 ``config.reg_grab.enabled = True``
-    这种赋值 —— 写成模型级校验会让「先开开关再填内容」直接 500。
-    完整性交给 :attr:`ready` 判断，由 API 与引擎各自给出提示。
+    ⚠️ **故意不做模型级「配好了才让开」的校验**：``StrictModel`` 开了
+    ``validate_assignment``，逐字段赋值时若校验整体完整性会误伤「先建再填」。
+    完整性交给 :attr:`ready` / :attr:`problem` 判断，由 API 与引擎各自给出提示。
     """
 
-    enabled: bool = False
+    id: str
+    name: Optional[str] = None
+    enabled: bool = True
     #: 监听的会话；为空表示所有会话。
     chats: list[ChatRef] = Field(default_factory=list)
     exclude_chats: list[ChatRef] = Field(default_factory=list)
@@ -1061,14 +1063,19 @@ class RegGrabConfig(StrictModel):
     #: 同一个注册码在这个时间窗内只处理一次（秒）。同一条码被多个群转发出来时，
     #: 靠它避免重复抢。
     code_ttl: float = Field(default=3600.0, ge=0.0, le=86400.0)
-    #: 并发上限。同一条码内部的步骤是串行的，这里限制的是「同时处理几条码」。
-    max_concurrency: int = Field(default=1, ge=1, le=20)
     #: 是否推送通知。
     notify: bool = True
     #: 也处理消息编辑事件（有些码是通过编辑消息补上的）。
     include_edited: bool = True
     #: 监听时段：只在这段时间里动手，其余时间看着不动（避免半夜秒抢暴露脚本）。
     window: RegGrabWindow = Field(default_factory=RegGrabWindow)
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _check_id(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("抢注任务 id 不能为空")
+        return value.strip()
 
     @field_validator("chats", "exclude_chats", mode="before")
     @classmethod
@@ -1080,19 +1087,126 @@ class RegGrabConfig(StrictModel):
         return _normalize_refs(value)
 
     @property
-    def ready(self) -> bool:
-        """配置是否完整到能干活：开了开关、有提取正则、且至少一条步骤。
+    def label(self) -> str:
+        return self.name or self.id
 
-        ⚠️ 这里**不看**监听时段：时段是「现在能不能动手」，``ready`` 是「配好了没有」。
-        把两者混在一起，面板上会出现「明明配好了却显示未就绪」，而且随着时间跳变。
-        当前是否在时段内由 :meth:`in_window` 单独回答。
+    @property
+    def ready(self) -> bool:
+        """配置是否完整到能干活：有提取正则、且至少一条步骤。
+
+        ⚠️ 这里**不看** ``enabled``、也**不看**监听时段：时段是「现在能不能动手」，
+        ``ready`` 是「配好了没有」。把两者混在一起，面板上会出现「明明配好了却显示
+        未就绪」，而且随着时间跳变。当前是否在时段内由 :attr:`in_window` 单独回答。
         """
-        return bool(self.enabled and self.detect.code_pattern and self.steps)
+        return bool(self.detect.code_pattern and self.steps)
+
+    @property
+    def problem(self) -> Optional[str]:
+        """给面板的一句话，说清「差什么才能用」；已就绪返回 ``None``。"""
+        if not self.detect.code_pattern:
+            return "还没填「注册码提取正则」，开了也不会执行"
+        if not self.steps:
+            return "还没有添加任何步骤，开了也不会执行"
+        return None
 
     @property
     def in_window(self) -> bool:
         """此刻是否落在监听时段内（``window.enabled=False`` 时恒为 ``True``）。"""
         return self.window.contains()
+
+
+#: 旧版**扁平** reg_grab 配置里属于「单个任务」的字段。出现任一个就把整份配置
+#: 当成旧结构，卷进一条 ``default`` 任务里。见 :func:`_migrate_legacy_reg_grab`。
+_REG_GRAB_TASK_FIELDS: tuple[str, ...] = (
+    "chats",
+    "exclude_chats",
+    "detect",
+    "steps",
+    "delay",
+    "jitter",
+    "code_ttl",
+    "notify",
+    "include_edited",
+    "window",
+)
+
+
+def _migrate_legacy_reg_grab(data: Any) -> Any:
+    """把旧版扁平 reg_grab 配置无缝迁移成一条 ``default`` 任务。
+
+    🔴 服务器上跑着的 config.json 就是旧扁平结构（``chats``/``detect``/``steps`` …
+    直接挂在 reg_grab 下）。若因为 ``extra="forbid"`` 直接报错，会让**整份账号配置
+    加载失败** —— 连带转发、通知、抢红包一起停摆，而不只是抢注不可用。
+
+    规则（对齐 :func:`_migrate_legacy_red_packet`）：
+    - 已经有 ``tasks`` 键 ⇒ 认定为新结构，原样返回；
+    - 出现任一旧任务字段 ⇒ 把这些字段收进一条 ``{"id": "default", ...}`` 任务；
+    - 空配置 / 只有 ``enabled`` ⇒ 不凭空造任务。
+    """
+    if not isinstance(data, dict):
+        return data
+    if "tasks" in data:
+        return data
+    legacy = {key: data[key] for key in _REG_GRAB_TASK_FIELDS if key in data}
+    if not legacy:
+        return data
+    rest = {key: value for key, value in data.items() if key not in _REG_GRAB_TASK_FIELDS}
+    task = {"id": "default", "name": "默认任务", **legacy}
+    return {**rest, "tasks": [task]}
+
+
+class RegGrabConfig(StrictModel):
+    """抢注账号级配置：任务列表 + 并发上限（对齐 :class:`RedPacketConfig`）。
+
+    ⚠️ 这里**故意不校验**「enabled 时必须有 ready 的任务」：``StrictModel`` 开了
+    ``validate_assignment``，而面板的总开关就是 ``config.reg_grab.enabled = True``
+    这种赋值 —— 写成模型级校验会让「先开开关再填内容」直接 500。
+    完整性交给每个任务的 :attr:`RegGrabTask.ready` 判断，由 API 与引擎各自提示。
+    """
+
+    enabled: bool = False
+    tasks: list[RegGrabTask] = Field(default_factory=list)
+    #: 并发上限（账号级）。同一条码内部的步骤是串行的，这里限制的是「同时处理几条码」。
+    max_concurrency: int = Field(default=1, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate(cls, data: Any) -> Any:
+        return _migrate_legacy_reg_grab(data)
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> "RegGrabConfig":
+        seen: set[str] = set()
+        for task in self.tasks:
+            if task.id in seen:
+                raise ValueError(f"抢注任务 id 重复: {task.id}")
+            seen.add(task.id)
+        return self
+
+    @property
+    def active_tasks(self) -> list[RegGrabTask]:
+        return [task for task in self.tasks if task.enabled]
+
+    @property
+    def watched_chats(self) -> list[ChatRef]:
+        """所有启用任务监听会话的并集；**任一任务留空 ⇒ 返回 ``[]`` 表示全监听**。
+
+        🔴 只做简单并集的话，那条留空的会被无声忽略 —— 用户会以为
+        「我都留空了怎么还是只监听那几个群」。
+        """
+        chats: list[ChatRef] = []
+        for task in self.active_tasks:
+            if not task.chats:
+                return []
+            for chat in task.chats:
+                if chat not in chats:
+                    chats.append(chat)
+        return chats
+
+    @property
+    def include_edited(self) -> bool:
+        """任一启用任务要处理编辑事件，就注册编辑 handler（any 语义）。"""
+        return any(task.include_edited for task in self.active_tasks)
 
 
 # --------------------------------------------------------------------------- #
@@ -1279,9 +1393,12 @@ class AccountConfig(StrictModel):
                 return []
             chats.extend(packet_chats)
         if self.reg_grab.enabled:
-            if not self.reg_grab.chats:
+            # 多任务之后不能再直接看 ``.chats`` —— 那是任务级的字段。
+            # ``watched_chats`` 已经处理了「任一任务留空 ⇒ 全监听」的语义。
+            grab_chats = self.reg_grab.watched_chats
+            if not grab_chats:
                 return []
-            chats.extend(self.reg_grab.chats)
+            chats.extend(grab_chats)
         deduped: list[ChatRef] = []
         for chat in chats:
             if chat not in deduped:

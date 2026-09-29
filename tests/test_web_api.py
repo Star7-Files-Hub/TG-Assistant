@@ -548,6 +548,122 @@ def test_red_packet_rejects_invalid_payload(client, app, account) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 抢注（多任务）
+# --------------------------------------------------------------------------- #
+#: 一条「配好了」的抢注任务：有提取正则 + 至少一条步骤。
+def _reg_grab_task(**overrides) -> dict:
+    task = {
+        "id": "main",
+        "name": "主群",
+        "enabled": True,
+        "chats": [-1001234567890],
+        "detect": {"code_pattern": r"(?:Register)_([A-Za-z0-9]{10})"},
+        "steps": [{"type": "send", "chat": "@example_bot", "text": "/bind {code}"}],
+    }
+    task.update(overrides)
+    return task
+
+
+def test_reg_grab_get_marks_every_task_ready(client, app, account) -> None:
+    """GET 要给**每条任务**附上 ready / problem / in_window，并给出服务端当前时间。"""
+    url = f"/api/config/{NAME}/reg_grab"
+    saved = client.put(
+        url,
+        json={
+            "enabled": False,
+            "max_concurrency": 2,
+            "tasks": [
+                _reg_grab_task(),
+                # 没填提取正则 ⇒ 不该被算成「配好了」
+                _reg_grab_task(id="tmp", name="临时", detect={}),
+            ],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["tasks"] == 2
+
+    body = client.get(url).json()
+    assert body["max_concurrency"] == 2
+    assert len(body["server_now"]) == 5 and body["server_now"][2] == ":", (
+        f"server_now 要形如 HH:MM，实际是 {body['server_now']!r}"
+    )
+    assert [task["id"] for task in body["tasks"]] == ["main", "tmp"]
+
+    first, second = body["tasks"]
+    assert first["ready"] is True
+    assert first["problem"] is None
+    # window.enabled 默认 False = 全天 ⇒ 恒在时段内
+    assert first["in_window"] is True
+    assert second["ready"] is False
+    assert "注册码提取正则" in second["problem"]
+
+
+def test_reg_grab_get_result_can_be_put_back(client, app, account) -> None:
+    """🔴 GET 的结果（多塞了 ready/problem/in_window/server_now）原样 PUT 回去不能 400。
+
+    模型是 ``extra="forbid"`` 的：只读字段漏掉一个，面板上「改一改再保存」
+    就会变成用户看不懂的「保存失败」。
+    """
+    url = f"/api/config/{NAME}/reg_grab"
+    assert client.put(url, json={"tasks": [_reg_grab_task()]}).status_code == 200
+
+    body = client.get(url).json()
+    assert "server_now" in body and body["tasks"][0]["ready"] is True
+
+    again = client.put(url, json=body)
+    assert again.status_code == 200, again.text
+
+    after = client.get(url).json()
+    assert after["tasks"] == body["tasks"], "往返一圈后配置被改动了"
+    assert after["tasks"][0]["steps"][0]["text"] == "/bind {code}"
+
+
+def test_reg_grab_enabled_needs_at_least_one_ready_task(client, app, account) -> None:
+    """总开关：一条能干活的任务都没有时拒绝开启，并给出中文原因。"""
+    url = f"/api/config/{NAME}/reg_grab/enabled"
+
+    denied = client.put(url, json={"enabled": True})
+    assert denied.status_code == 400, denied.text
+    assert "任务" in denied.json()["detail"]
+
+    # 只有「缺正则」的任务同样不算 —— 多任务下校验是「至少有一条 ready」。
+    client.put(
+        f"/api/config/{NAME}/reg_grab",
+        json={"tasks": [_reg_grab_task(detect={})]},
+    )
+    assert client.put(url, json={"enabled": True}).status_code == 400
+
+    # 补上一条配好的任务就能开
+    client.put(
+        f"/api/config/{NAME}/reg_grab",
+        json={"tasks": [_reg_grab_task(detect={}), _reg_grab_task(id="ok")]},
+    )
+    opened = client.put(url, json={"enabled": True})
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["enabled"] is True
+    assert opened.json()["ready"] is True
+
+    # 关闭不需要任何条件（哪怕开着开关、任务一条都没配好）
+    client.put(
+        f"/api/config/{NAME}/reg_grab",
+        json={"enabled": True, "tasks": [_reg_grab_task(detect={})]},
+    )
+    assert client.put(url, json={"enabled": False}).status_code == 200
+    assert client.get(f"/api/config/{NAME}/reg_grab").json()["enabled"] is False
+
+
+def test_reg_grab_rejects_invalid_payload(client, app, account) -> None:
+    url = f"/api/config/{NAME}/reg_grab"
+    assert client.put(url, json={"enabled": "not-a-bool"}).status_code == 400
+    # 重复 id 属于配置错误，要报 400 而不是 500
+    duplicated = client.put(
+        url, json={"tasks": [_reg_grab_task(), _reg_grab_task(name="重复")]}
+    )
+    assert duplicated.status_code == 400, duplicated.text
+    assert "重复" in duplicated.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
 # 通知
 # --------------------------------------------------------------------------- #
 REAL_TOKEN = "123456789:REAL-SECRET-TOKEN"

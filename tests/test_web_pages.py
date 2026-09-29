@@ -816,6 +816,7 @@ FEATURE_PAGES = {
     "cloudflare_ip.html": "cloudflare_ip",
     "notify.html": "notify",
     "red_packet.html": "red_packet",
+    "reg_grab.html": "reg_grab",
 }
 
 
@@ -1043,3 +1044,126 @@ def test_detail_text_falls_back_to_message() -> None:
         "/api/run/* 返回 {ok, message}，只读 detail 会让所有这类错误退化成"
         "兜底文案「启动失败」，用户看不到原因"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 规则弹窗的标签输入框：字段名（下划线）与 DOM id（连字符）必须对得上
+# --------------------------------------------------------------------------- #
+def _reg_grab_html() -> str:
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    return (web_dir / "templates" / "reg_grab.html").read_text(encoding="utf-8")
+
+
+def test_reg_grab_page_is_a_task_list_with_an_editor_modal() -> None:
+    """抢注页要跟抢红包一样是「任务卡片列表 + 弹窗编辑」，不再是整页单任务大表单。"""
+    html = _reg_grab_html()
+
+    for dom in (
+        'id="rg-task-list"',
+        'id="rg-modal"',
+        'id="rg-task-id"',
+        'id="rg-task-name"',
+        'id="rg-task-enabled"',
+        # 并发上限是**账号级**的，留在列表工具栏上，不跟着任务进弹窗
+        'id="rg-max-concurrency"',
+    ):
+        assert dom in html, f"抢注页缺少 {dom}"
+    assert "新建任务" in html
+
+    # 弹窗里要能配「每任务」的那几块：识别正则 / 步骤链 / 时段
+    for dom in (
+        'id="rg-code-pattern"',
+        'id="rg-steps"',
+        'id="rg-window-enabled"',
+        'id="rg-window-start"',
+        'id="rg-window-end"',
+    ):
+        assert dom in html, f"弹窗里缺少 {dom}"
+
+    # 单任务时代的「整页保存」必须退场，否则用户以为还有第二个保存入口
+    assert "function saveRegGrab" not in html, "单任务时代的整页保存函数还在"
+
+    for func in (
+        "renderTasks",
+        "renderTaskCard",
+        "openTaskModal",
+        "collectTask",
+        "saveTask",
+        "toggleTask",
+        "deleteTask",
+        "saveConcurrency",
+        "toggleRegGrab",
+    ):
+        assert f"function {func}(" in html, f"抢注页缺少 {func}()"
+
+
+def test_reg_grab_task_card_actions_are_delegated() -> None:
+    """卡片上的编辑 / 删除 / 启停**不许**把 ``task.id`` 拼进内联 handler。
+
+    ``RegGrabTask.id`` 是用户自由输入的，只要含一个单引号就能把
+    ``onclick="openTaskModal('...')"`` 截断 —— 而 HTML 转义救不了内联 handler：
+    浏览器会先把 ``&#39;`` 解码回单引号，再交给 JS 解析。所以跟规则页一样走
+    ``data-*`` + 事件委托。
+    """
+    html = _reg_grab_html()
+    body = _js_function_body(html, "renderTaskCard")
+
+    assert 'data-action="edit"' in body
+    assert 'data-action="delete"' in body
+    assert 'data-action="toggle"' in body
+    assert 'data-task-id="${attr(task.id)}"' in body
+    assert "onclick=" not in body, "卡片又把 task.id 拼进内联 handler 了"
+    assert "onchange=" not in body, "卡片又把 task.id 拼进内联 handler 了"
+
+    # 委托本身要接线：点按钮 / 拨开关都得有人接
+    init = _js_function_body(html, "bindTaskListActions")
+    assert "addEventListener('click'" in init
+    assert "addEventListener('change'" in init
+    assert "dataset.taskId" in init
+
+
+def test_reg_grab_tag_input_ids_match_the_dom() -> None:
+    """字段名（下划线）与 DOM id（连字符）必须对得上 —— 跟规则页同一个坑。
+
+    ``exclude_chats`` / ``text_patterns`` 直接拿字段名拼 id 会得到
+    ``rg-exclude_chats-field``（不存在），``getElementById`` 返回 ``null`` 又被
+    ``if (!input) return`` 静默吞掉：回车加不进标签、已有标签也不显示。
+    """
+    html = _reg_grab_html()
+
+    block = re.search(r"const tagFields = \[(.*?)\];", html, re.S)
+    assert block, "找不到 tagFields 定义"
+    keys = re.findall(r"'(\w+)'", block.group(1))
+    assert len(keys) >= 3, f"tagFields 的键没解析出来：{keys}"
+
+    for key in keys:
+        dom = key.replace("_", "-")
+        assert f'id="rg-{dom}-field"' in html, (
+            f"tagFields 有 {key}，但 HTML 里没有 id=\"rg-{dom}-field\" —— 回车添加会静默失效"
+        )
+        assert f'id="rg-{dom}-list"' in html, (
+            f"tagFields 有 {key}，但 HTML 里没有 id=\"rg-{dom}-list\" —— 标签根本不显示"
+        )
+
+    assert "${tagDomId(field)}-field" in html
+    assert "${tagDomId(field)}-list" in html
+    assert "${field}-field" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
+    assert "${field}-list" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
+
+
+def test_reg_grab_page_saves_the_whole_task_list() -> None:
+    """保存要把**整份** tasks 数组 PUT 回去（跟抢红包一致），账号级字段一起带上。"""
+    html = _reg_grab_html()
+
+    save = _js_function_body(html, "saveConfig")
+    assert "tasks: tasks.map(cleanTask)" in save
+    assert "max_concurrency" in save
+    assert "/reg_grab`" in save or "/reg_grab" in save
+
+    clean = _js_function_body(html, "cleanTask")
+    # GET 多塞的三个只读字段必须在提交前丢掉：模型是 extra="forbid" 的
+    assert "{ready, problem, in_window, ...rest}" in clean
+
+    collect = _js_function_body(html, "collectTask")
+    for key in ("id:", "name:", "enabled:", "chats:", "detect:", "steps:", "window:"):
+        assert key in collect, f"collectTask() 没提交 {key}"
