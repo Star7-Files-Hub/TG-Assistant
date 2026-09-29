@@ -177,7 +177,8 @@ class CFIPListener:
             ", ".join(f"{ISP_LABELS.get(r.isp, '整体')}={r.ip}" for r in changed),
             domains,
         )
-        if self.notifier is None:
+        # ⚠️ 关闭的只是「通知」：日志（上面这行）、DNS 更新、落盘都不受影响。
+        if self.notifier is None or not self.config.notify:
             return
 
         from .notify import NotifyTask
@@ -200,7 +201,8 @@ class CFIPListener:
             summary.changed_count,
             len(summary.results),
         )
-        if self.notifier is None:
+        # ⚠️ 关闭通知不影响上面这条错误日志 —— 「不发通知」不等于「不出日志」。
+        if self.notifier is None or not self.config.notify:
             return
 
         from .notify import NotifyTask

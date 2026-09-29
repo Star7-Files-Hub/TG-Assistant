@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -332,6 +334,61 @@ class TestAccountConfigIntegration:
         assert restored.records[1].record_type == "AAAA"
 
 
+class TestNotifyToggleConfig:
+    """「更新后发送通知」开关（``CloudflareIPConfig.notify``）。"""
+
+    def test_default_is_on(self):
+        """默认开 = 改动前的行为不变。"""
+        assert CloudflareIPConfig().notify is True
+
+    def test_old_config_without_the_field_still_notifies(self):
+        """🔴 老 config.json 里根本没有 ``notify`` 这个键。
+
+        加载后必须仍是 True —— 否则升级一次就静默地把通知全关了。
+        """
+        legacy = {
+            "enabled": True,
+            "api_token": "tok",
+            "source_channel": "@cfyxip",
+            "records": [{"zone_id": "zone", "domain": "yx.example.cc"}],
+            "real_time_listen": True,
+        }
+        config = CloudflareIPConfig.model_validate(legacy)
+
+        assert "notify" not in legacy
+        assert config.notify is True
+
+    def test_explicit_off_is_preserved(self):
+        assert CloudflareIPConfig(notify=False).notify is False
+
+    def test_roundtrip_preserves_off(self):
+        original = CloudflareIPConfig(notify=False)
+        restored = CloudflareIPConfig.model_validate(original.model_dump(mode="json"))
+
+        assert restored.notify is False
+
+    def test_legacy_config_file_without_the_key_loads_as_on(self, store):
+        """真·老 ``config.json``：文件里没有 ``notify`` 键，加载后仍必须是 True。"""
+        import json
+
+        from tg_assistant.config import AccountRecord, utc_now_iso
+
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        store.save_account_config("acct", store.load_account_config("acct", create=True))
+
+        path = store.paths.account("acct").config_file
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["cloudflare_ip"].pop("notify", None)
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+        # 先确认文件里真的没有这个键（不然这条测试等于没测老配置）
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert "notify" not in on_disk["cloudflare_ip"]
+
+        reloaded = store.load_account_config("acct", create=False)
+        assert reloaded.cloudflare_ip.notify is True
+
+
 class TestUpdateSummary:
     def test_skipped_property(self):
         s = UpdateSummary(fetched=IPFetchResult(), skipped_reason="too slow")
@@ -353,3 +410,226 @@ class TestUpdateSummary:
     def test_all_ok_false_when_skipped(self):
         s = UpdateSummary(fetched=IPFetchResult(), skipped_reason="test")
         assert s.all_ok is False
+
+
+# --------------------------------------------------------------------------- #
+# 通知开关（notify）：监听器发通知前先看它
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingNotifier:
+    """只记下 ``submit`` 进来的通知，不真的发。"""
+
+    def __init__(self) -> None:
+        self.tasks: list[Any] = []
+
+    def submit(self, task: Any) -> None:
+        self.tasks.append(task)
+
+
+class _RecordingLog:
+    """包一层真的 :class:`AccountLogger`，顺手记下日志文案。
+
+    ⚠️ 不用 ``caplog``：``configure_logging()`` 把 ``tg-assistant`` 的
+    ``propagate`` 关成了 ``False``，记录到不了 root handler。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.messages: list[str] = []
+
+    def bind(self, module: str) -> "_RecordingLog":
+        return self
+
+    def _record(self, msg: str, args: tuple[Any, ...]) -> None:
+        self.messages.append(msg % args if args else msg)
+
+    def debug(self, msg: str, *args: Any, **fields: Any) -> None:
+        self.inner.debug(msg, *args, **fields)
+
+    def info(self, msg: str, *args: Any, **fields: Any) -> None:
+        self._record(msg, args)
+        self.inner.info(msg, *args, **fields)
+
+    def error(self, msg: str, *args: Any, **fields: Any) -> None:
+        self._record(msg, args)
+        self.inner.error(msg, *args, **fields)
+
+
+def _ok_summary() -> UpdateSummary:
+    return UpdateSummary(
+        fetched=IPFetchResult(fastest="172.64.147.52", fastest_speed=111.14),
+        results=[
+            DNSUpdateResult(
+                domain="example.cc",
+                name="yx",
+                record_type="A",
+                ip="172.64.147.52",
+                ok=True,
+            )
+        ],
+    )
+
+
+def _failed_summary() -> UpdateSummary:
+    return UpdateSummary(
+        fetched=IPFetchResult(fastest="172.64.147.52", fastest_speed=111.14),
+        results=[
+            DNSUpdateResult(
+                domain="example.cc",
+                name="yx",
+                record_type="A",
+                ip=None,
+                ok=False,
+                error="boom",
+            )
+        ],
+    )
+
+
+class TestListenerNotifyToggle:
+    """🔴 回归：``notify=False`` 只表示「不发通知」。
+
+    最容易写错的地方是把它当成功能总闸（在 ``_on_message`` 开头就直接 return）
+    —— 那样用户只是想安静点，结果 IP 再也不更新了。
+    所以这里既要钉住「一条通知都不发」，也要钉住「更新 / 落盘 / 日志照旧」。
+    """
+
+    @staticmethod
+    def _listener(store, alog, *, notify: bool, notifier=None):
+        from tg_assistant.cf_ip_listener import CFIPListener
+        from tg_assistant.config import AccountRecord, utc_now_iso
+
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        config = store.load_account_config("acct", create=True)
+        cf = config.cloudflare_ip
+        cf.api_token = "tok"
+        cf.source_channel = "-1003372470551"
+        cf.records = [CloudflareDNSRecord(zone_id="zone", domain="example.cc", name="yx")]
+        # 三网分流：跳过「只拿这一条消息做预检」的分支，直接走完整抓取，
+        # 免得预检把要测的那条路径挡掉。
+        cf.split_by_isp = True
+        cf.enabled = True
+        cf.notify = notify
+        store.save_account_config("acct", config)
+
+        return CFIPListener(
+            "acct",
+            config.cloudflare_ip,
+            client=object(),
+            alog=alog,
+            store=store,
+            settings=object(),
+            notifier=notifier,
+        )
+
+    @staticmethod
+    def _patch_fetch(monkeypatch, summary: UpdateSummary):
+        """把抓取/代理换掉，返回「fetch 被调用了几次」。"""
+        import tg_assistant.cf_ip_listener as listener_mod
+        import tg_assistant.proxy as proxy_mod
+
+        calls: list[int] = []
+
+        monkeypatch.setattr(listener_mod, "make_message_source", lambda c: object())
+        monkeypatch.setattr(proxy_mod, "resolve_proxy", lambda *a, **k: None)
+
+        async def fake_fetch(config, source, state, proxy=None):
+            calls.append(1)
+            return summary
+
+        monkeypatch.setattr(listener_mod, "fetch_and_update", fake_fetch)
+        return calls
+
+    @staticmethod
+    def _message():
+        import types
+
+        return types.SimpleNamespace(text=SAMPLE_CHANNEL_MESSAGE, id=42)
+
+    async def _trigger(self, listener):
+        import types
+
+        await listener._on_message(types.SimpleNamespace(), self._message())
+
+    # --- 关闭：一条都不发 -------------------------------------------------- #
+    async def test_off_success_path_submits_nothing(self, store, alog, monkeypatch):
+        calls = self._patch_fetch(monkeypatch, _ok_summary())
+        notifier = _RecordingNotifier()
+        listener = self._listener(store, alog, notify=False, notifier=notifier)
+
+        await self._trigger(listener)
+
+        assert calls, "关了通知也必须照常抓取、更新 DNS"
+        assert notifier.tasks == [], "notify=False 时成功路径不该发任何通知"
+
+    async def test_off_failure_path_submits_nothing(self, store, alog, monkeypatch):
+        self._patch_fetch(monkeypatch, _failed_summary())
+        notifier = _RecordingNotifier()
+        log = _RecordingLog(alog)
+        listener = self._listener(store, log, notify=False, notifier=notifier)
+
+        await self._trigger(listener)
+
+        assert notifier.tasks == [], "notify=False 时失败路径不该发任何通知"
+        assert any("DNS 更新部分失败" in m for m in log.messages), (
+            "不发通知不等于不出日志：失败日志必须照旧"
+        )
+        assert store.load_state("acct").get("cloudflare_ip_last_result") is not None
+
+    async def test_off_keeps_persist_run_and_logs(self, store, alog, monkeypatch):
+        """落盘与日志不受通知开关影响 —— 「不发通知」不是「不出日志」。"""
+        self._patch_fetch(monkeypatch, _ok_summary())
+        notifier = _RecordingNotifier()
+        log = _RecordingLog(alog)
+        listener = self._listener(store, log, notify=False, notifier=notifier)
+
+        await self._trigger(listener)
+
+        state = store.load_state("acct")
+        assert state.get("cloudflare_ip_last_run"), "实时监听必须照常落盘运行时间"
+        assert state["cloudflare_ip_last_result"]["ok_count"] == 1
+        assert any("DNS 更新成功" in m for m in log.messages), (
+            "通知关了也要留下成功日志"
+        )
+
+    # --- 打开：照发，文案逐字不变 ------------------------------------------ #
+    async def test_on_success_notifies_with_unchanged_text(self, store, alog, monkeypatch):
+        self._patch_fetch(monkeypatch, _ok_summary())
+        notifier = _RecordingNotifier()
+        listener = self._listener(store, alog, notify=True, notifier=notifier)
+
+        await self._trigger(listener)
+
+        assert len(notifier.tasks) == 1
+        task = notifier.tasks[0]
+        assert task.event == "forward"
+        # ⚡ 这条文案**逐字**不变（开关只决定发不发，不改内容）。
+        assert task.text == (
+            "⚡ Cloudflare IP 已更新\n"
+            "<code>172.64.147.52</code>\n"
+            "域名: yx.example.cc"
+        )
+
+    async def test_on_failure_notifies_with_unchanged_text(self, store, alog, monkeypatch):
+        self._patch_fetch(monkeypatch, _failed_summary())
+        notifier = _RecordingNotifier()
+        listener = self._listener(store, alog, notify=True, notifier=notifier)
+
+        await self._trigger(listener)
+
+        assert len(notifier.tasks) == 1
+        task = notifier.tasks[0]
+        assert task.event == "error"
+        # ⚠️ 这条文案同样逐字不变。
+        assert task.text == "⚠️ Cloudflare IP 更新失败\nyx.example.cc: boom"
+
+    async def test_off_without_notifier_is_still_fine(self, store, alog, monkeypatch):
+        """没配通知渠道 + 开关打开 = 老行为（静默 return），关掉也一样不炸。"""
+        self._patch_fetch(monkeypatch, _ok_summary())
+        listener = self._listener(store, alog, notify=True, notifier=None)
+
+        await self._trigger(listener)
+
+        state = store.load_state("acct")
+        assert state["cloudflare_ip_last_result"]["ok_count"] == 1

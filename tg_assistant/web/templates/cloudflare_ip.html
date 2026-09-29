@@ -104,6 +104,9 @@
                 <div class="nt-grid" style="margin-top:10px;">
                     <label class="tg-checkbox"><input id="cf-real-time" type="checkbox" checked /><span class="tg-checkmark"></span><span>实时监听频道新消息（账号在线时自动生效）</span></label>
                 </div>
+                <div class="nt-grid" style="margin-top:10px;">
+                    <label class="tg-checkbox"><input id="cf-notify" type="checkbox" checked /><span class="tg-checkmark"></span><span>更新后发送通知</span></label>
+                </div>
             </div>
         </div>
 
@@ -220,6 +223,7 @@
         });
         document.getElementById('cf-only-if-faster').checked = cfData.only_update_if_faster !== false;
         document.getElementById('cf-real-time').checked = cfData.real_time_listen !== false;
+        document.getElementById('cf-notify').checked = cfData.notify !== false;
         records = cfData.records || [];
         renderRecords();
         toggleSplit();
@@ -371,6 +375,7 @@
             min_speed_threshold_by_isp: readIspThresholds(),
             only_update_if_faster: document.getElementById('cf-only-if-faster').checked,
             real_time_listen: document.getElementById('cf-real-time').checked,
+            notify: document.getElementById('cf-notify').checked,
             records: records
         };
         const res = await fetch(`/api/config/${encodeURIComponent(currentAccount)}/cloudflare_ip`, {
