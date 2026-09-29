@@ -100,21 +100,21 @@
                             <label>排除来源</label>
                             <div class="tag-input" id="exclude-sources-input">
                                 <div class="tag-list" id="exclude-sources-list"></div>
-                                <input type="text" id="exclude-sources-field" placeholder="排除的频道..." />
+                                <input type="text" id="exclude-sources-field" placeholder="排除的频道（按回车添加）" />
                             </div>
                         </div>
                         <div class="tg-input-group">
                             <label>发送者白名单</label>
                             <div class="tag-input" id="from-users-input">
                                 <div class="tag-list" id="from-users-list"></div>
-                                <input type="text" id="from-users-field" placeholder="只转发这些人..." />
+                                <input type="text" id="from-users-field" placeholder="只转发这些人（按回车添加）" />
                             </div>
                         </div>
                         <div class="tg-input-group">
                             <label>发送者黑名单</label>
                             <div class="tag-input" id="exclude-users-input">
                                 <div class="tag-list" id="exclude-users-list"></div>
-                                <input type="text" id="exclude-users-field" placeholder="这些人发的一律不转发..." />
+                                <input type="text" id="exclude-users-field" placeholder="这些人发的一律不转发（按回车添加）" />
                             </div>
                             <p class="form-hint">只对<strong>本规则</strong>生效；要全账号通用，请用分组标题下的「发送者黑名单」。</p>
                         </div>
@@ -188,7 +188,7 @@
                         <label>排除规则</label>
                         <div class="tag-input" id="exclude-patterns-input">
                             <div class="tag-list" id="exclude-patterns-list"></div>
-                            <input type="text" id="exclude-patterns-field" placeholder="匹配到这些规则时跳过..." />
+                            <input type="text" id="exclude-patterns-field" placeholder="匹配到这些规则时跳过（按回车添加）" />
                         </div>
                     </div>
                 </div>
@@ -898,10 +898,17 @@
     }
 
     // ==================== Tag Input ====================
+    // ⚠️ 字段名用下划线（tagInputs 的键 = 接口字段名），DOM id 用连字符。
+    // 直接拿字段名拼 id 会让 `exclude_sources` 去找不存在的 `exclude_sources-field`，
+    // `getElementById` 返回 null 后被 `if (!input) return` / `if (!list) return` **静默吞掉** ——
+    // 表现就是「回车没反应」+「编辑规则时这几个标签不显示」，而且控制台一声不吭。
+    // 实测受影响的四个：排除来源、发送者白名单、发送者黑名单、排除规则。
+    const tagDomId = field => field.replace(/_/g, '-');
+
     function initTagInputs() {
         const fields = ['sources', 'exclude_sources', 'targets', 'from_users', 'exclude_users', 'patterns', 'exclude_patterns'];
         fields.forEach(field => {
-            const input = document.getElementById(`${field}-field`);
+            const input = document.getElementById(`${tagDomId(field)}-field`);
             if (!input) return;
             input.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter' && this.value.trim()) {
@@ -929,7 +936,7 @@
     }
 
     function renderTags(field) {
-        const list = document.getElementById(`${field}-list`);
+        const list = document.getElementById(`${tagDomId(field)}-list`);
         if (!list) return;
         list.innerHTML = tagInputs[field].map((tag, i) =>
             `<span class="tag">${escapeHtml(tag)}<button data-remove-tag="${field}" data-index="${i}">&times;</button></span>`

@@ -1084,6 +1084,52 @@ def test_detail_text_falls_back_to_message() -> None:
 # --------------------------------------------------------------------------- #
 # 规则弹窗的标签输入框：字段名（下划线）与 DOM id（连字符）必须对得上
 # --------------------------------------------------------------------------- #
+def test_rules_tag_input_ids_match_the_dom() -> None:
+    """🔴 回归：4 个多词字段的标签输入框曾经**完全失效**。
+
+    ``tagInputs`` 的键是接口字段名（``exclude_sources``），DOM id 却是
+    ``exclude-sources-field``。而 ``initTagInputs`` / ``renderTags`` 直接拿
+    字段名拼 id，于是 ``getElementById`` 返回 ``null``，又被
+    ``if (!input) return`` / ``if (!list) return`` **静默吞掉** —— 控制台一声不吭。
+
+    用户侧症状（原话）：「排除来源也要像转发目标那样，回车添加」。
+    实际受影响的四个：排除来源、发送者白名单、发送者黑名单、排除规则；
+    单字字段（sources / targets / patterns）因为拼出来正好一样而幸免 ——
+    这也解释了为什么只有"某些"输入框看起来是好的。
+
+    连带后果比「回车没反应」更严重：``renderTags`` 拼的是同一个错 id，所以
+    编辑一条已有规则时这几个标签**根本不显示**，用户既看不到已配的值，
+    也点不到 × 删掉它。
+    """
+    html = _rules_html()
+
+    # 1) 从 JS 里取出 tagInputs 的全部键（下划线形态）
+    block = re.search(r"const tagInputs = \{(.*?)\};", html, re.S)
+    assert block, "找不到 tagInputs 定义"
+    keys = re.findall(r"(\w+)\s*:", block.group(1))
+    assert len(keys) >= 7, f"tagInputs 的键没解析出来：{keys}"
+
+    # 2) 每个键都必须在 HTML 里有对应的连字符 id
+    for key in keys:
+        dom = key.replace("_", "-")
+        assert f'id="{dom}-field"' in html, (
+            f'tagInputs 有 {key}，但 HTML 里没有 id="{dom}-field" —— 回车添加会静默失效'
+        )
+        assert f'id="{dom}-list"' in html, (
+            f'tagInputs 有 {key}，但 HTML 里没有 id="{dom}-list" —— 标签根本不显示'
+        )
+
+    # 3) JS 必须走 id 转换，不许再拿字段名直接拼 —— 第 2 步只查 HTML，
+    #    单独把 JS 改回错写法时它照样通过，所以这一步不能省。
+    assert "${tagDomId(field)}-field" in html
+    assert "${tagDomId(field)}-list" in html
+    assert "${field}-field" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
+    assert "${field}-list" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
+
+
+# --------------------------------------------------------------------------- #
+# 优选 IP：「更新后发送通知」复选框
+# --------------------------------------------------------------------------- #
 def _reg_grab_html() -> str:
     web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
     return (web_dir / "templates" / "reg_grab.html").read_text(encoding="utf-8")
