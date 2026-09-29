@@ -59,6 +59,7 @@ from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import LinkPreviewOptions
 
 from .client import SessionInvalid, with_flood_retry
+from .forward_excludes import ForwardExcludeStore
 from .metrics import MetricsStore
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
@@ -844,6 +845,16 @@ class MediaGroupBuffer:
     task: Optional[asyncio.Task[None]] = None
 
 
+def _refset_signature(refset: RefSet) -> tuple[Any, ...]:
+    """把 :class:`RefSet` 压成可比较的指纹（用于热重载判定"到底变没变"）。
+
+    id 与 username **分成两组**：混在一起的话 ``1`` 与 ``"1"`` 会压成同一个值，
+    而这在 Telegram 语义里是两个完全不同的对象。组内排序是为了让"同一批名单、
+    只是顺序不同"算作同一个指纹（面板保存时顺序会变，不该因此触发一次假重载）。
+    """
+    return (tuple(sorted(refset.ids)), tuple(sorted(refset.usernames)), refset.has_me)
+
+
 # --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
@@ -880,11 +891,11 @@ class ForwardEngine:
         self.rules: list[PreparedRule] = [
             PreparedRule.build(rule) for rule in config.forward.active_rules
         ]
-        #: 账号级全局排除：这些会话任何规则都不监听（与每条规则的 exclude_sources 互补）。
-        self._exclude_chats = RefSet(config.forward.exclude_chats)
-        #: 账号级黑名单：这些人发的消息**任何规则**都不转发（与每条规则的
-        #: ``exclude_users`` 互补）。判定在规则循环**之前**做，见 ``_handle``。
-        self._exclude_users = RefSet(config.forward.exclude_users)
+        #: 实际生效的排除集合 = **全局名单 ∪ 账号级名单**。
+        #: 这里先占位，真正的合并放在下面 ``store`` / ``account`` 就位之后
+        #: （合并要读 ``data/forward_excludes.json``，而那个路径依赖这两者）。
+        self._exclude_chats = RefSet()
+        self._exclude_users = RefSet()
         self.dedupe = DedupeCache(config.forward.dedupe_window)
         #: 跨账号去重表（同一条消息发往同一个目标只允许一个账号发）。
         #: 由 ``MultiRunner`` 创建、多个账号**共享同一个实例**；不传（单测 / 离线场景）
@@ -909,6 +920,16 @@ class ForwardEngine:
         self._store = store
         self._account = account
         self._config_file = self._resolve_config_file()
+
+        # ---- 全局排除名单（跨账号一份） ----
+        #: ``data/forward_excludes.json``：**所有账号共用一份**的排除频道 / 黑名单。
+        #: 放在 ``store`` / ``account`` 就位之后建：它的路径由它们决定。
+        self._global_excludes = ForwardExcludeStore(self._global_excludes_path())
+        #: 全局那份单独留一份，便于 snapshot 区分"全局排掉的"还是"账号级排掉的"。
+        self._global_exclude_chats = RefSet()
+        self._global_exclude_users = RefSet()
+        # 并集在这里算第一次（热重载会再算，见 ``apply_config``）。
+        self._rebuild_excludes(config)
         #: 上次读到的 config.json mtime。``None`` = 还没读到过。
         self._rules_mtime: Optional[float] = self._config_mtime()
         self._last_reload_check = 0.0
@@ -962,6 +983,42 @@ class ForwardEngine:
             return self._store.paths.account(self._account).used_codes_file
         except Exception:  # pragma: no cover - 账号名异常时退化为纯内存
             return None
+
+    # ------------------------------------------------------------------ #
+    # 全局排除名单（跨账号共用一份）
+    # ------------------------------------------------------------------ #
+    def _global_excludes_path(self) -> Optional[Any]:
+        """「全局排除」名单的位置（``data/forward_excludes.json``，**跨账号一份**）。
+
+        没有 ``store``（单测 / 离线场景）时返回 ``None`` = 退化成纯内存，
+        此时只有账号级名单生效，行为与从前完全一致。
+        """
+        if self._store is None:
+            return None
+        try:
+            return self._store.paths.forward_excludes_file
+        except Exception:  # pragma: no cover - 路径异常时退化为纯内存
+            return None
+
+    def _rebuild_excludes(self, config: AccountConfig) -> None:
+        """把**全局名单**与**账号级名单**并起来，刷新实际生效的排除集合。
+
+        并集而不是替换：全局那份回答"所有账号都要排除的"（典型：那个刷屏频道），
+        账号级那份回答"只有这个号要排除的"（各账号的来源本来就不同）。
+        因此面板上删掉全局名单里的一项，不会影响任何账号自己加的那些。
+
+        热重载也走这里 —— 面板改完全局名单**立刻**生效，不用重启账号。
+        """
+        global_excludes = self._global_excludes.load()
+        self._global_exclude_chats = RefSet(global_excludes.exclude_chats)
+        self._global_exclude_users = RefSet(global_excludes.exclude_users)
+        # RefSet 自己会归一化（数字 id / @username 各归各位），直接把两个列表接起来即可。
+        self._exclude_chats = RefSet(
+            [*global_excludes.exclude_chats, *config.forward.exclude_chats]
+        )
+        self._exclude_users = RefSet(
+            [*global_excludes.exclude_users, *config.forward.exclude_users]
+        )
 
     def _configure_used_codes(self) -> None:
         """把 ``forward.used_codes`` 灌进记忆体。
@@ -1037,6 +1094,14 @@ class ForwardEngine:
             # 已使用码拦截的策略也要进指纹：它的正则/TTL 一变，热重载必须承认
             # 「确实变了」，否则会被判定成"没变化"而白改一场（与上面黑名单同理）。
             self.config.forward.used_codes.model_dump(mode="json"),
+            # 「全局排除」名单（``data/forward_excludes.json``，跨账号一份）**在账号配置
+            # 之外**：改它不会动 config.json，不进指纹的话热重载会判定"没变化"。
+            # ⚠️ 取的是**内存里**那两个集合（只由 ``_rebuild_excludes`` 更新），
+            # 不在这里重新读盘 —— ``apply_config`` 的"改前/改后"两次指纹是在同一次
+            # 调用里算的，两次都读盘就都读到**同一个新内容**，于是"只改全局名单"
+            # 会被判成没变化：行为虽然生效了（集合已重建），但日志不报，线上看不到证据。
+            _refset_signature(self._global_exclude_chats),
+            _refset_signature(self._global_exclude_users),
         )
 
     def apply_config(self, config: AccountConfig) -> bool:
@@ -1058,8 +1123,8 @@ class ForwardEngine:
         # 策略也已经是最新的，不会出现「配置改了、判定口径还是旧的」。
         self._configure_used_codes()
         self.rules = [PreparedRule.build(rule) for rule in config.forward.active_rules]
-        self._exclude_chats = RefSet(config.forward.exclude_chats)
-        self._exclude_users = RefSet(config.forward.exclude_users)
+        # 全局 + 账号级取并集（全局那份可能在面板上刚被改过，这里重新读一次盘）。
+        self._rebuild_excludes(config)
         if self._rules_signature() == before:
             return False
 
@@ -1069,6 +1134,12 @@ class ForwardEngine:
             enabled=config.forward.enabled,
             exclude_chats=len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
             exclude_users=len(self._exclude_users.ids) + len(self._exclude_users.usernames),
+            # 全局那份单独报一次：两个号共用一份名单时，
+            # "到底是全局生效了还是账号级生效了"是排查时第一个要分清的事。
+            global_exclude_chats=len(self._global_exclude_chats.ids)
+            + len(self._global_exclude_chats.usernames),
+            global_exclude_users=len(self._global_exclude_users.ids)
+            + len(self._global_exclude_users.usernames),
             rule_ids=",".join(prepared.id for prepared in self.rules),
         )
         self._refresh_handlers()
@@ -1779,6 +1850,16 @@ class ForwardEngine:
             只能单独发一条 —— 这也正是小白要的格式：
             「转发的消息不用编辑，直接在下方加一条原文链接」。
 
+            这条链接**一律静音**发（用户原话：「forward的时候将原文链接那条信息静音
+            发送，copy则正常发送」）。理由：链接只是备注，转发内容本身才是通知的主角；
+            补一条备注又把手机震一次，等于同一条消息提醒两遍。``copy`` 模式不受影响 ——
+            它的链接写在**正文里**，和内容同一条消息，没法也不该单独静音。
+
+            ⚠️ 用 ``{**kwargs, ...}`` 合并而不是在后面直接写 ``disable_notification=True``：
+            规则自己设了 ``silent`` 时 ``kwargs`` 里**已经有**这个键，重复传参是
+            ``TypeError: got multiple values for keyword argument``（整条链接就发不出去了）。
+            合并的语义也更对：规则静音时就别把它翻回有声。
+
             刻意**不抛出**：内容已经发出去了，链接没补上不该让整条转发记成失败。
             """
             try:
@@ -1787,7 +1868,7 @@ class ForwardEngine:
                         chat_id=target,
                         text=f"{SOURCE_LINK_PREFIX}{link}",
                         link_preview_options=LinkPreviewOptions(is_disabled=True),
-                        **kwargs,
+                        **{**kwargs, "disable_notification": True},
                     ),
                     alog=self.alog,
                     action=f"补发原文链接到 {target}",
@@ -1960,6 +2041,14 @@ class ForwardEngine:
             # 配了却不生效时，第一个要确认的就是"它到底读进去了没有"。
             "exclude_chats": len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
             "exclude_users": len(self._exclude_users.ids) + len(self._exclude_users.usernames),
+            # 上面两个数是**并集**（全局 + 账号级）。这两个是其中来自**全局名单**
+            # （``data/forward_excludes.json``，所有账号共用一份）的条数 ——
+            # 分开报是为了回答"名单到底读进去了没有"：全局那份改了所有账号一起变，
+            # 账号级那份只有本号变，混在一个数字里就分不清是谁生效了。
+            "global_exclude_chats": len(self._global_exclude_chats.ids)
+            + len(self._global_exclude_chats.usernames),
+            "global_exclude_users": len(self._global_exclude_users.ids)
+            + len(self._global_exclude_users.usernames),
             # 「已使用码」拦截的状态：`known` 直接回答"它到底学到东西没有" ——
             # 拦不住时第一个要确认的就是这个数（一直是 0 说明通知没被认出来）。
             "used_codes": self.used_codes.snapshot(),

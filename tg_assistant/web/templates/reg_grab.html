@@ -68,8 +68,11 @@
                 <h3>基本信息</h3>
                 <div class="rg-grid">
                     <div class="rg-input-group">
-                        <label>任务 ID <span class="required">*</span></label>
-                        <input id="rg-task-id" type="text" placeholder="如 main、group-a" />
+                        <!-- id 不是必填项：留空时服务端会自动生成一个（优先取名称里的
+                             ASCII 片段，中文名就生成 task-xxxxxxxx）。这里是内部主键，
+                             逼用户先编一个英文 id 是纯负担。 -->
+                        <label>任务 ID（可留空，自动生成）</label>
+                        <input id="rg-task-id" type="text" placeholder="留空自动生成，如 main、group-a" />
                     </div>
                     <div class="rg-input-group">
                         <label>任务名称</label>
@@ -109,7 +112,13 @@
                 <div class="rg-input-group">
                     <label>注册码提取正则</label>
                     <input id="rg-code-pattern" type="text" placeholder="如：(?:Register|Renew)_([A-Za-z0-9]{10})" />
-                    <p class="rg-hint">第一个捕获组就是 <code>{code}</code>；没有捕获组时用整个匹配。多条码的列表消息也能命中。</p>
+                    <p class="rg-hint">
+                        抓的是<b>第一个非空捕获组</b>（<code>(?:...)</code> 是不捕获组，不算）；
+                        正则里一个捕获组都没写时才用<b>整段匹配</b>。
+                        想要整串 —— 比如 <code>XYING-Whitelist_4rLuucEgs5</code> ——
+                        就把整串括起来：<code>(XYING-Whitelist_[A-Za-z0-9]{10})</code>。
+                        拿不准就点下面的「测试提取」看它实际抓到什么。多条码的列表消息也能命中。
+                    </p>
                 </div>
                 <div class="rg-input-group">
                     <label>正文预筛正则</label>
@@ -142,8 +151,11 @@
                     <textarea id="rg-test-text" rows="3" placeholder="把群里那条注册码消息粘进来"></textarea>
                     <div class="rg-test-row">
                         <button type="button" class="tg-btn tg-btn-ghost tg-btn-sm" onclick="testPattern()">测试提取</button>
-                        <span id="rg-test-result" class="rg-hint"></span>
+                        <span class="rg-hint" style="margin:0;">走的是引擎那份正则与标志（区分大小写、多行模式），结果就是它实际会抓到的</span>
                     </div>
+                    <!-- 结果有好几行（抓到的码 / 整段匹配 / 捕获组），所以是块级容器而不是
+                         挤在按钮旁边的行内 span —— 注进 innerHTML 的那几个值都要先过 escapeHtml。 -->
+                    <div id="rg-test-result" class="rg-hint"></div>
                 </div>
                 <div class="rg-grid">
                     <div class="rg-input-group">
@@ -580,7 +592,9 @@
 
     async function saveTask() {
         const task = collectTask();
-        if (!task.id) { toast('任务 ID 不能为空', false); return; }
+        // id 可以留空：服务端会自动生成一个（优先取名称里的 ASCII 片段，中文名生成
+        // task-xxxxxxxx），保存后 loadRegGrab() 会把生成结果拉回来显示 —— 所以这里
+        // 既不拦"必填"，也不在前端猜一个 id（前端猜的会和服务端不一致）。
         const tasks = [...(rgData.tasks || [])];
 
         if (editingTaskId) {
@@ -588,7 +602,11 @@
             if (at < 0) { toast('任务已不存在，请刷新', false); return; }
             tasks[at] = task;
         } else {
-            if (tasks.some(t => t.id === task.id)) { toast('任务 ID 已存在', false); return; }
+            // 只有用户真填了 id 才查重；留空那条交给服务端生成，不可能撞上。
+            if (task.id && tasks.some(t => t.id === task.id)) {
+                toast('任务 ID 已存在', false);
+                return;
+            }
             tasks.push(task);
         }
         if (await saveConfig(tasks)) closeTaskModal();
@@ -840,21 +858,49 @@
     }
 
     // ---- 正则试提取 ----
+    // 后端回 {matched, full, groups, code, from_group}：把「引擎会拿哪个值当 {code}、
+    // 它是从第几个捕获组来的」直接摊在面板上。
+    // 为什么不再复用转发页那个 /api/rules/test：它只回答"匹配到了没有"，
+    // 而现在最常见的疑问恰恰是「我要整串，却只抓到了后缀」—— 答案在 from_group 上，
+    // 用户看到「整段匹配」和「当前抓的是第 1 个非空捕获组」就明白是自己的正则把
+    // 捕获组括窄了，而不是引擎坏了。
     async function testPattern() {
         const pattern = document.getElementById('rg-code-pattern').value.trim();
         const text = document.getElementById('rg-test-text').value;
         const out = document.getElementById('rg-test-result');
         if (!pattern) { out.textContent = '先填提取正则'; return; }
         if (!text.trim()) { out.textContent = '先粘一条消息进来'; return; }
-        const res = await fetch('/api/rules/test', {
+        const res = await fetch('/api/reg_grab/test_extract', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({pattern, text, mode: 'regex', ignore_case: true}),
+            body: JSON.stringify({pattern, text}),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        // 正则写错、文本为空这类输入问题由后端给出人话提示，原样显示。
         if (data.error) { out.textContent = data.error; return; }
-        if (!data.match) { out.textContent = '❌ 没匹配上'; return; }
-        const code = (data.groups && data.groups.length) ? data.groups[0] : data.full_match;
-        out.textContent = `✅ 提取到：${code}`;
+        if (!data.matched) { out.textContent = '❌ 没匹配上'; return; }
+
+        // 「这个值是哪来的」要一句话说清：抓到的码与整段匹配相同时，多半就是正则里
+        // 没写捕获组（弹窗里那一项已经解释了这条规则）。
+        const from = data.from_group === 0
+            ? '整段匹配'
+            : `第 ${data.from_group} 个非空捕获组`;
+        const groupLines = (data.groups || [])
+            .map((g, i) => `第 ${i + 1} 组：${(g == null || g === '') ? '（空）' : escapeHtml(g)}`)
+            .join('　');
+
+        let html = `✅ 抓到的注册码：<b style="color:var(--success);font-size:14px;">${escapeHtml(data.code)}</b>`
+            + `<span style="margin-left:6px;">（来自${from}）</span>`
+            + `<div>整段匹配：<code>${escapeHtml(data.full)}</code></div>`;
+        if (groupLines) html += `<div>捕获组：${groupLines}</div>`;
+        // 抓的不是整段时，用户十有八九想要的是整串 —— 给一句能直接照做的改法。
+        // 例子写死成「把带前缀的整串括起来」，是因为 auto 拼一个 `(${full})` 会骗人：
+        // full 本身就不含前缀（用户的正则从 Whitelist 才开始匹配），照抄它还是抓不到整串。
+        if (data.code !== data.full) {
+            html += `<div>💡 当前抓的是第 ${data.from_group} 个非空捕获组；想抓整串就把整串括起来，`
+                + `例如 <code>(XYING-Whitelist_xxxxxxxxxx)</code>`
+                + ` —— 前缀（如 XYING-）也得一起写进正则里，才算把「整串」括住。</div>`;
+        }
+        out.innerHTML = html;
     }
 
     init();

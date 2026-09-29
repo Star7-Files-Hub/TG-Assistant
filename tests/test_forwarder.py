@@ -18,10 +18,12 @@ from tg_assistant.config import (
     AccountConfig,
     AccountRecord,
     ForwardConfig,
+    ForwardExcludes,
     ForwardRule,
     MatchConfig,
     NotifyConfig,
 )
+from tg_assistant.forward_excludes import ForwardExcludeStore
 from tg_assistant.forwarder import (
     ChannelGroupDedupe,
     CrossAccountDedupe,
@@ -29,6 +31,7 @@ from tg_assistant.forwarder import (
     ForwardEngine,
     PreparedRule,
     RecentContentDedupe,
+    SOURCE_LINK_PREFIX,
     _pipeline_ms,
     _sent_ids,
     content_fingerprint,
@@ -767,6 +770,287 @@ class TestAccountLevelBlacklist:
         snap = engine.snapshot()
         assert snap["exclude_users"] == 2
         assert snap["exclude_chats"] == 0
+
+
+class TestGlobalExcludes:
+    """「全局排除」名单（``data/forward_excludes.json``，**所有账号共用一份**）。
+
+    用户原话：「将转发规则的黑名单及排除的频道也做成全局的」＋
+    「我设置的群id就不要转给我了」。线上两个账号（小白 / SevenStar）的这两份名单
+    **一模一样**（2026-09-29 取证：``-1003932130542`` / ``8817602576``）——
+    同一份名单存了两遍，面板上还得一个账号填一次：加一个账号就多填一遍，
+    漏填一个账号 = 那个号照转。
+
+    与账号级 ``forward.exclude_chats`` / ``exclude_users`` 是**并集**，不是替换：
+    全局那份回答"所有账号都要排除的"（那个刷屏频道 / 那个转发机器人），
+    账号级那份回答"只有这个号要排除的"（各账号的来源本来就不同）。
+    所以这一组钉三件事：
+
+    1. 全局名单真的被当成排除（群不转发、人发的消息不转发）；
+    2. 并集语义：只配全局生效、只配账号级也生效、两边都有都不漏、名单外不误伤；
+    3. 它是**跨账号一份** —— 同一个文件，两个账号同时生效；
+    4. 只改这个文件（``config.json`` 一个字没动）也要能被 ``apply_config`` 察觉。
+    """
+
+    ACCOUNT = "acc-a"
+    OTHER_ACCOUNT = "acc-b"
+    OTHER_SRC = -1004444444444
+    THIRD_SRC = -1005555555555
+
+    @staticmethod
+    def write_global(store, *, chats=(), users=()) -> None:
+        """写「全局排除」那份（生产里由面板的 ``PUT /api/forward-excludes`` 写）。"""
+        ForwardExcludeStore(store.paths.forward_excludes_file).save(
+            ForwardExcludes.model_validate(
+                {"exclude_chats": list(chats), "exclude_users": list(users)}
+            )
+        )
+
+    @staticmethod
+    def account_config(*, chats=(), users=(), sources=(SRC,)) -> AccountConfig:
+        """只配**账号级**名单的配置。
+
+        全局那份不在任何账号配置里（这正是"一份名单所有账号共用"的落点），
+        所以这里留空，由 :meth:`write_global` 单独写文件。
+        """
+        base = build_config(sources=list(sources))
+        return AccountConfig.model_validate(
+            {
+                "forward": {
+                    **base.forward.model_dump(),
+                    "exclude_chats": list(chats),
+                    "exclude_users": list(users),
+                }
+            }
+        )
+
+    def engine(self, store, client, alog, *, config, account=ACCOUNT) -> ForwardEngine:
+        """造一个**接上真实 store** 的引擎（全局名单的路径由 store 决定）。
+
+        不接 store 时全局名单退化成纯内存（见最后一个用例）——
+        那条路径要单独钉，但所有"全局名单生效"的验收都必须在接了 store 的引擎上做。
+        """
+        store.save_account_config(account, config)
+        loaded = store.load_account_config(account, create=False)
+        return ForwardEngine(client, loaded, alog, store=store, account=account)
+
+    # ---------------------------------------------------------------- 排除生效
+    @pytest.mark.asyncio
+    async def test_global_excluded_chat_is_not_forwarded(self, store, client, alog):
+        """全局名单里的群 id：消息进来就被丢弃，连规则都不看。
+
+        这是用户那句「我设置的群id就不要转给我了」最直白的验收：
+        群 id 写进**全局**名单（而不是某个账号的配置），本账号也必须不转。
+        """
+        self.write_global(store, chats=[SRC])
+        engine = self.engine(store, client, alog, config=self.account_config())
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["excluded"] == 1
+        assert engine.stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    async def test_global_blacklisted_sender_is_not_forwarded(self, store, client, alog):
+        """全局黑名单里的用户：他发的、命中规则的消息不转发。
+
+        与账号级黑名单同一套语义（只拦"本来真要发出去"的那几条）——
+        所以计的是 ``blocked_senders``，不是 ``excluded``。
+        """
+        self.write_global(store, users=[555])
+        engine = self.engine(store, client, alog, config=self.account_config())
+
+        engine._handle(src_message("关键词123", sender=FakeUser(555)), edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["blocked_senders"] == 1
+
+    @pytest.mark.asyncio
+    async def test_global_username_is_normalized_and_matches(self, store, client, alog):
+        """全局名单支持 ``@username``，且大小写不敏感。
+
+        面板传上来的写法与引擎比对用的写法不一样（面板 ``@Noisy_Channel``、
+        消息里 ``noisy_channel``），归一化没做对就会"名单存进去了却拦不住"。
+        """
+        self.write_global(store, chats=["@Noisy_Channel"])
+        engine = self.engine(store, client, alog, config=self.account_config())
+
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(-100777, username="noisy_channel")),
+            edited=False,
+        )
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["excluded"] == 1
+
+    # ---------------------------------------------------------------- 并集语义
+    @pytest.mark.asyncio
+    async def test_account_level_alone_still_works(self, store, client, alog):
+        """只配账号级（全局那份是空文件）时行为与加这个功能之前完全一致。
+
+        并集不能变成"后者覆盖前者"：线上用户会先在某个账号里配一份，
+        再慢慢把公共的挪到全局去 —— 中间态两边都有东西，任何一边都不能被吃掉。
+        """
+        self.write_global(store)  # 空名单，但文件存在
+        engine = self.engine(
+            store, client, alog, config=self.account_config(chats=[SRC])
+        )
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.stats["excluded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_both_sides_are_unioned_without_over_blocking(
+        self, store, client, alog
+    ):
+        """两边各排除一个会话：两个都被拦，第三个照常转发。
+
+        只断言"两个都被拦"是不够的 —— 把并集写成"用非空的那一边"也能过。
+        所以第三条（哪边都没提到的会话）必须**真的转出去**，
+        否则"排除"就退化成了"全部不转"。
+        """
+        self.write_global(store, chats=[SRC])
+        engine = self.engine(
+            store, client, alog, config=self.account_config(chats=[self.OTHER_SRC], sources=[])
+        )
+
+        for chat_id in (SRC, self.OTHER_SRC):
+            engine._handle(
+                make_message("关键词123", message_id=chat_id % 100000,
+                             chat=FakeChat(chat_id, title=f"群{chat_id}")),
+                edited=False,
+            )
+        await drain(engine)
+        assert client.forwarded == [], "全局或账号级任一边命中都该拦住"
+        assert engine.stats["excluded"] == 2
+
+        engine._handle(
+            make_message("关键词123", chat=FakeChat(self.THIRD_SRC, title="没被排除的群")),
+            edited=False,
+        )
+        await drain(engine)
+        assert len(client.forwarded) == 1, "名单外的会话被误伤了"
+        assert engine.stats["excluded"] == 2
+
+    # ------------------------------------------------------------ 跨账号一份
+    @pytest.mark.asyncio
+    async def test_one_global_file_covers_every_account(self, store, alog):
+        """两个账号读**同一个文件**：全局名单对两边同时生效。
+
+        这就是用户要的"全局"：不必给每个账号各填一遍，也就不会漏填一个账号
+        导致那个号照转。账号级名单则各自独立 —— 第二个账号没配，照样被全局拦。
+        """
+        self.write_global(store, chats=[SRC])
+        client_a, client_b = FakeClient(), FakeClient()
+        engine_a = self.engine(
+            store, client_a, alog, config=self.account_config(chats=[self.OTHER_SRC])
+        )
+        engine_b = self.engine(
+            store,
+            client_b,
+            alog,
+            config=self.account_config(sources=[]),
+            account=self.OTHER_ACCOUNT,
+        )
+
+        for engine, fake in ((engine_a, client_a), (engine_b, client_b)):
+            engine._handle(src_message("关键词123"), edited=False)
+            await drain(engine)
+
+        assert client_a.forwarded == []
+        assert client_b.forwarded == [], "第二个账号没配账号级名单，但全局那份必须管到它"
+
+    # ------------------------------------------------------------ 可观测性
+    @pytest.mark.asyncio
+    async def test_snapshot_separates_global_from_account_level(self, store, client, alog):
+        """快照要能分清"排掉的是全局那份还是账号级那份"。
+
+        两个号共用一份全局名单时，出问题第一个要回答的就是"到底哪一份生效了"。
+        并集总数（``exclude_chats``）相同的情况下，来源可能完全不同 ——
+        全塞进一个数字里就永远分不清。
+        """
+        self.write_global(store, chats=[SRC], users=[555])
+        engine = self.engine(
+            store, client, alog, config=self.account_config(chats=[self.OTHER_SRC])
+        )
+
+        snap = engine.snapshot()
+
+        assert snap["global_exclude_chats"] == 1
+        assert snap["global_exclude_users"] == 1
+        assert snap["exclude_chats"] == 2, "并集总数 = 全局 1 + 账号级 1"
+        assert snap["exclude_users"] == 1
+
+    @pytest.mark.asyncio
+    async def test_broken_global_file_does_not_stop_forwarding(self, store, client, alog):
+        """全局名单写坏 = 按**空名单**继续跑，绝不能让所有账号的转发停摆。
+
+        代价不对称：少排除几条只是多转了几条消息，而一份写坏的 JSON 让全部账号
+        的转发都起不来是灾难性的。所以这里断言"照常转发"，而不是"报错"。
+        """
+        store.paths.forward_excludes_file.write_text("{ 这不是合法 JSON", encoding="utf-8")
+        engine = self.engine(store, client, alog, config=self.account_config())
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert engine.snapshot()["global_exclude_chats"] == 0
+
+    # ------------------------------------------------------------ 热重载
+    @pytest.mark.asyncio
+    async def test_apply_config_notices_a_global_file_change(self, store, client, alog):
+        """只改全局名单文件（``config.json`` 一个字没动）也要被热重载察觉。
+
+        🔴 名单不在账号配置里，改它既不动 ``config.json`` 也不动规则的指纹。
+        没有这一条的话，用户在面板上改完全局名单、立刻去群里验证，
+        看到消息照样被转出去，只会以为功能坏了。
+
+        这里断言的是**行为**（真的拦住了）而不是"文件读到了"：
+        指纹只说明"有人报告变了"，拦住消息才是用户要的结果。
+        第二次调用必须返回 False —— 否则每一轮轮询都会白重建一次 handler。
+        """
+        self.write_global(store)  # 一开始是空名单
+        config = self.account_config()
+        engine = self.engine(store, client, alog, config=config)
+        engine.register()
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "名单还空着，第一条该转出去"
+
+        self.write_global(store, chats=[SRC])  # 只动这个文件
+
+        assert engine.apply_config(config) is True, "改全局名单没被察觉 —— 要等重启才生效"
+        engine._handle(src_message("关键词123", message_id=101), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "重载后全局名单里的群必须当场被拦住"
+        assert engine.stats["excluded"] == 1
+
+        assert engine.apply_config(config) is False, "内容没再变就不该重复重载"
+
+    @pytest.mark.asyncio
+    async def test_without_store_global_file_is_never_consulted(self, client, alog):
+        """不接 store 时（单测 / 离线场景）全局名单退化成"没有"，行为与从前一致。
+
+        这是刻意的降级路径：引擎在没有 store 时本来就读不到任何盘上状态，
+        不该因为全局名单这个新功能而报错或改变行为。
+        """
+        engine = ForwardEngine(client, self.account_config(), alog)
+
+        assert engine._global_excludes.path is None
+        assert engine.snapshot()["global_exclude_chats"] == 0
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1
 
 
 class TestMultilineForwardsOnce:
@@ -1587,6 +1871,41 @@ class TestCopyModeSourceLink:
         assert engine.stats["forwarded"] == 1
 
     @pytest.mark.asyncio
+    async def test_copy_mode_has_no_separate_note_and_silent_stays_rule_only(self, alog):
+        """``copy`` 模式**没有**单独的链接消息，静音与否只看规则自己的 ``silent``。
+
+        用户原话：「forward的时候将原文链接那条信息静音发送，**copy则正常发送**」——
+        copy 的链接写在正文里、和内容是同一条消息，既没法也不该单独静音。
+
+        ⚠️ "没有单独那条"必须由**调用条数**来钉：只断言正文里有链接的话，
+        把 forward 那套"补发一条静默链接"复制过来照样能过 ——
+        而用户会平白多收到一条消息。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="copy"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert [name for name, _ in client.calls] == ["send_message"], (
+            "copy 只该发一条 —— 多出来的那条就是被照搬过来的「补链接」消息"
+        )
+        assert "disable_notification" not in client.sent[0], (
+            "规则没开 silent，copy 就该正常提醒（用户原话：「copy则正常发送」）"
+        )
+        assert client.sent[0]["text"].endswith(f"{SOURCE_LINK_PREFIX}{self.LINK}")
+
+        # 静音决定权完全在规则手里：开了 silent 才是同一条消息静音
+        quiet_client = FakeClient()
+        quiet_engine = ForwardEngine(quiet_client, build_config(mode="copy", silent=True), alog)
+        quiet_engine.register()
+        quiet_engine._handle(src_message("关键词123"), edited=False)
+        await drain(quiet_engine)
+
+        assert len(quiet_client.sent) == 1, "静音不该额外多出一条消息"
+        assert quiet_client.sent[0]["disable_notification"] is True
+
+    @pytest.mark.asyncio
     async def test_copy_mode_keeps_entities(self, alog):
         """重新发送要带上原 entities —— 粗体 / 内联链接等格式不能丢。"""
         client = FakeClient()
@@ -1823,6 +2142,56 @@ class TestForwardModeLinkNote:
         note = client.sent[0]
         assert note["disable_notification"] is True
         assert note["message_thread_id"] == 777
+
+    @pytest.mark.asyncio
+    async def test_note_is_always_silent_while_content_is_not(self, alog):
+        """补发的那条链接**一律静音**，而转发内容照常提醒。
+
+        用户原话：「forward的时候将原文链接那条信息静音发送，copy则正常发送」。
+        理由：链接只是备注，转发内容本身才是通知的主角；补一条备注又把手机震一次，
+        等于同一条消息提醒两遍。
+
+        ⚠️ 这里要**同时**断言两侧：只断言"链接那条静音"的话，把静默顺手加到主转发
+        消息上也能过 —— 那就变成用户开了提醒却收不到提醒了。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        # 主转发消息：规则没开 silent ⇒ 不能替用户静音（键不出现或为假都算对）
+        assert client.forwarded[0].get("disable_notification") in (None, False)
+
+        note = client.sent[0]
+        assert note["disable_notification"] is True
+        assert note["text"].startswith(SOURCE_LINK_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_silent_rule_does_not_pass_the_flag_twice(self, alog):
+        """规则自己也静音时，补链接**不能**把 ``disable_notification`` 传两遍。
+
+        🔴 回归：链接那条的实现是"在规则给的参数上强制加静音"。写成
+        ``send_message(..., disable_notification=True, **kwargs)`` 的话，规则开了
+        ``silent`` 时 ``kwargs`` 里已经有一个同名键 —— Python 当场抛
+        ``TypeError: got multiple values for keyword argument 'disable_notification'``。
+        而补链接的错误是**被吞掉**的（内容已经发出去了，链接没补上不该算整条失败），
+        所以线上表现只是"链接偶尔没了"，日志里一条红线都没有。
+
+        所以合并要用 ``{**kwargs, "disable_notification": True}``，且语义是
+        "规则静音时别把它翻回有声"。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(mode="forward", silent=True), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        assert client.forwarded[0]["disable_notification"] is True, "规则静音时内容也该静音"
+        assert len(client.sent) == 1, (
+            "补链接那条没发出去（多半是重复传参的 TypeError 被吞了）"
+        )
+        assert client.sent[0]["disable_notification"] is True
 
     @pytest.mark.asyncio
     async def test_note_skipped_when_link_disabled(self, alog):

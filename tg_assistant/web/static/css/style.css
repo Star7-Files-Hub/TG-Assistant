@@ -935,11 +935,58 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     gap: 12px;
     flex-wrap: wrap;
 }
-.rules-account-group-body {
+/* 账号卡片里最后一行的下边框要去掉：分组本身有 border + overflow:hidden，
+   留着的话会贴着圆角画一条"多余的线"。规则卡片已经搬走（按 rule.id 合并了），
+   所以现在最后一行是「已使用注册码拦截」。 */
+.rules-account-group .rules-account-exclude:last-child {
+    border-bottom: none;
+}
+
+/* ---- 「各账号单独设置」折叠节 ----
+   规则改为按 rule.id 合并成主卡片之后，账号各自的设置（总开关 / 排除名单 /
+   已用注册码）需要一个明确的落点，否则用户会以为那两行排除名单只对某条规则生效。
+   默认折叠：主视图留给规则本身。 */
+.rules-account-settings {
+    border: 1px solid rgba(48, 54, 61, 0.6);
+    border-radius: 14px;
+    background: rgba(13, 17, 23, 0.35);
+    overflow: hidden;
+}
+.rules-account-settings > summary {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--text-muted);
+    list-style: none;
+}
+.rules-account-settings > summary::-webkit-details-marker {
+    display: none;
+}
+.rules-account-settings > summary::before {
+    content: '▶';
+    font-size: 10px;
+    transition: transform 0.15s;
+}
+.rules-account-settings[open] > summary::before {
+    transform: rotate(90deg);
+}
+.rules-account-settings-title {
+    font-weight: 600;
+    color: var(--text);
+}
+.rules-account-settings-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rules-account-settings-body {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 12px 16px 16px;
+    padding: 0 12px 12px;
 }
 
 /* 账号级「排除频道」：这些会话所有规则都不监听（转发目标由后端自动排除，不用填这里） */
@@ -978,15 +1025,152 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     padding: 5px 8px;
 }
 
-.rules-account-empty {
-    font-size: 13px;
+/* ---- 全局排除区块（所有账号共用一份，见 /api/forward-excludes）----
+   视觉上刻意与"账号分组"区分开：淡蓝底 + 圆角独立卡片，
+   一眼能看出它不属于下面任何一个账号。 */
+.rules-global {
+    margin-bottom: 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(47, 129, 247, 0.04);
+    overflow: hidden;
+}
+.rules-global-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px 10px;
+}
+.rules-global-header h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+}
+.rules-global-header p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+.rules-global-state {
+    flex-shrink: 0;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(47, 129, 247, 0.15);
+    color: var(--primary);
+    font-size: 11px;
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    cursor: default;
+}
+/* 名单文件读不到时用红色：此刻引擎是**按空名单**在跑，
+   界面必须一眼看出"排除其实没生效"，而不是看起来配好了。 */
+.rules-global-state-warn {
+    background: rgba(248, 81, 73, 0.15);
+    color: var(--danger);
+}
+.rules-global-body .rules-account-exclude:last-child {
+    border-bottom: none;
+}
+
+/* ---- 规则卡片上"条数多就折叠"的匹配条件 ---- */
+.rule-patterns-details > summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    cursor: pointer;
+    list-style: none;   /* 倒三角自己画：各浏览器自带的标记大小/位置不一致 */
+}
+.rule-patterns-details > summary::-webkit-details-marker {
+    display: none;
+}
+.rule-patterns-details > summary::before {
+    content: '▸';
     color: var(--text-muted);
-    padding: 8px 0;
+    font-size: 12px;
+}
+.rule-patterns-details[open] > summary::before {
+    content: '▾';
+}
+.rule-patterns-count {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rule-pattern-preview {
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* 展开了就不需要预览了（同一个正则会出现两次） */
+.rule-patterns-details[open] .rule-pattern-preview {
+    display: none;
+}
+.rule-patterns-details > .rule-patterns {
+    margin-top: 8px;
+}
+
+/* 「监听账号」勾选行：规则卡片上唯一决定"这条规则对哪些账号生效"的地方。
+   勾上的账号用主色描出来 —— 一眼能看出这条任务落在谁身上（用户原话：
+   「一条主规则，选择监听账号即可」）。 */
+.rule-owners {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+}
+.rule-owners-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    cursor: help;
+}
+.rule-owners-count {
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(47, 129, 247, 0.15);
+    color: var(--primary);
+    font-size: 11px;
+    font-family: var(--font-mono);
+}
+.rule-owners-list {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.rule-owner {
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(13, 17, 23, 0.4);
+    font-size: 12px;
+}
+.rule-owner:has(input:checked) {
+    border-color: rgba(47, 129, 247, 0.5);
+    background: rgba(47, 129, 247, 0.12);
+    color: var(--text);
+}
+.rule-owner .tg-checkmark {
+    width: 14px; height: 14px;
+    border-width: 2px;
+    border-radius: 4px;
 }
 .rule-shared {
     margin-top: 10px;
     font-size: 12px;
     color: var(--text-muted);
+}
+/* 各账号里的同一份规则内容不一致：这是"会静默出错的坑"，
+   用告警色，别混在普通灰字提示里（用户会以为只是说明文字）。 */
+.rule-shared-warn {
+    color: var(--warning);
 }
 
 /* 账号状态点 */
@@ -1057,6 +1241,13 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
 
 /* 规则列表 */
 .rules-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+/* 规则主卡片（按 rule.id 合并，一条规则一张）。它和「各账号单独设置」那节
+   是并列的两块，中间靠 .rules-list 的 gap 拉开距离。 */
+.rules-rule-list {
     display: flex;
     flex-direction: column;
     gap: 12px;

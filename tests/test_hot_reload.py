@@ -20,14 +20,15 @@ import os
 
 import pytest
 
-from tg_assistant.config import AccountConfig, AccountRecord
+from tg_assistant.config import AccountConfig, AccountRecord, ForwardExcludes
+from tg_assistant.forward_excludes import ForwardExcludeStore
 from tg_assistant.forwarder import ForwardEngine
 from tg_assistant.red_packet import RedPacketHunter
 from tg_assistant.reg_grab import RegGrabHunter
 from tg_assistant.runner import AccountRunner
 
 from .conftest import FakeButton, FakeChat, FakeClient, FakeMarkup, make_message
-from .test_forwarder import build_config as fwd_config
+from .test_forwarder import SRC, build_config as fwd_config, drain, src_message
 from .test_red_packet import (
     button_markup as rp_button_markup,
     rp_config,
@@ -435,6 +436,11 @@ def make_runner(store, config: AccountConfig) -> AccountRunner:
     runner.alog = CapturingLog()
     runner._config_file = store.paths.account("acc-a").config_file
     runner._config_mtime = None
+    # 「全局排除」名单的路径也要接上 —— 生产里 `AccountRunner.start()` 一起记这两个，
+    # 少了它，下面的用例就测不到"只改全局名单也会触发重载"这条路径（而它正是
+    # 用户最容易以为坏掉的地方：面板改完、群里照样转）。
+    runner._global_excludes_file = store.paths.forward_excludes_file
+    runner._global_excludes_mtime = None
     return runner
 
 
@@ -596,3 +602,112 @@ class TestRunnerConfigWatcher:
 
         assert alive, "热重载抛错不能把 run_forever 带崩"
         assert "配置热重载出错，已跳过这一轮" in runner.alog.text
+
+
+# --------------------------------------------------------------------------- #
+# 转发：「全局排除」名单也要热重载
+# --------------------------------------------------------------------------- #
+class TestForwardGlobalExcludesHotReload:
+    """改全局排除名单（``data/forward_excludes.json``）当场生效，**不用重启账号**。
+
+    那份名单**不在**任何账号的 ``config.json`` 里（所有账号共用一份）——
+    只盯 ``config.json`` 的 mtime 的话，面板改完全局名单不会触发任何重载。
+    用户改完的下一步动作就是去群里看有没有被拦住，看到照样转出去只会以为功能坏了，
+    而日志里**一条错都不会有**（名单文件是合法的，只是没人去读）。
+
+    所以这里用**真引擎**（不是 ``StubForward`` 替身）验收：
+    ``_reload_config_if_changed()`` 返回 True 只说明"有人报告变了"，
+    消息真的被拦住才是用户要的结果。
+    """
+
+    ACCOUNT = "acc-a"
+
+    def _runner_with_real_engine(self, store, alog, client):
+        """runner + 真转发引擎：配置落盘、引擎接真实 store（全局名单由它定位）。"""
+        config = fwd_config()
+        store.save_account_config(self.ACCOUNT, config)
+        runner = make_runner(store, config)
+        engine = ForwardEngine(client, config, alog, store=store, account=self.ACCOUNT)
+        engine.register()
+        runner.forwarder = engine
+        return runner, engine
+
+    @staticmethod
+    def _write_global(store, *, chats=()) -> None:
+        ForwardExcludeStore(store.paths.forward_excludes_file).save(
+            ForwardExcludes.model_validate({"exclude_chats": list(chats)})
+        )
+
+    @pytest.mark.asyncio
+    async def test_global_file_change_reloads_without_a_restart(self, store, alog):
+        client = FakeClient()
+        runner, engine = self._runner_with_real_engine(store, alog, client)
+
+        # 第一次必定读一次盘（两个 mtime 初始都是 None）：启动过程中名单刚好被改过
+        # 也不会漏掉；之后没再动过就不该反复读。
+        assert await runner._reload_config_if_changed() is True
+        assert await runner._reload_config_if_changed() is False
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "名单还是空的，这条该正常转出去"
+
+        # 只动全局名单文件：config.json 一个字节都没改
+        self._write_global(store, chats=[SRC])
+
+        assert await runner._reload_config_if_changed() is True, (
+            "全局名单变了没触发重载 —— 用户改完要等重启才生效"
+        )
+        assert runner.forwarder is engine, "重载把引擎实例换掉了，那就是重启而不是热重载"
+        assert runner._stopped.is_set() is False, "改一份名单不该把账号停掉"
+
+        engine._handle(src_message("关键词123", message_id=101), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "重载后全局名单里的群必须当场被拦住"
+        assert engine.stats["excluded"] == 1
+        # 用户能看到的证据：面板 / 日志里必须写出来"真的重载了"
+        assert "配置已热重载（无需重启账号）" in runner.alog.text
+
+        # mtime 没再动 ⇒ 不该每一轮轮询都白重建一次 handler
+        assert await runner._reload_config_if_changed() is False
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_global_file_is_picked_up(self, store, alog):
+        """把名单清空也要当场生效 —— 并集是"重算"而不是"只增不减"。
+
+        只说"加进去能生效"是不够的：如果重载时把新名单**追加**到旧集合上，
+        用户删掉一项后消息照样被拦，而且界面上看不出任何异常。
+        """
+        self._write_global(store, chats=[SRC])
+        client = FakeClient()
+        runner, engine = self._runner_with_real_engine(store, alog, client)
+        await runner._reload_config_if_changed()
+
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+        assert client.forwarded == [], "名单里的群一开始就该被拦住"
+
+        self._write_global(store)  # 清空
+        # 明确把 mtime 往前推：不靠 sleep 赌文件系统的时间精度
+        bump_mtime(store.paths.forward_excludes_file)
+
+        assert await runner._reload_config_if_changed() is True
+        engine._handle(src_message("关键词123", message_id=101), edited=False)
+        await drain(engine)
+        assert len(client.forwarded) == 1, "名单清空后消息该恢复转发"
+        assert engine.snapshot()["global_exclude_chats"] == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_global_file_is_tolerated(self, store, alog):
+        """从没配过全局名单（文件不存在）时监视器要安静地正常工作。
+
+        ``stat`` 一个不存在的文件会抛 ``OSError``；这里必须吞掉并当成"没变化"，
+        否则轮询一上来就异常，``config.json`` 的重载也会一起被带停。
+        """
+        client = FakeClient()
+        runner, _engine = self._runner_with_real_engine(store, alog, client)
+        assert not store.paths.forward_excludes_file.exists()
+
+        assert await runner._reload_config_if_changed() is True, "config.json 那次必须读到"
+        assert await runner._reload_config_if_changed() is False
+        assert "配置热重载出错" not in runner.alog.text

@@ -173,6 +173,22 @@ class Paths:
         """
         return self.data_dir / "metrics.json"
 
+    @property
+    def forward_excludes_file(self) -> Path:
+        """转发「全局排除」名单（排除频道 + 发送者黑名单），**所有账号共用一份**。
+
+        🔴 **为什么要跨账号共享**：2026-09-29 线上取证 —— 两个账号（小白 / SevenStar）
+        的 ``forward.exclude_chats`` 与 ``forward.exclude_users`` **一模一样**
+        （``-1003932130542`` / ``8817602576``）：同一份名单被存了两遍，面板上还得
+        一个账号填一次。加一个账号就多填一遍，漏填一个账号 = 那个号照转。
+        用户原话：「将转发规则的黑名单及排除的频道也做成全局的」。
+
+        放在 ``data/`` 根下，与 ``dedupe.json`` / ``metrics.json`` 同类 —— 都是
+        "跨账号一份事实"。账号目录里那份 ``forward.exclude_*`` 保留为
+        **该账号额外排除**，两者在引擎里取**并集**（见 ``ForwardEngine._rebuild_excludes``）。
+        """
+        return self.data_dir / "forward_excludes.json"
+
     def account(self, name: str) -> AccountPaths:
         safe = validate_account_name(name)
         return AccountPaths(name=safe, root=self.accounts_dir / safe)

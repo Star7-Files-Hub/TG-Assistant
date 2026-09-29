@@ -146,6 +146,90 @@ class ChainOutcome:
 
 
 # --------------------------------------------------------------------------- #
+# 注册码提取（引擎与面板共用同一条口径）
+# --------------------------------------------------------------------------- #
+def _ensure_pattern(pattern: str | re.Pattern[str]) -> re.Pattern[str]:
+    """把「用户写的正则字符串」或「预编译好的正则」统一成正则对象。
+
+    引擎里正则只编译一次、整个进程复用；面板的「测试提取」拿到的却是字符串，
+    所以两种入参都得接受。关键是编译时**必须**用 ``compile_user_pattern``
+    （与 :meth:`PreparedTask.build` 同一份 flags）—— 面板要是自己 ``re.compile``
+    一套标志，它会信誓旦旦地说「能匹配」，而真正动手的引擎匹配不上。
+    """
+    if isinstance(pattern, str):
+        return compile_user_pattern(pattern)
+    return pattern
+
+
+def _code_and_group(found: re.Match[str]) -> tuple[str, int]:
+    """「抓取规则」的**唯一**实现处：第一个非空捕获组；一个非空组都没有才用整段。
+
+    返回 ``(注册码, 来自第几个捕获组)``，组号 ``0`` 表示整段匹配。
+
+    🔴 这条规则是对外契约，不是实现细节，别"顺手"改成整段匹配：线上有任务的正则
+    把捕获组只括在后缀上（``(?:Whitelist)_([A-Za-z0-9]{10})`` ⇒ 只拿到
+    ``4rLuucEgs5``），用户的困惑来自**正则**，不是引擎抓错了。改成整段匹配会一次性
+    改坏所有靠捕获组拼 ``{code}`` 的老任务。正确做法是把这件事显示清楚
+    —— 见 :func:`extract_code_detail` 与抢注面板的「测试提取」。
+    """
+    for index, group in enumerate(found.groups(), start=1):
+        if group:
+            return group, index
+    return found.group(0), 0
+
+
+def extract_code(pattern: Optional[str | re.Pattern[str]], text: str) -> Optional[str]:
+    """从文本里提取注册码；没匹配上返回 ``None``。
+
+    抓的是**第一个非空捕获组**（``(?:...)`` 是「不捕获组」，不算），正则里一个
+    捕获组都没写时才退回整个匹配。
+    """
+    if pattern is None:
+        return None
+    found = _ensure_pattern(pattern).search(text)
+    if not found:
+        return None
+    return _code_and_group(found)[0]
+
+
+def extract_code_detail(
+    pattern: Optional[str | re.Pattern[str]], text: str
+) -> dict[str, Any]:
+    """试提取的**详细**结果，供面板把「到底抓到了什么」摊开给用户看。
+
+    返回 ``{"matched", "full", "groups", "code", "from_group"}``：
+    ``full`` 是整段匹配、``groups`` 是全部捕获组（``None`` 原样保留，用 ``(x)?``
+    写的可选组也在列表里，面板按序号渲染即可）、``code`` 是引擎真正会用的值、
+    ``from_group`` 是它来自第几个捕获组（``0`` = 整段匹配）。没匹配上时 ``full``
+    与 ``code`` 都是 ``None``、``groups`` 是空列表。
+
+    ``code`` 走的就是 :func:`extract_code` 用的 :func:`_code_and_group` —— 面板与
+    引擎不可能给出两个不一样的答案（这正是用户投诉「抓到的跟我想要的不一样」时
+    最需要的保证）。
+
+    正则写错时 ``re.error`` 会往外抛，由调用方（HTTP 层）翻成一句人话。
+    """
+    compiled = _ensure_pattern(pattern) if pattern is not None else None
+    found = compiled.search(text) if compiled is not None else None
+    if found is None:
+        return {
+            "matched": False,
+            "full": None,
+            "groups": [],
+            "code": None,
+            "from_group": None,
+        }
+    code, from_group = _code_and_group(found)
+    return {
+        "matched": True,
+        "full": found.group(0),
+        "groups": list(found.groups()),
+        "code": code,
+        "from_group": from_group,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 按钮小工具
 # --------------------------------------------------------------------------- #
 def iter_inline_buttons(message: Any) -> list[Any]:
@@ -705,18 +789,13 @@ class RegGrabHunter:
 
     @staticmethod
     def _extract_code(task: PreparedTask, text: str) -> Optional[str]:
-        """按任务的 ``code_pattern`` 提取注册码：第一个非空捕获组，没有捕获组就用整个匹配。"""
-        pattern = task.code_pattern
-        if pattern is None:
-            return None
-        found = pattern.search(text)
-        if not found:
-            return None
-        if found.groups():
-            for group in found.groups():
-                if group:
-                    return group
-        return found.group(0)
+        """按任务的 ``code_pattern`` 提取注册码。
+
+        真正的规则只有一份，在模块级 :func:`extract_code` 里（第一个非空捕获组，
+        没有捕获组才用整个匹配）。抽出去是为了让面板的「测试提取」跑**同一条**
+        逻辑 —— 在路由里另抄一遍，"测试说能抓、实际抓不到"是迟早的事。
+        """
+        return extract_code(task.code_pattern, text)
 
     # ------------------------------------------------------------------ #
     def _note_usage(self, message: Any, chat_id: int) -> None:
@@ -1293,6 +1372,8 @@ __all__ = [
     "StepResult",
     "button_label",
     "code_value_of",
+    "extract_code",
+    "extract_code_detail",
     "iter_inline_buttons",
     "step_label",
     "visible_code_part",

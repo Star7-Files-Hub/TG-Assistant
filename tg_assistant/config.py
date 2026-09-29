@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -430,6 +431,44 @@ class ForwardUsedCodes(StrictModel):
         if value:
             _check_regex(value, "forward.used_codes.notice_pattern")
         return value
+
+
+class ForwardExcludes(StrictModel):
+    """转发「全局排除」名单：**所有账号共用一份**（``data/forward_excludes.json``）。
+
+    用户原话：「将转发规则的黑名单及排除的频道也做成全局的」。线上两个账号的
+    这两份名单本来完全一样（2026-09-29 取证），却要在面板里一个账号填一遍。
+    放进这个模型的是"写一次管全部账号"的那份。
+
+    与账号级的 :attr:`ForwardConfig.exclude_chats` / :attr:`ForwardConfig.exclude_users`
+    是**并集**关系，不是替换：
+    * 全局（本模型）—— 所有账号都要排除的（典型：那个刷屏的频道、那个转发机器人）；
+    * 账号级 —— 只有这个号要排除的（各账号的来源本来就不同）。
+
+    用 :data:`ChatRef` 而不是 ``str``：面板传上来的 ``"-1003932130542"`` 必须
+    归一化成 ``int``，否则引擎里按 username 去比对，永远匹配不上数字 id
+    （同一条判断抄两份就是这个项目踩过的坑，所以这里复用同一个类型）。
+    """
+
+    exclude_chats: list[ChatRef] = Field(default_factory=list)
+    exclude_users: list[ChatRef] = Field(default_factory=list)
+
+    # 与账号级那一对**共用同一个归一化**（``_normalize_refs`` → ``parse_chat_ref``）：
+    # 面板传上来的是字符串 ``"-1003932130542"``，不归一化就会被当成 username，
+    # 引擎按数字 id 比对时永远匹配不上（"名单存进去了却拦不住"这类 bug 最难查）。
+    # 「同一条判断抄两份」是这个项目踩过的坑，所以这里直接调同一个函数。
+    @field_validator("exclude_chats", "exclude_users", mode="before")
+    @classmethod
+    def _normalize_exclude_lists(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, (str, int)):
+            value = [value]
+        return _normalize_refs(value)
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.exclude_chats or self.exclude_users)
 
 
 class ForwardConfig(StrictModel):
@@ -1222,7 +1261,10 @@ class RegGrabTask(StrictModel):
     完整性交给 :attr:`ready` / :attr:`problem` 判断，由 API 与引擎各自给出提示。
     """
 
-    id: str
+    #: 任务主键。**允许留空** —— 留空时由 :class:`RegGrabConfig` 自动生成一个
+    #: （见 :func:`_auto_task_id`）。用户原话：「名称填了就行，ID 自动生成一个」：
+    #: 这条 id 是内部主键，让每个只想抢码的人先编一个英文 id 是纯负担。
+    id: str = ""
     name: Optional[str] = None
     enabled: bool = True
     #: 监听的会话；为空表示所有会话。
@@ -1252,9 +1294,22 @@ class RegGrabTask(StrictModel):
 
     @field_validator("id", mode="before")
     @classmethod
-    def _check_id(cls, value: Any) -> Any:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("抢注任务 id 不能为空")
+    def _normalize_id(cls, value: Any) -> str:
+        """只做归一化，**不**在这里生成 id。
+
+        🔴 生成必须放在 :class:`RegGrabConfig` 那层：字段校验器看不到兄弟任务，
+        用户把一条任务「复制一份改改名字」时两条都会走到这里，各自随机/各自取名字
+        片段，生成出**同一个** id，接着撞上唯一性校验 —— 用户只看到「保存失败」，
+        根本猜不到是"名字重了"。唯一能同时看到所有任务 id 的地方只有父模型的
+        ``model_validator``。
+
+        ``None`` 当成空串（前端 JSON 里 null 与 "" 都会出现），非字符串直接报错：
+        静默 ``str()`` 会把 ``id: 123`` 这种前端 bug 藏起来。
+        """
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("抢注任务 id 必须是字符串")
         return value.strip()
 
     @field_validator("chats", "exclude_chats", mode="before")
@@ -1335,6 +1390,56 @@ def _migrate_legacy_reg_grab(data: Any) -> Any:
     return {**rest, "tasks": [task]}
 
 
+def _ascii_slug(name: str) -> Optional[str]:
+    """把任务名称压成一段 ASCII 安全片段，抽不出来返回 ``None``。
+
+    规则：转小写、所有非 ASCII 字母数字的字符当分隔符、合并连续分隔符、
+    去掉首尾 ``-``。``"主群 Register #1"`` ⇒ ``"register-1"``。
+
+    纯中文名（``"主群注册码"``）会得到空串 ⇒ ``None``：要给它生成"好看"的 id
+    就得做音译，多音字与生僻字都得处理，收益远不抵复杂度 —— 退回随机 id 至少
+    不难看，用户也可以随时手填一个。长度封顶是为了防「把一整句话贴进名称框」
+    时生成一条几十个字符的主键。
+    """
+    lowered = name.lower()
+    slug = "-".join(
+        part
+        for part in "".join(
+            ch if (ch.isascii() and ch.isalnum()) else "-" for ch in lowered
+        ).split("-")
+        if part
+    )
+    if not slug:
+        return None
+    return slug[:40].rstrip("-") or None
+
+
+def _auto_task_id(name: Optional[str], taken: set[str]) -> str:
+    """给「没填 id」的抢注任务生成一个 id：优先用名称里的 ASCII 片段，否则短随机。
+
+    ``taken`` 必须包含**同一次保存里所有已知 id**（含本次刚生成的）：复制一条任务
+    再改改是常规操作，两条同名任务若各自生成同一个 id，撞上唯一性校验后用户只会
+    看到「保存失败」。撞名时追加 ``-2`` / ``-3`` …，比再随机一个更好认。
+
+    id 一旦写进 config.json 就不再变化 —— 生成只发生在「这条任务还没有 id」时，
+    所以重新加载配置天然稳定（面板刷新看到的还是同一个）。
+    """
+    base = _ascii_slug(name or "")
+    if base is not None:
+        if base not in taken:
+            return base
+        index = 2
+        while f"{base}-{index}" in taken:
+            index += 1
+        return f"{base}-{index}"
+    # 中文名 / 空名：退回短随机。用 hex 而不是递增序号，是为了两个账号、两次保存
+    # 之间也不容易撞上（序号还得先扫一遍已有 id 才能接着排）。
+    while True:
+        candidate = f"task-{random.getrandbits(32):08x}"
+        if candidate not in taken:
+            return candidate
+
+
 class RegGrabConfig(StrictModel):
     """抢注账号级配置：任务列表 + 并发上限（对齐 :class:`RedPacketConfig`）。
 
@@ -1355,7 +1460,25 @@ class RegGrabConfig(StrictModel):
         return _migrate_legacy_reg_grab(data)
 
     @model_validator(mode="after")
-    def _unique_ids(self) -> "RegGrabConfig":
+    def _assign_ids(self) -> "RegGrabConfig":
+        """给留空的 id 补一个，然后照旧查唯一性。
+
+        两件事在**同一个校验器**里做，是因为它们看到的必须是同一份事实：先生成、
+        再查重，用户手打的重复 id 依旧是错误（那是他该改的），而自动生成的那些
+        保证互不重复。
+
+        ⚠️ 生成必须在这里而不是 :class:`RegGrabTask` 里 —— 只有父模型同时看得见
+        所有任务。见 :func:`_auto_task_id`。
+        """
+        taken = {task.id for task in self.tasks if task.id}
+        for task in self.tasks:
+            if task.id:
+                continue
+            # 赋值走的是 ``RegGrabTask`` 的 validate_assignment，只归一化这一个字段，
+            # 不会反过来触发「必须有步骤/正则」之类的完整性校验（那是 ready 的事）。
+            task.id = _auto_task_id(task.name, taken)
+            taken.add(task.id)
+
         seen: set[str] = set()
         for task in self.tasks:
             if task.id in seen:
@@ -1468,6 +1591,9 @@ class CloudflareIPConfig(StrictModel):
     #: 实时监听：账号在线时是否监听源频道的新消息。
     #: 关闭后只走定时轮询 / 手动触发。
     real_time_listen: bool = True
+    #: 更新后是否推送通知（``⚡ Cloudflare IP 已更新`` / ``⚠️ Cloudflare IP 更新失败``）。
+    #: 关闭后**只是不打扰**：DNS 更新、``persist_run`` 落盘、日志一律照旧。
+    notify: bool = True
 
     @field_validator("min_speed_threshold_by_isp", mode="before")
     @classmethod
@@ -1768,6 +1894,7 @@ __all__ = [
     "CONFIG_VERSION",
     "ChatRef",
     "ForwardConfig",
+    "ForwardExcludes",
     "ForwardUsedCodes",
     "ForwardMode",
     "ForwardRule",

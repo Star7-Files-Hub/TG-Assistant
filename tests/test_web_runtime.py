@@ -822,3 +822,61 @@ async def test_cf_loop_drops_backoff_when_feature_disabled(
     await asyncio.wait_for(manager._cloudflare_ip_loop(), DEADLOCK_GUARD)
 
     assert "acct" not in manager._cf_backoff
+
+
+async def test_cf_loop_still_updates_when_notify_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """关了通知 ≠ 关了功能：定时调度照旧抓取、更新、落盘。
+
+    🔴 回归方向：这个开关最容易写错的地方就是把它当成功能总闸
+    （在 ``_on_message`` / 调度循环开头 ``if not config.notify: return``），
+    于是用户只是想安静点，结果 IP 再也不更新了。
+    """
+    from tg_assistant.cloudflare_ip import (
+        DNSUpdateResult,
+        IPFetchResult,
+        UpdateSummary,
+    )
+
+    clock = _VirtualTime()
+    _patch_loop_clock(monkeypatch, clock)
+    store = _LoopStore(_cf_config(interval_hours=1.0))
+    store.cf_config.notify = False
+    manager = _loop_manager(monkeypatch, store)
+
+    stopped: list[bool] = []
+
+    class _FakeClient:
+        async def stop(self, block: bool = False) -> None:
+            stopped.append(True)
+
+    async def _fake_source(*args: Any, **kwargs: Any) -> Any:
+        return _FakeClient(), object()
+
+    async def _fake_fetch(*args: Any, **kwargs: Any) -> Any:
+        return UpdateSummary(
+            fetched=IPFetchResult(fastest="172.64.147.52", fastest_speed=111.14),
+            results=[
+                DNSUpdateResult(
+                    domain="example.cc",
+                    name="yx",
+                    record_type="A",
+                    ip="172.64.147.52",
+                    ok=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "tg_assistant.cloudflare_ip.make_message_source_from_account", _fake_source
+    )
+    monkeypatch.setattr("tg_assistant.cloudflare_ip.fetch_and_update", _fake_fetch)
+    monkeypatch.setattr("tg_assistant.proxy.resolve_proxy", lambda *a, **k: None)
+
+    clock.limit = 2
+    await asyncio.wait_for(manager._cloudflare_ip_loop(), DEADLOCK_GUARD)
+
+    assert store.saved == 1, "notify=False 时定时调度也必须照常落盘"
+    assert store.state["cloudflare_ip_last_result"]["ok_count"] == 1
+    assert len(stopped) == 1, "临时 client 仍然要停掉"

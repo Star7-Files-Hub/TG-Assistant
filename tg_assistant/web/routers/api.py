@@ -460,51 +460,157 @@ def _run_match_test(payload: dict[str, Any]) -> dict[str, Any]:
     抽成独立函数是因为有两个入口 —— 带账号路径的旧地址，以及页面去掉
     「先选账号」之后新增的全局地址（见 :func:`api_rules_test_global`）。
     匹配逻辑本身跟账号毫无关系，两边必须给出完全一样的结果。
+
+    🔴 这里回答的是**整条规则的文本级判定**，不是"主正则匹配到了没有"：
+    以前只拿 ``pattern`` 跑一遍主正则，用户在「排除规则」里加了 ``21点`` 之后，
+    测试按钮照样显示「匹配成功」，于是用户认定"排除没用"（真实原因只是测试器
+    压根没把 ``exclude_patterns`` 算进去）。所以现在：
+
+    * 判定**全部**交给 :class:`tg_assistant.matching.CompiledMatcher`（引擎本人）——
+      测试器和引擎各写一套 ``re`` 是这个面板踩过的坑：标志一改两边答案就不一样，
+      而用户只会信测试器。这里连"哪条排除规则命中的"都是用引擎逐条重跑问出来的
+      （:func:`_hit_exclude_patterns`），没有第二套匹配实现。
+    * 入参向后兼容：老的 ``pattern``（单个字符串）继续可用，新的 ``patterns`` /
+      ``exclude_patterns`` 列表优先。页面以前自己用 ``|`` 拼主正则，那会让捕获组
+      编号和引擎（逐条模式、取命中那条的组）对不上，现在也一并修好了。
     """
     import re
 
-    from tg_assistant.matching import compile_user_pattern
+    from tg_assistant.config import MatchConfig
+    from tg_assistant.matching import CompiledMatcher, compile_user_pattern
 
-    pattern = str(payload.get("pattern", ""))
+    def _as_list(value: Any) -> list[str]:
+        """``patterns`` / ``exclude_patterns`` 允许传字符串或列表（老入参是字符串）。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value else []
+        return [str(item) for item in value if str(item).strip()]
+
+    patterns = _as_list(payload.get("patterns"))
+    if "patterns" not in payload:
+        patterns = _as_list(payload.get("pattern", ""))
+    exclude_patterns = _as_list(payload.get("exclude_patterns"))
     text = str(payload.get("text", ""))
     mode = str(payload.get("mode", "regex"))
     ignore_case = bool(payload.get("ignore_case", True))
 
-    if not pattern:
+    if mode not in ("regex", "contains", "exact", "all"):
+        # 老实现里未知 mode 落到「始终匹配」（页面只可能发这四个），保持这个口径
+        return {"match": True, "message": "all 模式始终匹配"}
+    # all 模式本来就"不做文本判断"，主正则可以是空的（引擎允许）
+    if not patterns and mode != "all":
         return {"match": False, "error": "正则表达式为空"}
     if not text:
         return {"match": False, "error": "测试文本为空"}
 
     if mode == "regex":
-        try:
-            # 🔴 必须走 ``compile_user_pattern``：它和转发引擎（``CompiledMatcher``）
-            # 用的是**同一份** flags。这里曾经是裸的 ``re.compile(pattern,
-            # IGNORECASE)`` —— 两边各写各的，引擎哪天调了标志（比如加
-            # ``re.MULTILINE``），测试器就会给出**不一样**的答案，
-            # 而用户理所当然地会信测试器，然后认定"你们的匹配坏了"。
-            compiled = compile_user_pattern(pattern, ignore_case=ignore_case)
-        except re.error as exc:
-            return {"match": False, "error": f"正则表达式无效: {exc}"}
-        found = compiled.search(text)
-        if not found:
-            return {"match": False}
-        groups = found.groups()
-        return {
-            "match": True,
-            "full_match": found.group(0),
-            "groups": [group for group in groups if group] if groups else [],
-            "span": list(found.span()),
+        # 逐条预编译只是为了把"哪一条写错了"说清楚：CompiledMatcher 一次编译整组，
+        # 抛出来的 re.error 里不带是哪条。编译仍用引擎同一个 compile_user_pattern。
+        for raw in patterns + exclude_patterns:
+            try:
+                compile_user_pattern(raw, ignore_case=ignore_case)
+            except re.error as exc:
+                return {"match": False, "error": f"正则表达式无效: {exc}"}
+
+    config = MatchConfig(
+        mode=mode,  # type: ignore[arg-type]
+        patterns=patterns,
+        exclude_patterns=exclude_patterns,
+        ignore_case=ignore_case,
+    )
+    result = CompiledMatcher(config).match_text(text)
+
+    if result.matched:
+        out: dict[str, Any] = {"match": True}
+        if mode == "all":
+            out["message"] = "all 模式始终匹配"
+        else:
+            # 引擎告诉我们命中的是**哪一条**（result.keyword），这里只负责把那条的
+            # 捕获组/span 取出来给界面看 —— 搜索顺序依然是引擎定的。
+            if result.keyword:
+                out["matched_pattern"] = result.keyword
+            if mode == "regex" and result.keyword:
+                found = compile_user_pattern(result.keyword, ignore_case=ignore_case).search(text)
+                if found is not None:
+                    groups = found.groups()
+                    out["full_match"] = found.group(0)
+                    out["groups"] = [group for group in groups if group] if groups else []
+                    out["span"] = list(found.span())
+            if result.groups:
+                out.setdefault("groups", [group for group in result.groups if group])
+        return out
+
+    if result.reason == "命中排除规则":
+        # ⚠️ 只有**主条件已经命中**、排除规则才可能被引擎检查到（regex/contains/exact
+        # 都是先命中主模式再判排除；all 模式则总是先判排除）。所以这里报"被拦下"
+        # 永远不会把"主正则本来就不命中"的消息误报成"被排除"。
+        hits = _hit_exclude_patterns(config, text)
+        named = "、".join(f"「{pattern}」" for pattern in hits)
+        if mode == "all":
+            message = f"该规则是 all 模式（来源对了就算命中），但文本命中排除规则{named} ⇒ 不会转发"
+        else:
+            message = f"主条件命中，但被排除规则{named}拦下 ⇒ 不会转发"
+        out = {
+            "match": False,
+            "excluded": True,
+            "excluded_by": hits,
+            "reason": result.reason,
+            "message": message,
+            "primary": _primary_hit(config, text, ignore_case=ignore_case),
         }
+        return out
 
-    if mode == "contains":
-        matched = pattern.lower() in text.lower() if ignore_case else pattern in text
-        return {"match": matched}
+    out = {"match": False}
+    if result.reason:
+        out["reason"] = result.reason
+    return out
 
-    if mode == "exact":
-        matched = pattern.lower() == text.lower() if ignore_case else pattern == text
-        return {"match": matched}
 
-    return {"match": True, "message": "all 模式始终匹配"}
+def _hit_exclude_patterns(config: Any, text: str) -> list[str]:
+    """到底哪几条排除规则命中了。
+
+    做法是**让引擎自己回答**：逐条把它从排除列表里去掉再跑一遍，如果结果从
+    "被排除"变成"命中"，去掉的那条就是肇事者。不去给每条排除单独建一个
+    "只有它"的匹配器 —— 那等于把 ``mode`` 各分支的语义（regex/contains/exact/all
+    对排除的处理并不一样）在 api.py 里再抄一遍，正是要避免的事。
+    """
+    from tg_assistant.matching import CompiledMatcher
+
+    hits: list[str] = []
+    for index, raw in enumerate(config.exclude_patterns):
+        rest = [p for i, p in enumerate(config.exclude_patterns) if i != index]
+        probe = config.model_copy(update={"exclude_patterns": rest})
+        if CompiledMatcher(probe).match_text(text).matched:
+            hits.append(raw)
+    return hits
+
+
+def _primary_hit(config: Any, text: str, *, ignore_case: bool) -> dict[str, Any]:
+    """被排除规则拦下时，顺手把"主条件本来匹配到了什么"取出来。
+
+    用户看到「被 21点 拦下」的第一反应往往是"那它到底匹配到哪儿了" —— 不给出来
+    就得自己猜。同样走引擎（把排除列表清空再跑一次），主模式一条都不命中时返回空。
+    """
+    from tg_assistant.matching import CompiledMatcher, compile_user_pattern
+
+    primary: dict[str, Any] = {}
+    if config.mode == "all":
+        return primary
+    probe = config.model_copy(update={"exclude_patterns": []})
+    hit = CompiledMatcher(probe).match_text(text)
+    if not hit.matched:
+        return primary
+    if hit.keyword:
+        primary["pattern"] = hit.keyword
+    if hit.groups:
+        primary["groups"] = [group for group in hit.groups if group]
+    if config.mode == "regex" and hit.keyword:
+        found = compile_user_pattern(hit.keyword, ignore_case=ignore_case).search(text)
+        if found is not None:
+            primary["full_match"] = found.group(0)
+            primary["span"] = list(found.span())
+    return primary
 
 
 @router.post("/config/{name}/rules/test")
@@ -601,6 +707,55 @@ async def api_forward_set_exclude_users(
         raise HTTPException(status_code=400, detail=f"黑名单校验失败：{exc}") from exc
     store.save_account_config(name, config)
     return {"ok": True, "exclude_users": list(config.forward.exclude_users)}
+
+
+@router.put("/forward-excludes")
+async def api_set_forward_excludes(
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """**全局**排除名单（所有账号共用一份）：排除频道（群 id）+ 发送者黑名单。
+
+    用户原话：「将转发规则的黑名单及排除的频道也做成全局的」、
+    「我设置的群id就不要转给我了」。
+
+    🔴 **为什么要跨账号一份**：2026-09-29 线上取证 —— 两个账号（小白 / SevenStar）
+    的这两份名单**一模一样**（``-1003932130542`` / ``8817602576``）：同一份名单存了两遍，
+    面板上还得一个账号填一次。加一个账号就多填一遍，漏填一个账号 = 那个号照转。
+
+    与 ``/config/{name}/forward-exclude-*``（账号级）是**并集**关系，不是替换：
+    这里写一次管所有账号（典型：那个刷屏频道），账号级那份留给"只有这个号要排除的"。
+
+    命中这里的群 id 之后**既不转发、也不会推给你** —— 通知是转发成功之后才发的
+    （见 ``ForwardEngine._send``），没有转发就没有通知。
+
+    只更新 body 里出现的键（``exclude_chats`` / ``exclude_users``）：
+    面板一次改一个名单，不必先读后写整份，免得两个名单互相覆盖。
+    """
+    from tg_assistant.config import ForwardExcludes
+    from tg_assistant.forward_excludes import ForwardExcludeStore
+
+    allowed = {"exclude_chats", "exclude_users"}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"不认识的字段：{'、'.join(unknown)}")
+    if not payload:
+        raise HTTPException(
+            status_code=400, detail="至少要给一个名单（exclude_chats / exclude_users）"
+        )
+
+    exclude_store = ForwardExcludeStore(store.paths.forward_excludes_file)
+    current = exclude_store.load()
+    # 交给模型校验（数字 id 归一化成 int、去 @、去空白、拒绝重复）——
+    # 与账号级那两份共用同一个类型，避免"同一个判断抄两份"。
+    try:
+        excludes = ForwardExcludes.model_validate(
+            {**current.model_dump(mode="json"), **payload}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"排除名单校验失败：{exc}") from exc
+    exclude_store.save(excludes)
+    return {"ok": True, **excludes.model_dump(mode="json")}
 
 
 @router.put("/config/{name}/forward-used-codes")
@@ -805,7 +960,22 @@ async def api_rules_overview(
                 "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
             }
         )
-    return {"accounts": accounts}
+    # 「全局排除」名单：**所有账号共用一份**（``data/forward_excludes.json``）。
+    # 放在响应顶层而不是塞进每个账号：它本来就只有一份，塞进去就等于把
+    # "两个号存着同一份名单"这个毛病原样搬到接口里（面板会渲染成页面顶部一个区块）。
+    from tg_assistant.forward_excludes import ForwardExcludeStore
+
+    exclude_store = ForwardExcludeStore(store.paths.forward_excludes_file)
+    global_excludes = exclude_store.load()
+    return {
+        "accounts": accounts,
+        "global_excludes": {
+            **global_excludes.model_dump(mode="json"),
+            # 读文件失败过几次。>0 说明磁盘上那份名单没读到，此刻是**按空名单**在跑 ——
+            # 面板据此提示，而不是让用户对着一个"看起来配好了"的界面发呆。
+            "load_errors": exclude_store.load_errors,
+        },
+    }
 
 
 @router.post("/rules")
@@ -1174,6 +1344,40 @@ async def api_reg_grab_test_notify(
     return {"ok": True, "detail": "测试通知已提交，去机器人那边看看收到没有。"}
 
 
+@router.post("/reg_grab/test_extract")
+async def api_reg_grab_test_extract(payload: dict[str, Any]) -> dict[str, Any]:
+    """试跑「注册码提取正则」，把**到底抓到了什么**完整回给面板。
+
+    为什么另开一个端点而不是复用 ``/rules/test``：转发页在用它，它返回的是
+    「匹配到了没有 + 捕获组列表」，而抢注要回答的是一个更具体的问题 ——
+    「引擎会把哪个值当成 ``{code}``，它是从第几个捕获组来的」。
+    用户原话「我想要 XYING-Whitelist_4rLuucEgs5，但只匹配到 4rLuucEgs5」，
+    答案就在 ``from_group`` 上：他的正则把捕获组只括在了后缀上。
+
+    也不需要账号上下文：提取跟账号毫无关系，页面就不用先选账号。
+
+    ⚠️ 这里**不改提取语义**（第一个非空捕获组，没有捕获组才用整段），只是把它
+    显示出来 —— 改语义会一次性改坏所有靠捕获组拼 ``{code}`` 的老任务。
+    """
+    import re
+
+    from tg_assistant.reg_grab import extract_code_detail
+
+    pattern = str(payload.get("pattern", "") or "")
+    text = str(payload.get("text", "") or "")
+    if not pattern:
+        return {"matched": False, "error": "正则表达式为空", "code": None}
+    if not text:
+        return {"matched": False, "error": "测试文本为空", "code": None}
+    try:
+        # 走引擎同一个 ``extract_code_detail``：编译标志、取组规则都跟真正动手时
+        # 一模一样，否则测试器说"能抓"、引擎却抓不到，用户只会更困惑。
+        return extract_code_detail(pattern, text)
+    except re.error as exc:
+        # 正则写错是用户最常见的输入错误，要给一句能看懂的话而不是 500。
+        return {"matched": False, "error": f"正则表达式无效: {exc}", "code": None}
+
+
 # --------------------------------------------------------------------------- #
 # Cloudflare 优选 IP 自动更新
 # --------------------------------------------------------------------------- #
@@ -1246,6 +1450,10 @@ async def api_cloudflare_ip_put(
     ⚠️ 面板读回来的 ``api_token`` 是脱敏的（``A1b2C3***``）。
     若原样提交回来，会把脱敏值当成新 token 存下去。
     所以：脱敏形态的值一律忽略，保留原有 token。
+
+    ``notify``（「更新后发送通知」复选框）和 ``real_time_listen`` 一样，
+    由面板提交、经下面的 ``model_validate`` 整体写回 —— 不需要单独分支；
+    请求体里没带该字段时沿用模型默认值 ``True``。
     """
     from tg_assistant.config import CloudflareIPConfig
 
@@ -1572,6 +1780,7 @@ async def api_cloudflare_ip_status(
     return {
         "enabled": cf_config.enabled,
         "real_time_listen": cf_config.real_time_listen,
+        "notify": cf_config.notify,
         "listener_running": listener_running,
         "split_by_isp": cf_config.split_by_isp,
         "min_speed_threshold": cf_config.min_speed_threshold,

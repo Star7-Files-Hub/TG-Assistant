@@ -32,6 +32,25 @@
         </div>
     </div>
 
+    <!-- 全局排除名单（所有账号共用一份）。
+         与每个账号分组里那份的区别只在"存哪儿"：这里存 data/forward_excludes.json，
+         一份名单所有账号一起生效；账号级那份存各账号自己的 config.json，两者取并集。
+         线上两个账号的名单本来完全一样（各存一份、面板上要填两遍），用户原话：
+         「将转发规则的黑名单及排除的频道也做成全局的」「我设置的群id就不要转给我了」。 -->
+    <div class="rules-global" id="rules-global">
+        <div class="rules-global-header">
+            <div>
+                <h2>全局排除（所有账号共用）</h2>
+                <p class="text-muted">
+                    这里填一次的群 id / 用户，<strong>所有账号</strong>都不再转发，也不会再推送给你
+                    （没有转发就没有通知）。下面每个账号里那份是"只有这个号要排除"的，两者同时生效。
+                </p>
+            </div>
+            <span class="rules-global-state" id="rules-global-state"></span>
+        </div>
+        <div class="rules-global-body" id="rules-global-body"></div>
+    </div>
+
     <!-- 规则列表：按账号分组渲染，每组的标题栏带该账号的转发总开关与启停 -->
     <div class="rules-list" id="rules-list">
         <div class="rules-empty" id="rules-empty">
@@ -58,6 +77,10 @@
         </div>
         <div class="tg-modal-body">
             <div class="tg-rule-form">
+                <!-- 已存配置里的"永远匹配不到"值：只在编辑时出现，只提示、不拦保存。
+                     老规则里那些人名/昵称是**修复前**被静默存进去的，用户一直不知道
+                     它们没生效 —— 打开编辑器就说清楚，比让他继续等强。 -->
+                <p class="form-hint form-hint-warn" id="rule-refs-warn" style="display:none"></p>
                 <!-- 基本信息 -->
                 <div class="form-section">
                     <h3>基本信息</h3>
@@ -109,6 +132,10 @@
                                 <div class="tag-list" id="from-users-list"></div>
                                 <input type="text" id="from-users-field" placeholder="只转发这些人（按回车添加）" />
                             </div>
+                            <!-- 用户填人名"加不上"就是因为这个：Telegram 只有数字 ID 和
+                                 @username 能对上，昵称对不上。写清楚比让他试半天强。 -->
+                            <p class="form-hint">只能填数字 ID（如 7002057019）或 @username。
+                                人名 / 中文昵称 Telegram 匹配不到，填了不会生效。</p>
                         </div>
                         <div class="tg-input-group">
                             <label>发送者黑名单</label>
@@ -116,7 +143,8 @@
                                 <div class="tag-list" id="exclude-users-list"></div>
                                 <input type="text" id="exclude-users-field" placeholder="这些人发的一律不转发（按回车添加）" />
                             </div>
-                            <p class="form-hint">只对<strong>本规则</strong>生效；要全账号通用，请用分组标题下的「发送者黑名单」。</p>
+                            <p class="form-hint">只对<strong>本规则</strong>生效；要全账号通用，请用下方「各账号单独设置」里的「发送者黑名单」。</p>
+                            <p class="form-hint">只能填数字 ID 或 @username；人名 / 中文昵称匹配不到。</p>
                         </div>
                     </div>
                 </div>
@@ -278,6 +306,11 @@
     let editingRuleId = null;
     // 编辑时这条规则当前落在哪些账号（用来锁定弹窗里的账号选择器）
     let editingOwners = [];
+    // 全局排除名单（所有账号共用一份，见 /api/forward-excludes）。
+    // 数据源依旧是后端响应，不在前端另存状态 —— 避免"界面显示的和磁盘里的不一致"。
+    let globalExcludes = {exclude_chats: [], exclude_users: []};
+    // 全局名单文件读失败过几次（>0 = 磁盘上那份没读到，此刻按空名单在跑）。
+    let globalExcludesErrors = 0;
 
     // Tag input 数据
     const tagInputs = {
@@ -309,6 +342,13 @@
         list.addEventListener('change', onRuleListChange);
         // 「排除频道 / 黑名单」的输入框是列表渲染出来的，用委托比每渲染一次挂一次监听可靠
         list.addEventListener('keydown', onExcludeListKeydown);
+        // 全局排除区块在 #rules-list **外面**（它不属于任何一个账号分组），
+        // 所以要单独挂一次委托 —— 复用同一对处理函数，避免两套交互各写一遍。
+        const globalBox = document.getElementById('rules-global');
+        if (globalBox) {
+            globalBox.addEventListener('click', onRuleListClick);
+            globalBox.addEventListener('keydown', onExcludeListKeydown);
+        }
         // 标签上的删除按钮同理（虽然 field 来自固定列表、index 是数字，
         // 但让「内联 handler 不带数据」这条约束没有例外更省心）
         document.getElementById('rule-modal').addEventListener('click', onModalClick);
@@ -327,6 +367,9 @@
             return;
         }
         accounts = data.accounts || [];
+        // 全局排除名单：响应顶层只有一份（所有账号共用），不是每个账号一份。
+        globalExcludes = data.global_excludes || {exclude_chats: [], exclude_users: []};
+        globalExcludesErrors = globalExcludes.load_errors || 0;
         const btn = document.getElementById('btn-add-rule');
         btn.disabled = accounts.length === 0;
         btn.title = accounts.length === 0 ? '还没有账号，先去「账号」页添加' : '';
@@ -337,18 +380,44 @@
         return accounts.find(a => a.name === name);
     }
 
+    // 把「账号 → 规则」的响应**转置**成「规则 → 监听账号」。
+    //
+    // 为什么必须转置：同一条规则是扇出写到多个账号、每个账号各存一份的，按账号渲染
+    // 会让同一条规则在页面上出现 N 次，用户根本数不清自己有几条任务（原话：
+    // 「展示以及任务是以任务为维度，而不是以账号，同样的规则不做二次展现」）。
+    // 合并成一张主卡片后，「这条规则对哪些账号生效」改用勾选表达。
+    function collectRules() {
+        const order = [];
+        const byId = new Map();
+        accounts.forEach(acc => {
+            (acc.rules || []).forEach(rule => {
+                let entry = byId.get(rule.id);
+                if (!entry) {
+                    entry = {id: rule.id, rule: rule, owners: [], variants: new Map()};
+                    byId.set(rule.id, entry);
+                    order.push(entry);
+                }
+                entry.owners.push(acc.name);
+                entry.variants.set(acc.name, rule);
+            });
+        });
+        order.forEach(entry => {
+            // 各账号里那份是不是**一模一样**：正常扇出是一样的，但有人手改过某个账号的
+            // config.json、或走过一次只写单账号的接口时就会分叉。分叉必须在卡片上说出来
+            // —— 否则卡片显示一份、别的账号按另一份跑，而"编辑保存会覆盖所有监听账号"
+            // 又会把差异悄悄抹掉。
+            const primary = JSON.stringify(entry.rule);
+            entry.divergent = entry.owners.filter(
+                name => JSON.stringify(entry.variants.get(name)) !== primary
+            );
+        });
+        return order;
+    }
+
     // 找出某个 rule id 落在哪些账号里（规则级操作都是「所有拥有者一起改」）
     function findRule(ruleId) {
-        const owners = [];
-        let rule = null;
-        accounts.forEach(acc => {
-            const hit = acc.rules.find(r => r.id === ruleId);
-            if (hit) {
-                owners.push(acc.name);
-                if (!rule) rule = hit;
-            }
-        });
-        return rule ? {rule: rule, owners: owners} : null;
+        const entry = collectRules().find(item => item.id === ruleId);
+        return entry ? {rule: entry.rule, owners: entry.owners, divergent: entry.divergent} : null;
     }
 
     function statusOf(acc) {
@@ -360,18 +429,23 @@
     // ==================== 渲染 ====================
     function renderRules() {
         const list = document.getElementById('rules-list');
+        // 全局排除区块与"有没有账号 / 有没有规则"无关，所以放在两个提前返回**之前**：
+        // 一个账号都还没加的时候，正是最先把"这些群不要转给我"填上的时候。
+        renderGlobalExcludes();
         if (accounts.length === 0) {
             list.innerHTML = emptyBlock('还没有账号', '先去「账号」页添加一个 Telegram 账号，再回来配转发规则');
             return;
         }
-        if (accounts.every(acc => acc.rules.length === 0)) {
-            list.innerHTML = emptyBlock(
+        // 规则按 rule.id 合并（同一条规则扇出到 N 个账号也只出现一次），
+        // 账号各自的设置另起一节 —— 见 renderAccountSettings 里的说明。
+        const entries = collectRules();
+        const rulesHtml = entries.length
+            ? `<div class="rules-rule-list">${entries.map(renderRuleCard).join('')}</div>`
+            : emptyBlock(
                 '还没有转发规则',
                 '点击右上角「新建规则」开始创建；弹窗里一个账号都不勾就是写入全部账号'
             );
-            return;
-        }
-        list.innerHTML = accounts.map(renderAccountGroup).join('');
+        list.innerHTML = rulesHtml + renderAccountSettings();
         renderExcludeLists();
     }
 
@@ -384,9 +458,34 @@
             </div>`;
     }
 
+    // 账号维度：规则卡片按 rule.id 合并之后，账号各自的设置（转发总开关、账号级
+    // 排除名单、已使用注册码拦截）就不再挂在任何一张规则卡上了。单独收进这一节，
+    // 并默认折叠 —— 主视图留给规则，这些是"少数情况才来改一次"的东西。
+    //
+    // 折叠不影响功能：内容照样在 DOM 里（只是被 details 藏起来），
+    // renderExcludeLists 按选择器照样填得上标签。
+    function renderAccountSettings() {
+        // 每次 loadAll 都会重建 innerHTML。不把展开状态带过去的话，用户改一次名单
+        // （保存成功后会重拉）这一节就自己合上了，得重新点开 —— 白掉一次点击。
+        const prev = document.querySelector('.rules-account-settings');
+        const open = prev ? prev.open : false;
+        return `
+            <details class="rules-account-settings"${open ? ' open' : ''}>
+                <summary>
+                    <span class="rules-account-settings-title">各账号单独设置</span>
+                    <span class="rules-account-settings-sub">转发总开关 · 账号级排除名单 · 已使用注册码拦截</span>
+                </summary>
+                <div class="rules-account-settings-body">
+                    ${accounts.map(renderAccountGroup).join('')}
+                </div>
+            </details>`;
+    }
+
+    // 账号卡片：只放**账号自己的**东西。规则不在这里 —— 规则在上面的主卡片里，
+    // 一条规则一张，不随账号重复出现。
     function renderAccountGroup(acc) {
         const st = statusOf(acc);
-        const rules = acc.rules || [];
+        const ruleCount = (acc.rules || []).length;
         return `
             <div class="rules-account-group" data-account="${escapeHtml(acc.name)}">
                 <div class="rules-account-group-header">
@@ -394,7 +493,7 @@
                         <span class="status-dot ${st.cls}"></span>
                         <span class="rules-account-name">${escapeHtml(acc.name)}</span>
                         ${acc.username ? `<span class="rules-account-user">@${escapeHtml(acc.username)}</span>` : ''}
-                        <span class="rules-account-count">${st.text} · ${rules.length} 条规则</span>
+                        <span class="rules-account-count">${st.text} · 监听 ${ruleCount} 条规则</span>
                     </div>
                     <div class="rules-account-group-actions">
                         <label class="rules-master-toggle" title="该账号的转发总开关（改完自动生效，不用重启）">
@@ -417,11 +516,6 @@
                 </div>
                 ${excludeChatsRow(acc)}
                 ${usedCodesRow(acc)}
-                <div class="rules-account-group-body">
-                    ${rules.length
-                        ? rules.map(rule => renderRuleCard(acc, rule)).join('')
-                        : '<p class="rules-account-empty">该账号还没有规则</p>'}
-                </div>
             </div>`;
     }
 
@@ -438,6 +532,9 @@
             label: '排除频道',
             placeholder: '频道 ID 或 @username，回车添加；留空 = 不排除任何频道',
             hint: '这些会话所有规则都不监听。转发目标已由后端自动排除，不用重复填。',
+            // 全局那份的提示：强调"写一次管所有账号"，并把用户最关心的事说清 ——
+            // 排除掉之后**通知也不会再发**（通知是转发成功之后才发的）。
+            globalHint: '这些群 / 频道所有账号都不再转发，也不会再推送给你（没有转发就没有通知）。转发目标不用填，后端会自动排除。',
             added: n => `已排除 ${n} 个频道`,
             cleared: '已清空排除列表'
         },
@@ -445,24 +542,40 @@
             key: 'exclude_users',
             endpoint: 'forward-exclude-users',
             label: '发送者黑名单',
-            placeholder: '用户 ID 或 @username，回车添加；留空 = 不拉黑任何人',
-            hint: '这些人发的消息，即使命中了规则也不转发（该账号所有规则通用）。',
+            // 「只能填 ID 或 @username」必须写在能看见的地方：填人名会被后端当 username
+            // 存下来，看着加上了、实际永远匹配不到（见 refRejectReason 的说明）。
+            placeholder: '用户 ID 或 @username（人名匹配不到），回车添加；留空 = 不拉黑任何人',
+            hint: '这些人发的消息，即使命中了规则也不转发（该账号所有规则通用）。只能填数字 ID 或 @username。',
+            globalHint: '这些人发的消息，所有账号、所有规则都不转发。只能填数字 ID 或 @username。',
             added: n => `已拉黑 ${n} 个人`,
             cleared: '已清空黑名单'
         }
     };
 
-    function excludeListRow(acc, role) {
+    // 名单里的一个标签。两个名单、两种作用域（全局 / 账号级）共用同一段 HTML，
+    // 抄成四份的话，下次改样式或改删除逻辑一定会漏。
+    function excludeTags(items, role) {
+        return (items || []).map((tag, i) => `
+                    <span class="tag">${escapeHtml(String(tag))}<button type="button"
+                          data-exclude-remove="${i}" title="移除">×</button></span>`).join('');
+    }
+
+    function excludeListRow(acc, role, isGlobal) {
         const spec = EXCLUDE_LISTS[role];
-        const items = acc[spec.key] || [];
+        const items = (isGlobal ? globalExcludes[spec.key] : (acc && acc[spec.key])) || [];
+        // 作用域写进 DOM：全局那份只有 data-global="1"，没有 data-account ——
+        // 保存时要据此走 /api/forward-excludes（没有账号概念），
+        // 渲染时也不会去 accounts 里找一个不存在的账号。
+        const scopeAttr = isGlobal
+            ? 'data-global="1"'
+            : `data-account="${escapeHtml(acc.name)}"`;
         return `
             <div class="rules-account-exclude">
-                <span class="rules-account-exclude-label" title="${escapeHtml(spec.hint)}">
+                <span class="rules-account-exclude-label" title="${escapeHtml(isGlobal ? spec.globalHint : spec.hint)}">
                     ${spec.label}
                     ${items.length ? `<span class="rules-account-exclude-count">${items.length}</span>` : ''}
                 </span>
-                <div class="tag-input tag-input-compact" data-role="${role}"
-                     data-account="${escapeHtml(acc.name)}">
+                <div class="tag-input tag-input-compact" data-role="${role}" ${scopeAttr}>
                     <div class="tag-list" data-role="${role}-list"></div>
                     <input type="text" data-role="${role}-field"
                            placeholder="${escapeHtml(spec.placeholder)}" />
@@ -474,16 +587,65 @@
         return excludeListRow(acc, 'exclude-chats') + excludeListRow(acc, 'exclude-users');
     }
 
-    function renderRuleCard(acc, rule) {
+    // 全局排除区块：两个名单各一行，画在页面顶部（不在任何账号分组里）。
+    function renderGlobalExcludes() {
+        const body = document.getElementById('rules-global-body');
+        if (!body) return;
+        body.innerHTML = excludeListRow(null, 'exclude-chats', true)
+            + excludeListRow(null, 'exclude-users', true);
+        renderGlobalState();
+    }
+
+    // 顶部那个小状态：把"现在到底排除了什么"写在标题旁边。
+    // 文件读失败时**必须说出来**（此刻是按空名单在跑），
+    // 否则用户会对着一个"看起来配好了"的界面发呆，然后在群里看到消息照样转。
+    function renderGlobalState() {
+        const el = document.getElementById('rules-global-state');
+        if (!el) return;
+        if (globalExcludesErrors > 0) {
+            el.className = 'rules-global-state rules-global-state-warn';
+            el.textContent = `⚠ 名单文件读不到，当前按空名单运行（已失败 ${globalExcludesErrors} 次）`;
+            el.title = 'data/forward_excludes.json 读不到或格式不对。改一次名单即可重新写入。';
+            return;
+        }
+        const chats = (globalExcludes.exclude_chats || []).length;
+        const users = (globalExcludes.exclude_users || []).length;
+        el.className = 'rules-global-state';
+        el.textContent = chats || users
+            ? `生效中：${chats} 个频道 · ${users} 个发送者`
+            : '未设置';
+    }
+
+    // 监听账号那一行：勾上 = 把这条规则写进该账号，取消 = 从该账号移除这条规则。
+    // 这是"以规则为维度"的核心操作 —— 规则只有一条，它落到哪些账号由这里决定。
+    function ruleOwnersRow(entry) {
+        const picked = entry.owners.length;
+        return `
+                    <div class="rule-owners" data-role="rule-owners">
+                        <span class="rule-owners-label"
+                              title="勾上 = 把这条规则写进该账号；取消 = 从该账号移除这条规则。一个都不勾就会删掉这条规则。">
+                            监听账号
+                            <span class="rule-owners-count">${picked}/${accounts.length}</span>
+                        </span>
+                        <div class="rule-owners-list">
+                            ${accounts.map(acc => `
+                                <label class="tg-checkbox rule-owner">
+                                    <input type="checkbox" data-role="rule-owner"
+                                           value="${escapeHtml(acc.name)}"
+                                           ${entry.owners.includes(acc.name) ? 'checked' : ''} />
+                                    <span class="tg-checkmark"></span>
+                                    <span>${escapeHtml(acc.name)}</span>
+                                </label>`).join('')}
+                        </div>
+                    </div>`;
+    }
+
+    function renderRuleCard(entry) {
+        const rule = entry.rule;
         const match = rule.match || {};
         const patterns = match.patterns || [];
         const sources = rule.sources || [];
         const targets = rule.targets || [];
-        // 同一条规则通常会被扇出到多个账号，各存一份。标出「别处也有」，
-        // 否则用户会以为删了这里就删干净了（其实每份都是独立的）。
-        const shared = accounts
-            .filter(other => other.name !== acc.name && (other.rules || []).some(r => r.id === rule.id))
-            .map(other => other.name);
         return `
             <div class="rule-card ${rule.enabled ? '' : 'rule-disabled'}" data-rule-id="${escapeHtml(rule.id)}">
                 <div class="rule-card-header">
@@ -498,10 +660,10 @@
                         </div>
                     </div>
                     <div class="rule-card-actions">
-                        <button class="tg-btn tg-btn-sm tg-btn-ghost" data-action="edit" title="编辑">
+                        <button class="tg-btn tg-btn-sm tg-btn-ghost" data-action="edit" title="编辑（会改到所有监听账号）">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                         </button>
-                        <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="delete" title="删除">
+                        <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="delete" title="删除（会从所有监听账号删掉）">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
                         </button>
                     </div>
@@ -520,15 +682,7 @@
                             <div class="rule-flow-value">${targets.map(t => `<span class="rule-tag rule-tag-target">${escapeHtml(t)}</span>`).join('')}</div>
                         </div>
                     </div>
-                    ${patterns.length > 0 ? `
-                    <div class="rule-match">
-                        <div class="rule-match-label">
-                            <span class="badge-mode badge-${match.mode}">${({regex:'正则',contains:'包含',exact:'精确',all:'全部'})[match.mode] || match.mode}</span>
-                        </div>
-                        <div class="rule-patterns">
-                            ${patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('')}
-                        </div>
-                    </div>` : ''}
+                    ${patterns.length > 0 ? renderRulePatterns(match, patterns) : ''}
                     ${(rule.from_users || []).length || (rule.exclude_users || []).length ? `
                     <div class="rule-match">
                         <div class="rule-match-label">
@@ -539,9 +693,47 @@
                             ${(rule.exclude_users || []).length ? `<span class="rule-tag rule-tag-block">黑名单 ${(rule.exclude_users || []).length}</span>` : ''}
                         </div>
                     </div>` : ''}
-                    ${shared.length > 0 ? `<p class="rule-shared">这条规则也存在于 ${shared.map(escapeHtml).join('、')} —— 编辑 / 删除 / 启停会对所有账号一起生效</p>` : ''}
+                    ${ruleOwnersRow(entry)}
+                    ${entry.divergent.length > 0 ? `
+                    <p class="rule-shared rule-shared-warn">⚠ 各账号里的这份规则内容不一致（${entry.divergent.map(escapeHtml).join('、')}）—— 卡片按「${escapeHtml(entry.owners[0])}」那份显示；编辑保存会把全部监听账号覆盖成同一份。</p>` : ''}
                 </div>
             </div>`;
+    }
+
+    //: 规则卡片上"折叠"匹配条件的阈值：条数 ≥ 这个值就默认收起。
+    //: 线上那条规则配了 20 条正则（2026-09-29 取证），全铺出来能把一张卡片撑满一屏。
+    //: 用户原话：「正则规则不用全部展示，点击编辑或加个倒三角打开」。
+    //: 1-2 条时不折叠 —— 为了两条条件多一次点击只会更碍事。
+    const PATTERN_COLLAPSE_THRESHOLD = 3;
+
+    function renderRulePatterns(match, patterns) {
+        const mode = ({regex:'正则',contains:'包含',exact:'精确',all:'全部'})[match.mode] || match.mode;
+        const badge = `<span class="badge-mode badge-${match.mode}">${escapeHtml(mode)}</span>`;
+        const chips = patterns.map(p => `<code class="rule-pattern">${escapeHtml(p)}</code>`).join('');
+        if (patterns.length < PATTERN_COLLAPSE_THRESHOLD) {
+            return `
+                    <div class="rule-match">
+                        <div class="rule-match-label">${badge}</div>
+                        <div class="rule-patterns">${chips}</div>
+                    </div>`;
+        }
+        // 收起时给一条预览（第一条，超长截断）：卡片上仍能看出"这条规则大概匹配什么"，
+        // 而不是只剩一个数字 —— 数字本身不提供任何判断依据。
+        const unit = match.mode === 'regex' ? '条正则' : '条条件';
+        const preview = patterns[0].length > 24 ? patterns[0].slice(0, 24) + '…' : patterns[0];
+        // 用原生 <details>/<summary>：倒三角是浏览器画的、键盘可达、且不依赖额外 JS
+        // （面板整体是 JS 渲染的，能少一个失败点就少一个）。
+        return `
+                    <div class="rule-match">
+                        <details class="rule-patterns-details">
+                            <summary>
+                                ${badge}
+                                <span class="rule-patterns-count">${patterns.length} ${unit}</span>
+                                <code class="rule-pattern rule-pattern-preview">${escapeHtml(preview)}</code>
+                            </summary>
+                            <div class="rule-patterns">${chips}</div>
+                        </details>
+                    </div>`;
     }
 
     // 转义到「能安全放进双引号属性」的程度（多了引号两兄弟：
@@ -565,7 +757,15 @@
             const box = removeBtn.closest('[data-role]');
             const role = box && EXCLUDE_LISTS[box.dataset.role] ? box.dataset.role : '';
             if (role) {
-                removeExcludeItem(role, box.dataset.account, Number(removeBtn.dataset.excludeRemove));
+                // 全局那份的 DOM 上只有 data-global="1"（没有 data-account），
+                // 不看这个标记的话会去 accounts 里找一个叫 "" 的账号，然后静默什么都不做。
+                const isGlobal = box.dataset.global === '1';
+                removeExcludeItem(
+                    role,
+                    isGlobal ? '' : box.dataset.account,
+                    Number(removeBtn.dataset.excludeRemove),
+                    isGlobal
+                );
             }
             return;
         }
@@ -578,8 +778,10 @@
         const action = btn.dataset.action;
         if (action === 'start') startAccount(account);
         else if (action === 'stop') stopAccount(account);
-        else if (action === 'edit') editRule(account, ruleId);
-        else if (action === 'delete') deleteRule(account, ruleId);
+        // 编辑 / 删除按 rule.id 走：规则卡片是按 rule.id 合并出来的，不再属于某个账号
+        // （编辑与删除本来就作用于**所有**监听账号，不需要账号参数）。
+        else if (action === 'edit') editRule(ruleId);
+        else if (action === 'delete') deleteRule(ruleId);
         // 「已使用注册码」的保存键同样走委托：它长在按账号渲染出来的行里，
         // 每渲染一次挂一次监听既啰嗦又容易漏（内联 handler 带数据是被明令禁止的）。
         else if (action === 'save-used-codes') saveUsedCodes(account, btn.closest('[data-role="used-codes"]'));
@@ -594,6 +796,10 @@
             setForwardEnabled(group.dataset.account, input.checked);
         } else if (input.dataset.role === 'rule-enabled' && card) {
             setRuleEnabled(card.dataset.ruleId, input.checked);
+        } else if (input.dataset.role === 'rule-owner' && card) {
+            // 账号名在 checkbox 的 value 上：主卡片不在任何 [data-account] 里面，
+            // 靠 group 取账号会拿到 null（那样就会"勾了没反应"）。
+            setRuleOwner(card.dataset.ruleId, input.value, input.checked);
         }
     }
 
@@ -651,20 +857,30 @@
     function renderExcludeLists() {
         Object.keys(EXCLUDE_LISTS).forEach(role => {
             const spec = EXCLUDE_LISTS[role];
-            document.querySelectorAll(`[data-role="${role}"]`).forEach(box => {
+            // 两种作用域分开查：全局那份的数据来自响应顶层的 global_excludes，
+            // 账号级那份来自各账号自己的 config.json —— 一个 selector 混查会把两者搞混。
+            document.querySelectorAll(`[data-role="${role}"][data-global="1"]`).forEach(box => {
+                const list = box.querySelector(`[data-role="${role}-list"]`);
+                if (list) list.innerHTML = excludeTags(globalExcludes[spec.key], role);
+            });
+            document.querySelectorAll(`[data-role="${role}"][data-account]`).forEach(box => {
                 const acc = accountByName(box.dataset.account);
                 const list = box.querySelector(`[data-role="${role}-list"]`);
                 if (!acc || !list) return;
-                list.innerHTML = (acc[spec.key] || []).map((tag, i) => `
-                    <span class="tag">${escapeHtml(String(tag))}<button type="button"
-                          data-exclude-remove="${i}" title="移除">×</button></span>`).join('');
+                list.innerHTML = excludeTags(acc[spec.key], role);
             });
         });
+        renderGlobalState();
     }
 
-    async function saveExcludeList(role, name, items) {
+    async function saveExcludeList(role, scope, items, isGlobal) {
         const spec = EXCLUDE_LISTS[role];
-        const res = await fetch(`/api/config/${encodeURIComponent(name)}/${spec.endpoint}`, {
+        // 全局走 /api/forward-excludes（没有账号参数，一份名单所有账号共用），
+        // 账号级还是老端点。两者的 body 形状一样，都是 {字段名: [...]}。
+        const url = isGlobal
+            ? '/api/forward-excludes'
+            : `/api/config/${encodeURIComponent(scope)}/${spec.endpoint}`;
+        const res = await fetch(url, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({[spec.key]: items})
@@ -675,47 +891,62 @@
             await loadAll();   // 失败时重拉，把界面拨回磁盘上的真实状态
             return false;
         }
-        toast(items.length ? spec.added(items.length) : spec.cleared, true);
+        const msg = items.length ? spec.added(items.length) : spec.cleared;
+        toast(isGlobal ? `全局：${msg}` : msg, true);
         await loadAll();
         return true;
     }
 
-    async function addExcludeItem(role, name, value) {
-        const acc = accountByName(name);
-        if (!acc || !value) return;
-        const items = [...(acc[EXCLUDE_LISTS[role].key] || [])];
+    async function addExcludeItem(role, scope, value, isGlobal) {
+        const spec = EXCLUDE_LISTS[role];
+        const source = isGlobal ? globalExcludes : accountByName(scope);
+        if (!source || !value) return;
+        const items = [...(source[spec.key] || [])];
         if (items.some(x => String(x).toLowerCase() === value.toLowerCase())) return;
         items.push(value);
-        await saveExcludeList(role, name, items);
+        await saveExcludeList(role, scope, items, isGlobal);
     }
 
-    async function removeExcludeItem(role, name, index) {
-        const acc = accountByName(name);
-        if (!acc) return;
-        const items = [...(acc[EXCLUDE_LISTS[role].key] || [])];
+    async function removeExcludeItem(role, scope, index, isGlobal) {
+        const spec = EXCLUDE_LISTS[role];
+        const source = isGlobal ? globalExcludes : accountByName(scope);
+        if (!source) return;
+        const items = [...(source[spec.key] || [])];
         items.splice(index, 1);
-        await saveExcludeList(role, name, items);
+        await saveExcludeList(role, scope, items, isGlobal);
     }
 
     function onExcludeListKeydown(event) {
         const field = event.target;
         if (!field.dataset || !field.dataset.role) return;
+        // 和弹窗里的 tag 输入同一件事：中文输入法上屏那一下的回车 / 退格都不是"提交"。
+        if (event.isComposing || event.keyCode === 229) return;
         // 输入框的 data-role 是 `<名单>-field`，去掉后缀就是名单名。
         const role = String(field.dataset.role).replace(/-field$/, '');
         if (!EXCLUDE_LISTS[role]) return;
         const box = field.closest(`[data-role="${role}"]`);
         if (!box) return;
+        // 作用域由 DOM 上的标记决定：data-global="1" = 全局那份（没有账号）。
+        const isGlobal = box.dataset.global === '1';
+        const scope = isGlobal ? '' : box.dataset.account;
         if (event.key === 'Enter') {
             event.preventDefault();
             const value = field.value.trim();
             if (!value) return;
+            // 复用弹窗那套判断（refRejectReason），账号级排除和规则级白/黑名单
+            // 对"什么才算一个用户/频道"必须是同一口径 —— 抄两份早晚会不一致。
+            const reason = refRejectReason(EXCLUDE_LISTS[role].key, value);
+            if (reason) {
+                toast(reason, false);
+                return;   // 不清空输入框，让用户在原值上改
+            }
             field.value = '';
-            addExcludeItem(role, box.dataset.account, value);
+            addExcludeItem(role, scope, value, isGlobal);
         } else if (event.key === 'Backspace' && !field.value) {
             // 空输入框按退格 = 删掉最后一个，和弹窗里的 tag 输入保持一致
-            const acc = accountByName(box.dataset.account);
-            const items = (acc && acc[EXCLUDE_LISTS[role].key]) || [];
-            if (items.length) removeExcludeItem(role, box.dataset.account, items.length - 1);
+            const source = isGlobal ? globalExcludes : accountByName(scope);
+            const items = (source && source[EXCLUDE_LISTS[role].key]) || [];
+            if (items.length) removeExcludeItem(role, scope, items.length - 1, isGlobal);
         }
     }
 
@@ -868,13 +1099,67 @@
         await loadAll();  // 失败时也重拉，把开关拨回真实状态
     }
 
-    async function deleteRule(accountName, ruleId) {
+    // 「监听账号」勾选：这是"以规则为维度"之后**唯一**增减规则作用范围的地方。
+    //
+    // 两个端点都只能用现成的：
+    //   * 勾上 = 把当前这份规则写进该账号 → POST /api/rules（只写缺这条规则的账号）。
+    //     不能用 PUT：PUT 是"覆盖已存在的副本"，账号里没有这条规则时它算 missing，
+    //     不写也不报错，界面看起来"勾上了、其实什么都没发生"。
+    //   * 取消 = 从该账号移除 → DELETE /api/rules/{id}?accounts=<name>
+    //     （不带 accounts 的 DELETE 是"从所有账号删掉"，那是删除键的语义，别混用）。
+    async function setRuleOwner(ruleId, accountName, checked) {
         const found = findRule(ruleId);
-        const owners = found ? found.owners : [accountName];
+        if (!found || !accountName) { await loadAll(); return; }
+
+        if (checked) {
+            const res = await fetch('/api/rules', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({rule: found.rule, accounts: [accountName]})
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                toast(detailText(data) || `写入账号「${accountName}」失败`, false);
+            } else {
+                toast(`规则「${ruleId}」已写入「${accountName}」`, true);
+            }
+            await loadAll();  // 成功失败都重拉，把勾选状态拨回磁盘上的真实结果
+            return;
+        }
+
+        // 取消最后一个监听账号 = 这条规则哪儿都不生效了（等于删除）。
+        // 这个后果比"少一个账号"重得多，所以先问一句。
+        if (found.owners.length <= 1) {
+            const ok = confirm(
+                `「${accountName}」是规则「${ruleId}」最后一个监听账号。\n\n` +
+                '取消后这条规则就没有任何账号在跑了（等于删除）。确定取消吗？'
+            );
+            if (!ok) { await loadAll(); return; }
+        }
+        const res = await fetch(
+            `/api/rules/${encodeURIComponent(ruleId)}?accounts=${encodeURIComponent(accountName)}`,
+            {method: 'DELETE'}
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            toast(detailText(data) || `从账号「${accountName}」移除失败`, false);
+        } else {
+            toast(`已从「${accountName}」移除规则「${ruleId}」`, true);
+        }
+        await loadAll();
+    }
+
+    async function deleteRule(ruleId) {
+        const found = findRule(ruleId);
+        if (!found) { await loadAll(); return; }
+        const owners = found.owners;
         const scope = owners.length > 1
-            ? `\n\n规则「${ruleId}」同时存在于 ${owners.length} 个账号，会一起删掉：\n${owners.join('、')}`
-            : `\n\n只从账号「${owners[0]}」删除。`;
-        if (!confirm(`确定删除规则「${ruleId}」吗？${scope}`)) return;
+            ? `\n\n规则「${ruleId}」一共有 ${owners.length} 个监听账号，会一起删掉：\n${owners.join('、')}`
+            : `\n\n只有「${owners[0]}」在监听，删掉后这条规则就不存在了。`;
+        // 只想让它对某一个账号失效、不想整条删掉的情况很常见，直接指路，
+        // 免得用户拿"删除"当"取消一个账号"用（那会把其它账号一起删了）。
+        const hint = owners.length > 1 ? '\n\n只想让某个账号不再跑这条规则？去卡片上的「监听账号」取消它。' : '';
+        if (!confirm(`确定删除规则「${ruleId}」吗？${scope}${hint}`)) return;
 
         const res = await fetch(`/api/rules/${encodeURIComponent(ruleId)}`, {method: 'DELETE'});
         const data = await res.json().catch(() => ({}));
@@ -911,10 +1196,16 @@
             const input = document.getElementById(`${tagDomId(field)}-field`);
             if (!input) return;
             input.addEventListener('keydown', function(e) {
+                // 🔴 中文输入法**选字/上屏**那一下也会派发 keydown(Enter)——带
+                // ``isComposing=true``（老浏览器是 keyCode 229）。不挡住的话，用户打
+                // 「张三」按回车选字时，这里会把还没上屏的拼音当成标签加进去，还顺手
+                // 清空输入框：字没了、进去一个半截值，主观感受就是"加不上"。
+                // 必须放在所有分支之前 —— 退格同理，上屏那一下不该删掉一个已有标签。
+                if (e.isComposing || e.keyCode === 229) return;
                 if (e.key === 'Enter' && this.value.trim()) {
                     e.preventDefault();
-                    addTag(field, this.value.trim());
-                    this.value = '';
+                    // 只有真的加进去了才清空输入框：校验没过时内容要留给用户改
+                    if (addTag(field, this.value.trim())) this.value = '';
                 }
                 if (e.key === 'Backspace' && !this.value && tagInputs[field].length > 0) {
                     removeTag(field, tagInputs[field].length - 1);
@@ -923,11 +1214,84 @@
         });
     }
 
+    // ---- 引用类字段（频道 / 人）的校验 ----
+    //
+    // 为什么要在前端拦：Telegram 只认**数字 ID** 和 **@username**。人名 / 中文昵称
+    // （「张三」）在 ``config.parse_chat_ref`` 里会被 ``return text.lower()`` 静默当成
+    // username 存下来 —— 标签照显示、保存照成功、toast 还报"已保存"，但引擎的
+    // ``RefSet.matches`` 只比 sender_id 与 username，永远匹配不到。用户看到的现象
+    // 就是"人加上了却没用 / 加不上"（2026-09-29 实测复现）。
+    // 静默接受是最坏的选择：他会以为配好了，然后在群里等一条永远不来的转发。
+    //
+    // ⚠️ ``patterns`` / ``exclude_patterns`` 是**正则**，不是引用：
+    // ``(?:Whitelist)_([A-Za-z0-9]{10})``、``张三`` 都可能是合法正则，
+    // 绝不能拿这套规则去拦（它们只需要 IME 守卫）。
+    const REF_FIELDS = {
+        sources: 'chat', exclude_sources: 'chat', targets: 'chat',
+        from_users: 'person', exclude_users: 'person',
+        exclude_chats: 'chat'
+    };
+    //: `@?` 可选：parse_chat_ref 也接受不带 @ 的写法。Telegram username 只允许
+    //: 字母、数字、下划线，所以含中文/空格/emoji 的输入一定能被判出来。
+    const USERNAME_RULE = /^@?[A-Za-z0-9_]+$/;
+    const NUMERIC_ID_RULE = /^-?\d+$/;
+    const TME_LINK_RULE = /^(?:https?:\/\/)?t\.me\//i;
+
+    /// 返回中文拒绝原因；空串 = 通过。``field`` 用接口字段名（下划线形态）。
+    function refRejectReason(field, value) {
+        const kind = REF_FIELDS[field];
+        if (!kind) return '';
+        const text = String(value || '').trim();
+        if (!text) return '';
+        if (kind === 'person') {
+            if (NUMERIC_ID_RULE.test(text) || USERNAME_RULE.test(text)) return '';
+            return `「${text}」没法当用户用：人名 / 昵称 Telegram 匹配不到。`
+                + '请填数字 ID（例如 7002057019）或 @username（只能是字母、数字、下划线）。';
+        }
+        if (NUMERIC_ID_RULE.test(text) || USERNAME_RULE.test(text) || TME_LINK_RULE.test(text)) return '';
+        return `「${text}」没法当频道用：请填频道 ID（例如 -1001234567890）、@username 或 t.me 链接。`;
+    }
+
     function addTag(field, value) {
+        const reason = refRejectReason(field, value);
+        if (reason) {
+            // 输入框**不清空**（由调用方保证）：让用户能在原值上改一个字符，
+            // 而不是重打一遍 —— "加了半天加不上"里有一半是这个体验问题。
+            toast(reason, false);
+            return false;
+        }
         if (!tagInputs[field].includes(value)) {
             tagInputs[field].push(value);
             renderTags(field);
         }
+        return true;
+    }
+
+    // 编辑一条**老**规则时，把它里面"永远匹配不到"的引用直接指出来。
+    // 这些值（人名 / 昵称）是修复前被后端静默当成 username 存进去的：用户当时看到的是
+    // "保存成功"，之后规则一直不生效也不知道为什么。打开编辑器就说清楚，比让他继续等强。
+    // ⚠️ 只提示、**不拦保存** —— 既有的配置必须照旧能改能存（拦了就是"我的规则打不开了"）。
+    function warnAboutUnmatchableRefs(rule) {
+        const el = document.getElementById('rule-refs-warn');
+        if (!el) return;
+        const labels = {
+            sources: '来源', exclude_sources: '排除来源', targets: '转发目标',
+            from_users: '发送者白名单', exclude_users: '发送者黑名单'
+        };
+        const bad = [];
+        Object.keys(labels).forEach(field => {
+            (rule[field] || []).forEach(value => {
+                if (refRejectReason(field, value)) bad.push(`${labels[field]}：${value}`);
+            });
+        });
+        if (!bad.length) {
+            el.style.display = 'none';
+            el.textContent = '';
+            return;
+        }
+        el.style.display = '';
+        el.textContent = '⚠️ 这条规则里有 Telegram 匹配不到的值（它们一直没生效）：'
+            + bad.join('；') + '。改成数字 ID 或 @username 才会命中。';
     }
 
     function removeTag(field, index) {
@@ -954,7 +1318,11 @@
     }
 
     // ==================== 弹窗 ====================
-    function renderAccountPicker(checked, locked) {
+    // 账号勾选框。⚠️ 这里**故意没有** locked/disabled 参数：编辑时曾经传 true 把整排
+    // 勾选框设成 disabled，用户在弹窗里想加一个账号根本点不动、点了也不产生任何请求
+    // （2026-09-29 用户反馈「转发规则中新勾选账号无法勾选」）。
+    // 编辑时的账号增减由 saveRule 落成 POST / DELETE 差集，所以这里必须始终可点。
+    function renderAccountPicker(checked) {
         const box = document.getElementById('rule-accounts');
         if (accounts.length === 0) {
             box.innerHTML = '<p class="form-hint">还没有账号，先去「账号」页添加</p>';
@@ -964,8 +1332,7 @@
         box.innerHTML = accounts.map(acc => `
             <label class="tg-checkbox">
                 <input type="checkbox" value="${escapeHtml(acc.name)}"
-                       ${checked.includes(acc.name) ? 'checked' : ''}
-                       ${locked ? 'disabled' : ''} />
+                       ${checked.includes(acc.name) ? 'checked' : ''} />
                 <span class="tg-checkmark"></span>
                 <span>${escapeHtml(acc.name)}${acc.username ? ` (@${escapeHtml(acc.username)})` : ''}</span>
             </label>`).join('');
@@ -980,6 +1347,24 @@
         const el = document.getElementById('rule-accounts-summary');
         if (!el) return;
         const picked = selectedRuleAccounts();
+        // 编辑时这个框是**既有监听账号的勾选状态**，不是"要不要写全部账号"。
+        // 所以文案要说这次保存的**差集**变成了什么 —— 继续显示"将写入全部账号"
+        // 会和实际做的事对不上（用户勾掉一个账号时尤其误导）。
+        if (editingRuleId) {
+            const adds = picked.filter(name => !editingOwners.includes(name));
+            const removes = editingOwners.filter(name => !picked.includes(name));
+            if (picked.length === 0) {
+                el.textContent = '⚠ 一个账号都不勾 = 保存时把这条规则删掉';
+            } else if (adds.length === 0 && removes.length === 0) {
+                el.textContent = `监听账号不变：${picked.join('、')}`;
+            } else {
+                const bits = [];
+                if (adds.length) bits.push(`新增监听 ${adds.join('、')}`);
+                if (removes.length) bits.push(`取消监听 ${removes.join('、')}`);
+                el.textContent = `将写入：${picked.join('、')}（${bits.join('；')}）`;
+            }
+            return;
+        }
         if (picked.length > 0) {
             el.textContent = `将写入：${picked.join('、')}`;
         } else if (accounts.length > 0) {
@@ -1012,11 +1397,13 @@
         document.getElementById('test-text').value = '';
         document.getElementById('test-result').innerHTML = '';
         clearAllTags();
+        warnAboutUnmatchableRefs({});   // 新建时把"老配置里的坏值"提示清掉
         document.getElementById('patterns-group').style.display = 'flex';
         document.getElementById('template-group').style.display = 'none';
         document.getElementById('rule-accounts-hint').textContent =
-            `不勾选任何账号 = 写入全部账号（共 ${accounts.length} 个）`;
-        renderAccountPicker([], false);
+            `不勾选任何账号 = 写入全部账号（共 ${accounts.length} 个）；` +
+            '保存后还能在卡片上改「监听账号」';
+        renderAccountPicker([]);
         document.getElementById('rule-modal').classList.add('active');
     }
 
@@ -1024,13 +1411,14 @@
         document.getElementById('rule-modal').classList.remove('active');
     }
 
-    function editRule(accountName, ruleId) {
-        const acc = accountByName(accountName);
-        const rule = acc ? acc.rules.find(r => r.id === ruleId) : null;
-        if (!rule) return;
+    function editRule(ruleId) {
+        // 规则卡片是按 rule.id 合并出来的，编辑一条规则 = 改它**所有**监听账号里的那份。
+        // 所以这里只要 ruleId：不再需要"从哪个账号点的"（那正是要消掉的账号维度）。
         const found = findRule(ruleId);
+        if (!found) return;
+        const rule = found.rule;
         editingRuleId = ruleId;
-        editingOwners = found ? found.owners : [accountName];
+        editingOwners = found.owners;
 
         document.getElementById('modal-title').textContent = '编辑规则';
         document.getElementById('rule-id').value = rule.id;
@@ -1066,10 +1454,14 @@
         tagInputs.patterns = [...(rule.match?.patterns || [])];
         tagInputs.exclude_patterns = [...(rule.match?.exclude_patterns || [])];
         Object.keys(tagInputs).forEach(renderTags);
+        warnAboutUnmatchableRefs(rule);
 
         document.getElementById('rule-accounts-hint').textContent =
-            `规则会同步到所有包含它的账号（${editingOwners.join('、')}），改一次全部生效`;
-        renderAccountPicker(editingOwners, true);
+            `勾选 = 这条规则要跑在哪些账号上（当前：${editingOwners.join('、')}）。` +
+            '勾掉 = 保存时把它从该账号移除；勾上新的 = 保存时写进去。';
+        // ⚠️ 这里**不能**锁（曾经传 true 把整排勾选框 disabled，用户根本点不动 ——
+        // 「转发规则中新勾选账号无法勾选」就是这么来的）。
+        renderAccountPicker(editingOwners);
         document.getElementById('rule-modal').classList.add('active');
     }
 
@@ -1113,38 +1505,143 @@
             include_source_link: document.getElementById('rule-include-link').checked
         };
 
+        // 编辑：先把「内容」写到仍在监听的账号，再把勾选框的**差集**落成增 / 删。
+        // 只解锁弹窗、保存时不管差集的话，界面会显示"勾上了"而磁盘上根本没写 ——
+        // 那比锁着更糟（用户以为生效了，然后在群里等一条永远不来的转发）。
+        if (editingRuleId) {
+            await saveEditedRule(rule);
+            return;
+        }
+
         // 新建：accounts 为空数组 → 后端扇出写入全部账号。
-        // 编辑：不带 accounts → 后端更新所有拥有该规则的账号。
-        const body = editingRuleId ? {rule: rule} : {rule: rule, accounts: selectedRuleAccounts()};
-        const url = editingRuleId ? `/api/rules/${encodeURIComponent(editingRuleId)}` : '/api/rules';
-        const res = await fetch(url, {
-            method: editingRuleId ? 'PUT' : 'POST',
+        const res = await fetch('/api/rules', {
+            method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body)
+            body: JSON.stringify({rule: rule, accounts: selectedRuleAccounts()})
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
             toast(detailText(data) || '保存失败', false);
             return;
         }
-        const done = editingRuleId ? (data.updated || []) : (data.saved || []);
+        const done = data.saved || [];
         const conflicts = data.conflicts || [];
-        let msg = editingRuleId ? `已更新 ${done.length} 个账号的规则` : `已保存到 ${done.length} 个账号`;
+        let msg = `已保存到 ${done.length} 个账号`;
         if (conflicts.length > 0) msg += `；${conflicts.join('、')} 已有同名规则，已跳过`;
         toast(msg, true);
         closeRuleModal();
         await loadAll();
     }
 
+    // 编辑保存：三步都走服务端**已有**的原子接口，顺序不能反。
+    //   1) PUT /api/rules/{id}（不带 accounts = 更新所有现有副本）—— 内容改动
+    //   2) POST /api/rules {rule, accounts: [新增]}             —— 只写缺这条规则的账号
+    //      （不能拿 PUT 去加：账号里没有这条规则时它只算 missing，不写也不报错）
+    //   3) DELETE /api/rules/{id}?accounts=[取消]               —— 只从这些账号移除
+    //      （不带 accounts 的 DELETE 是"从所有账号删掉"，那是删除键的语义）
+    async function saveEditedRule(rule) {
+        const id = editingRuleId;
+        const before = [...editingOwners];       // 打开弹窗那一刻的监听账号
+        const picks = selectedRuleAccounts();    // 用户改完之后的勾选
+        const adds = picks.filter(name => !before.includes(name));
+        const removes = before.filter(name => !picks.includes(name));
+
+        // 一个账号都不留 = 这条规则哪儿都不跑了，等于删除。删掉回不来，先问一句；
+        // 用户说不要就整单放弃（连内容改动也不落盘）—— 状态最好预测。
+        if (picks.length === 0 && !confirm(
+            `确定把「${id}」从所有账号移除吗？\n\n`
+            + `移除后没有任何账号在跑这条规则（监听账号：${before.join('、')}），等于把它删掉。`
+        )) {
+            toast('已取消：没有账号监听的规则会被删除', false);
+            await reloadAndResyncEdit(id);
+            return;
+        }
+
+        // 1) 内容改动。一个账号都不留时跳过：规则马上要被移除，PUT 没有意义。
+        if (picks.length > 0) {
+            const res = await putJson(`/api/rules/${encodeURIComponent(id)}`, {rule: rule});
+            if (!res.ok) { await failEditSave(res.data); return; }
+        }
+        // 2) 新增监听账号
+        if (adds.length > 0) {
+            const res = await postJson('/api/rules', {rule: rule, accounts: adds});
+            if (!res.ok) { await failEditSave(res.data); return; }
+        }
+        // 3) 取消监听账号
+        if (removes.length > 0) {
+            const query = removes.map(encodeURIComponent).join(',');
+            const res = await deleteJson(`/api/rules/${encodeURIComponent(id)}?accounts=${query}`);
+            if (!res.ok) { await failEditSave(res.data); return; }
+        }
+
+        if (picks.length === 0) {
+            toast(`规则「${id}」已从所有账号移除`, true);
+        } else {
+            const bits = [];
+            if (adds.length) bits.push(`新增监听 ${adds.join('、')}`);
+            if (removes.length) bits.push(`取消监听 ${removes.join('、')}`);
+            if (bits.length === 0) bits.push(`内容已更新（${before.join('、')}）`);
+            toast(`规则「${id}」已保存：${bits.join('；')}`, true);
+        }
+        closeRuleModal();
+        await loadAll();   // 无论如何回读磁盘上的真实状态
+    }
+
+    /// 保存失败：中文原因照原样给用户看，然后把**页面与弹窗**都拨回磁盘真实状态。
+    /// 只重拉页面不管弹窗的话，弹窗里那几个勾还会停在"我改过的样子"—— 那正是
+    /// 用户以为"勾上了"的来源。
+    async function failEditSave(data) {
+        toast(detailText(data) || '保存失败', false);
+        await reloadAndResyncEdit(editingRuleId);
+    }
+
+    async function reloadAndResyncEdit(ruleId) {
+        await loadAll();
+        const found = ruleId ? findRule(ruleId) : null;
+        if (!found) {
+            // 规则已经不在了（比如取消全部监听账号那一步已经落盘）：留在编辑器里
+            // 只会让用户对着一条不存在的规则继续点保存。
+            if (document.getElementById('rule-modal').classList.contains('active')) {
+                closeRuleModal();
+                toast('这条规则已经不存在了，已关闭编辑器', false);
+            }
+            return;
+        }
+        editingOwners = [...found.owners];
+        renderAccountPicker(editingOwners);
+    }
+
+    // 三个薄封装：只为了把 fetch 的样板收在一处（编辑保存要连发 1~3 个请求，
+    // 每次都写一遍 headers/JSON.parse 很容易漏掉某一步的 !res.ok 判断）。
+    async function putJson(url, body) { return sendJson('PUT', url, body); }
+    async function postJson(url, body) { return sendJson('POST', url, body); }
+    async function deleteJson(url) { return sendJson('DELETE', url); }
+
+    async function sendJson(method, url, body) {
+        const res = await fetch(url, {
+            method: method,
+            headers: {'Content-Type': 'application/json'},
+            body: body === undefined ? undefined : JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({}));
+        return {ok: res.ok, data: data};
+    }
+
     // ==================== 正则测试器 ====================
     async function testRegex() {
-        const pattern = tagInputs.patterns.join('|');
+        // 测的是**整条规则的文本级判定**：主条件 + 排除规则一起算。
+        // 曾经只发 patterns.join('|')、完全不带 exclude_patterns —— 用户在
+        // 「排除规则」里加了 21点，测试按钮照样显示"匹配成功"，于是被理解成
+        // "排除没用"（其实引擎那边是生效的，只是测试器没把它算进去）。
+        // 也不再自己用 '|' 拼主正则：那样捕获组编号和引擎（逐条模式、取命中那条
+        // 的组）对不上，模板里的 {g1} 会对错。
         const text = document.getElementById('test-text').value;
         const mode = document.getElementById('match-mode').value;
         const ignoreCase = document.getElementById('ignore-case').checked;
         const resultEl = document.getElementById('test-result');
+        const hasPatterns = tagInputs.patterns.length > 0;
 
-        if (!pattern || !text) {
+        if (!text || (mode !== 'all' && !hasPatterns)) {
             resultEl.innerHTML = '';
             return;
         }
@@ -1153,24 +1650,48 @@
         const res = await fetch('/api/rules/test', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({pattern, text, mode, ignore_case: ignoreCase})
+            body: JSON.stringify({
+                patterns: tagInputs.patterns,
+                exclude_patterns: tagInputs.exclude_patterns,
+                text: text,
+                mode: mode,
+                ignore_case: ignoreCase
+            })
         });
         const data = await res.json();
+        // 这个测试需要真实会话才能判断的东西一律不算 —— 不写清楚的话，用户会拿
+        // 一个"匹配成功"去质疑"为什么这条没转出去"（来源频道不符、发送者在黑名单、
+        // 注册码已用过、被去重挡掉，全都不在这里）。
+        const scopeHint = `<p class="form-hint">只看文本级判定：匹配模式 + 排除规则。`
+            + `频道来源/排除、发送者白名单/黑名单、已使用注册码拦截、去重与频率限制，`
+            + `都不在这里判断（它们需要真实会话上下文）。</p>`;
         if (data.error) {
             resultEl.innerHTML = `<div class="test-result-error">${escapeHtml(data.error)}</div>`;
+        } else if (data.excluded) {
+            // 被排除规则拦下：这是**没匹配上**（引擎不会转发），必须说清楚是谁拦的，
+            // 不然用户会继续以为"排除没生效"。
+            const by = (data.excluded_by || []).map(p => `<code>${escapeHtml(p)}</code>`).join('、');
+            let html = `<div class="test-result-fail">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                被排除规则拦下 ⇒ 不会转发`;
+            if (by) html += `<span class="test-groups">拦下它的是: ${by}</span>`;
+            const primary = data.primary || {};
+            if (primary.full_match) {
+                html += `<span class="test-groups">主条件本来匹配到: <code>${escapeHtml(primary.full_match)}</code></span>`;
+            }
+            resultEl.innerHTML = html + `</div>` + scopeHint;
         } else if (data.match) {
             let html = `<div class="test-result-success">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
                 匹配成功`;
             if (data.full_match) html += `<span class="test-match-text">"${escapeHtml(data.full_match)}"</span>`;
             if (data.groups && data.groups.length > 0) html += `<span class="test-groups">捕获组: ${data.groups.map(g => escapeHtml(g)).join(', ')}</span>`;
-            html += `</div>`;
-            resultEl.innerHTML = html;
+            resultEl.innerHTML = html + `</div>` + scopeHint;
         } else {
             resultEl.innerHTML = `<div class="test-result-fail">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
                 不匹配
-            </div>`;
+            </div>` + scopeHint;
         }
     }
 

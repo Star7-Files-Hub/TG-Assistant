@@ -43,6 +43,7 @@ from .config import (
     mask_phone,
     utc_now_iso,
 )
+from .bot_commands import StatusCommand, StatusData
 from .forwarder import CrossAccountDedupe, ForwardEngine
 from .logging_setup import get_logger
 from .notify import BotNotifier, NotifyTask
@@ -561,6 +562,8 @@ class AccountRunner:
         self.hunter: Optional[RedPacketHunter] = None
         self.reg_grab: Optional[RegGrabHunter] = None
         self.cf_ip_listener: Optional[Any] = None
+        #: ``/status`` 指令处理器。仅在启用了通知（有可回话的 bot）时才挂上。
+        self.status_command: Optional[StatusCommand] = None
         self.bundle: Optional[ClientBundle] = None
         self.started_at: Optional[float] = None
         self._stopped = asyncio.Event()
@@ -568,6 +571,12 @@ class AccountRunner:
         #: 三个引擎共用这一份读盘结果（见 :meth:`_reload_config_if_changed`）。
         self._config_file: Optional[Any] = None
         self._config_mtime: Optional[float] = None
+        #: 「全局排除」名单（``data/forward_excludes.json``，所有账号共用一份）的
+        #: 路径与 mtime。它**不在** config.json 里，所以必须单独盯一份 mtime ——
+        #: 只盯 config.json 的话，面板改完全局名单不会触发任何重载，
+        #: 用户改完立刻去群里验证，看到没拦住只会以为功能坏了。
+        self._global_excludes_file: Optional[Any] = None
+        self._global_excludes_mtime: Optional[float] = None
 
     @property
     def name(self) -> str:
@@ -665,6 +674,18 @@ class AccountRunner:
         )
         await self.reg_grab.register()
 
+        # ``/status`` 指令：只有启用了通知（有一个能回话的 bot）才有意义 ——
+        # 指令是小白在「和这个 bot 的私聊」里打出来的，回复也要经这个 bot 发回去。
+        # 没通知就没这个私聊，直接不挂（也就不会白收全部私聊消息）。
+        if self.notifier is not None and self.config.notify.enabled:
+            self.status_command = StatusCommand(
+                bot_token=self.config.notify.bot_token,
+                gather=self._status_snapshot,
+                send=self._reply_status,
+                alog=self.alog,
+            )
+            self.status_command.register(self.client)
+
         # Cloudflare 优选 IP 实时监听
         if self.config.cloudflare_ip.enabled and self.config.cloudflare_ip.real_time_listen:
             from tg_assistant.cf_ip_listener import CFIPListener
@@ -689,6 +710,9 @@ class AccountRunner:
             with contextlib.suppress(Exception):
                 self._config_file = self.store.paths.account(self.name).config_file
                 self._config_mtime = None
+                # 全局排除名单（跨账号一份）：同样留 None，首次检查必读一次盘。
+                self._global_excludes_file = self.store.paths.forward_excludes_file
+                self._global_excludes_mtime = None
 
         if not needs_updates:
             self.alog.warning(
@@ -698,6 +722,9 @@ class AccountRunner:
 
     async def stop(self) -> None:
         self.alog.info("正在停止账号")
+        if self.status_command is not None and self.client is not None:
+            self.status_command.unregister(self.client)
+            self.status_command = None
         if self.cf_ip_listener is not None:
             await self.cf_ip_listener.unregister()
             self.cf_ip_listener = None
@@ -754,12 +781,18 @@ class AccountRunner:
     # ------------------------------------------------------------------ #
     # 配置热重载
     async def _reload_config_if_changed(self) -> bool:
-        """``config.json`` 变了就把新配置应用到所有引擎。返回 True 表示确实应用了。
+        """``config.json``（或全局排除名单）变了就把新配置应用到所有引擎。
+
+        返回 True 表示确实应用了。
 
         🔴 **只为整个账号读一次盘**，再把同一份 ``AccountConfig`` 分发给三个引擎。
         让每个引擎各自去读的话，一次面板保存会触发 3 次读盘 + 解析，更糟的是
         它们可能读到**不同版本**（用户连点两次保存时），于是三个功能的生效状态
         对不上，排查起来毫无头绪。
+
+        「全局排除」名单（``data/forward_excludes.json``，跨账号一份）也在这里盯 ——
+        它不在账号配置里，只盯 ``config.json`` 的话，面板改完全局名单**不会**触发
+        任何重载，用户改完立刻去群里验证、看到没拦住只会以为功能坏了。
         """
         if self._config_file is None or self.store is None:
             return False
@@ -767,11 +800,16 @@ class AccountRunner:
             mtime = self._config_file.stat().st_mtime
         except OSError:
             return False
-        if mtime == self._config_mtime:
+        global_mtime: Optional[float] = None
+        if self._global_excludes_file is not None:
+            with contextlib.suppress(OSError):
+                global_mtime = self._global_excludes_file.stat().st_mtime
+        if mtime == self._config_mtime and global_mtime == self._global_excludes_mtime:
             return False
         # 先记下 mtime 再解析：解析失败时不会每一轮都重试同一次坏写，
         # 用户改回一个合法配置就会重新触发（mtime 又变了）。
         self._config_mtime = mtime
+        self._global_excludes_mtime = global_mtime
         try:
             config = self.store.load_account_config(self.name, create=False)
         except Exception as exc:
@@ -911,6 +949,59 @@ class AccountRunner:
             "reg_grab": self.reg_grab.snapshot() if self.reg_grab else None,
             "notify": dict(self.notifier.stats) if self.notifier else None,
         }
+
+    # ------------------------------------------------------------------ #
+    # /status 指令的取数 + 回话
+    # ------------------------------------------------------------------ #
+    def _status_snapshot(self) -> StatusData:
+        """给 ``/status`` 攒一份面板数据。
+
+        每处取值都用 ``getattr`` / try 兜底：某个引擎没起来、或快照少了个键，
+        都退化成 0/关，绝不让一条 ``/status`` 因此抛异常（用户宁可看到 0）。
+        实时口径：开关/规则数直接读**当前 config**（热重载后会变），
+        大盘读**共享的 MetricsStore**（跨账号汇总的总数）。
+        """
+        cfg = self.config
+        data = StatusData(
+            account_label=self.name,
+            running=self.client is not None,
+            forward_on=bool(cfg.forward.enabled),
+            forward_rules=len(cfg.forward.active_rules),
+            red_packet_on=bool(cfg.red_packet.enabled),
+            red_packet_tasks=len(cfg.red_packet.active_tasks),
+            reg_grab_on=bool(cfg.reg_grab.enabled),
+            reg_grab_tasks=len(cfg.reg_grab.active_tasks),
+        )
+        with contextlib.suppress(Exception):
+            if self.bundle is not None:
+                data.username = getattr(self.bundle, "me_username", None)
+        with contextlib.suppress(Exception):
+            fwd = self.forwarder.snapshot() if self.forwarder else {}
+            data.exclude_chats = int(fwd.get("global_exclude_chats", 0) or 0)
+            data.exclude_users = int(fwd.get("global_exclude_users", 0) or 0)
+        with contextlib.suppress(Exception):
+            if self.metrics is not None:
+                data.metrics = self.metrics.totals()
+        return data
+
+    async def _reply_status(self, chat_id: int, text: str) -> None:
+        """把面板文本**只**发回发起的那个私聊。
+
+        复用 :class:`BotNotifier` 的底层 ``_call`` —— 拿到它的代理/重试/429 处理，
+        但**绕开** ``submit``：``submit`` 会广播给所有配置的通知对象，而 ``/status``
+        的语义是「谁问，回给谁」，只能发这一个 chat_id。
+        """
+        if self.notifier is None:
+            return
+        await self.notifier._call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "link_preview_options": {"is_disabled": True},
+            },
+        )
 
 
 # --------------------------------------------------------------------------- #

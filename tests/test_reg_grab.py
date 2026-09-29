@@ -38,6 +38,8 @@ from tg_assistant.reg_grab import (
     RegGrabHunter,
     StepResult,
     code_value_of,
+    extract_code,
+    extract_code_detail,
     iter_inline_buttons,
     step_label,
     visible_code_part,
@@ -305,6 +307,71 @@ class TestConfig:
 
 
 # --------------------------------------------------------------------------- #
+class TestAutoTaskId:
+    """任务 ID 不必填：留空/缺省自动生成、落盘稳定、同名不撞车。
+
+    用户原话：「抢注的任务ID不要做成必填，名称填了就行，ID自动生成一个」。
+    """
+
+    def test_blank_id_is_generated_from_the_name(self) -> None:
+        config = RegGrabConfig(tasks=[{"name": "主群 Register #1"}])
+        assert config.tasks[0].id == "register-1", "名称里的 ASCII 片段要拿来做 id"
+
+    def test_missing_id_key_also_generates(self) -> None:
+        """「缺省」也得能用：面板新增一条任务时发上来的就是不带 id 的对象。"""
+        config = RegGrabConfig(tasks=[{}])
+        assert config.tasks[0].id
+
+    def test_chinese_name_falls_back_to_a_short_random_id(self) -> None:
+        config = RegGrabConfig(tasks=[{"name": "主群注册码"}])
+        assert re.fullmatch(r"task-[0-9a-f]{8}", config.tasks[0].id), config.tasks[0].id
+
+    def test_explicit_id_wins(self) -> None:
+        config = RegGrabConfig(tasks=[{"id": "mine", "name": "别的名字"}])
+        assert config.tasks[0].id == "mine"
+
+    def test_same_name_twice_does_not_collide(self) -> None:
+        """🔴 复制一条任务改改是常规操作：两条同名任务不能生成同一个 id。
+
+        生成若放在 ``RegGrabTask`` 自己的校验器里（看不到兄弟任务），这里就会撞上
+        唯一性校验，用户只看到「保存失败」——所以生成必须在父模型里做。
+        """
+        first, second = RegGrabConfig(tasks=[{"name": "Main"}, {"name": "Main"}]).tasks
+        assert first.id == "main"
+        assert second.id != first.id and second.id.startswith("main")
+
+    def test_generated_id_avoids_an_explicit_one(self) -> None:
+        config = RegGrabConfig(tasks=[{"id": "main"}, {"name": "Main"}])
+        assert config.tasks[1].id != "main"
+
+    def test_two_chinese_names_get_two_ids(self) -> None:
+        config = RegGrabConfig(tasks=[{"name": "群一"}, {"name": "群二"}])
+        ids = [task.id for task in config.tasks]
+        assert len(set(ids)) == 2, ids
+
+    def test_survives_a_dump_validate_round_trip(self) -> None:
+        """🔴 重新加载后必须**不变**：生成只在「这条任务还没有 id」时发生。"""
+        config = RegGrabConfig(tasks=[{"name": "主群"}, {"name": "备用群"}])
+        ids = [task.id for task in config.tasks]
+        again = RegGrabConfig.model_validate(config.model_dump(mode="json"))
+        assert [task.id for task in again.tasks] == ids
+
+    def test_duplicate_explicit_ids_are_still_rejected(self) -> None:
+        """自动生成不能顺手把「用户手打的重复 id」也放过去。"""
+        with pytest.raises(ValidationError, match="重复"):
+            RegGrabConfig(tasks=[{"id": "same"}, {"id": "same"}])
+
+    def test_id_is_trimmed_and_must_be_a_string(self) -> None:
+        assert RegGrabConfig(tasks=[{"id": "  padded  "}]).tasks[0].id == "padded"
+        with pytest.raises(ValidationError, match="字符串"):
+            RegGrabConfig(tasks=[{"id": 123}])
+
+    def test_flat_legacy_config_still_gets_default_id(self) -> None:
+        """兼容路径别被带坏：旧扁平结构迁移出来的那条仍然是 ``default``。"""
+        assert [t.id for t in rg_config().reg_grab.tasks] == ["default"]
+
+
+# --------------------------------------------------------------------------- #
 class TestDetection:
     def test_extracts_capture_group(self, alog) -> None:
         hunter = build(rg_config(), alog=alog)
@@ -366,6 +433,81 @@ class TestDetection:
     def test_watch_chats_empty_means_no_filter(self, alog) -> None:
         hunter = build(rg_config(chats=[]), alog=alog)
         assert hunter._watch_chats() == []
+
+
+# --------------------------------------------------------------------------- #
+#: 用户报的那条正则与他给的消息正文（原话：「我想要 XYING-Whitelist_4rLuucEgs5，
+#: 但只匹配到 4rLuucEgs5，我的正则是 (?:Whitelist)_([A-Za-z0-9]{10})」）。
+#: 捕获组只括住后缀 ⇒ 引擎按契约只交出后缀 —— 这不是 bug，但面板必须讲清楚。
+USER_PATTERN = r"(?:Whitelist)_([A-Za-z0-9]{10})"
+USER_TEXT = "🎟️ 注册码使用 - jf [7002057019] 使用了 XYING-Whitelist_4rLuucEgs5 已绑定"
+USER_FULL = "Whitelist_4rLuucEgs5"
+USER_CODE = "4rLuucEgs5"
+#: 面板给出的改法：把整串括起来，就拿到整串。
+USER_FIXED_PATTERN = r"(XYING-Whitelist_[A-Za-z0-9]{10})"
+USER_WHOLE = "XYING-Whitelist_4rLuucEgs5"
+
+
+class TestExtractCode:
+    """``extract_code``：第一个非空捕获组；没有捕获组才用整段（语义**保持不变**）。"""
+
+    def test_user_pattern_only_yields_the_suffix(self) -> None:
+        """用户的原始正则拿到后缀 —— 这正是他反馈的现象，契约如此。"""
+        assert extract_code(USER_PATTERN, USER_TEXT) == USER_CODE
+
+    def test_wrapping_the_whole_thing_yields_the_whole_code(self) -> None:
+        """按面板提示把整串括起来 ⇒ 拿到整串（不用改引擎）。"""
+        assert extract_code(USER_FIXED_PATTERN, USER_TEXT) == USER_WHOLE
+
+    def test_no_capture_group_uses_the_whole_match(self) -> None:
+        assert extract_code(r"MSKY-\d+-Register_\w+", CODE) == CODE
+
+    def test_multiple_groups_take_the_first_non_empty(self) -> None:
+        """第 1 组用 ``(x)?`` 写成可选、这次没参与匹配 ⇒ 落到第 2 组。"""
+        assert extract_code(r"(?:pre_)(x)?([A-Za-z0-9]{5})", "pre_abcde") == "abcde"
+
+    def test_no_match_returns_none(self) -> None:
+        assert extract_code(USER_PATTERN, "今天天气不错") is None
+
+    def test_none_pattern_returns_none(self) -> None:
+        """任务没填提取正则时引擎走的就是这条路（``code_pattern is None``）。"""
+        assert extract_code(None, USER_TEXT) is None
+
+    def test_compiled_pattern_works_too(self) -> None:
+        """引擎传的是预编译好的正则；字符串与正则对象两种入参都要收。"""
+        assert extract_code(re.compile(USER_PATTERN), USER_TEXT) == USER_CODE
+
+    def test_engine_still_agrees_with_the_module_function(self, alog) -> None:
+        """🔴 引擎的 ``_extract_code`` 已改成转调本函数，行为必须一模一样。"""
+        hunter = build(rg_config(detect={"code_pattern": USER_PATTERN}), alog=alog)
+        assert hunter._should_grab(rg_message(USER_TEXT), CHAT) == USER_CODE
+
+    def test_detail_reports_full_match_groups_and_group_number(self) -> None:
+        assert extract_code_detail(USER_PATTERN, USER_TEXT) == {
+            "matched": True,
+            "full": USER_FULL,
+            "groups": [USER_CODE],
+            "code": USER_CODE,
+            "from_group": 1,
+        }
+
+    def test_detail_says_whole_match_when_there_is_no_group(self) -> None:
+        detail = extract_code_detail(r"MSKY-\d+-Register_\w+", CODE)
+        assert detail["code"] == detail["full"] == CODE
+        assert detail["groups"] == []
+        assert detail["from_group"] == 0, "0 表示整段匹配"
+
+    def test_detail_without_any_match(self) -> None:
+        detail = extract_code_detail(USER_PATTERN, "今天天气不错")
+        assert detail["matched"] is False
+        assert detail["code"] is None and detail["full"] is None
+        assert detail["groups"] == [] and detail["from_group"] is None
+
+    def test_detail_keeps_empty_optional_groups_visible(self) -> None:
+        """``(x)?`` 没参与匹配时留 ``None`` —— 面板要能显示「第 1 组：（空）」。"""
+        detail = extract_code_detail(r"(?:pre_)(x)?([A-Za-z0-9]{5})", "pre_abcde")
+        assert detail["groups"] == [None, "abcde"]
+        assert detail["from_group"] == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -1621,6 +1763,176 @@ class TestTestNotifyEndpoint:
         assert len(submitted) == 1
         assert submitted[0].event == "reg_grab"
         assert "测试" in submitted[0].text
+
+
+# --------------------------------------------------------------------------- #
+def _reg_grab_template() -> str:
+    from pathlib import Path
+
+    web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
+    return (web_dir / "templates" / "reg_grab.html").read_text(encoding="utf-8")
+
+
+def _js_function_body(html: str, name: str) -> str:
+    """截出某个 JS 函数的函数体。
+
+    ⚠️ 断言必须限定在函数体内：模板别处也可能出现同样的字符串，全文搜的话
+    把接线删掉测试照样过（test_web_pages.py 里有一份同名的同款工具）。
+    """
+    start = html.index(f"async function {name}(")
+    end = html.index("\n    }\n", start)
+    return html[start:end]
+
+
+class TestTestExtractEndpoint:
+    """「测试提取」的后端、面板文案，以及**走真实入口**的 id 自动生成。
+
+    为什么这一组用例要打 API 而不是只构造模型：需求是「用户能这么用」——
+    只证明 ``RegGrabConfig`` 会生成 id，证明不了 PUT/GET 这条用户真正走的路上
+    它也生成、也落盘、刷新后还是同一个。
+    """
+
+    @staticmethod
+    def _app(tmp_path):
+        from tg_assistant.config import AccountRecord, utc_now_iso
+        from tg_assistant.web import create_app
+
+        app = create_app(tmp_path / "data")
+        store = app.state.store
+        store.upsert_account(AccountRecord(name="acct", created_at=utc_now_iso()))
+        store.load_account_config("acct", create=True)
+        return app, store
+
+    def test_reports_what_the_engine_would_grab(self, tmp_path) -> None:
+        """用户的原始正则：``code`` 只有后缀，``from_group`` 说清它是第 1 组。"""
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app(tmp_path)
+        with TestClient(app) as client:
+            res = client.post(
+                "/api/reg_grab/test_extract",
+                json={"pattern": USER_PATTERN, "text": USER_TEXT},
+            )
+
+        assert res.status_code == 200, res.text
+        assert res.json() == {
+            "matched": True,
+            "full": USER_FULL,
+            "groups": [USER_CODE],
+            "code": USER_CODE,
+            "from_group": 1,
+        }
+
+    def test_needs_no_account_context(self, tmp_path) -> None:
+        """页面去掉了「先选账号」：一个账号都没注册时这条路径也要能用。"""
+        from fastapi.testclient import TestClient
+        from tg_assistant.web import create_app
+
+        app = create_app(tmp_path / "data")
+        with TestClient(app) as client:
+            res = client.post(
+                "/api/reg_grab/test_extract",
+                json={"pattern": USER_FIXED_PATTERN, "text": USER_TEXT},
+            )
+        assert res.status_code == 200, res.text
+        assert res.json()["code"] == USER_WHOLE
+
+    def test_no_match_is_reported_as_such(self, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app(tmp_path)
+        with TestClient(app) as client:
+            res = client.post(
+                "/api/reg_grab/test_extract",
+                json={"pattern": USER_PATTERN, "text": "今天天气不错"},
+            )
+        assert res.status_code == 200, res.text
+        assert res.json()["matched"] is False
+        assert res.json()["code"] is None
+
+    def test_invalid_regex_gets_a_readable_error(self, tmp_path) -> None:
+        """正则写错是输入错误：给一句人话，不要 500。"""
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app(tmp_path)
+        with TestClient(app) as client:
+            res = client.post(
+                "/api/reg_grab/test_extract",
+                json={"pattern": "([unclosed", "text": USER_TEXT},
+            )
+        assert res.status_code == 200, res.text
+        assert "正则表达式无效" in res.json()["error"]
+
+    def test_blank_pattern_or_text_is_an_error(self, tmp_path) -> None:
+        from fastapi.testclient import TestClient
+
+        app, _ = self._app(tmp_path)
+        with TestClient(app) as client:
+            empty_pattern = client.post(
+                "/api/reg_grab/test_extract", json={"pattern": "", "text": USER_TEXT}
+            )
+            empty_text = client.post(
+                "/api/reg_grab/test_extract", json={"pattern": USER_PATTERN, "text": ""}
+            )
+        assert "正则表达式为空" in empty_pattern.json()["error"]
+        assert "测试文本为空" in empty_text.json()["error"]
+
+    def test_put_without_id_generates_and_persists_one(self, tmp_path) -> None:
+        """🔴 需求 A 走真实入口：两条同名任务都不带 id ⇒ 各自拿到 id 并落盘。"""
+        from fastapi.testclient import TestClient
+
+        app, store = self._app(tmp_path)
+        ready = {
+            "name": "Main",
+            "detect": {"code_pattern": PATTERN},
+            "steps": [{"type": "send", "chat": "@bot", "text": "/bind {code}"}],
+        }
+        with TestClient(app) as client:
+            res = client.put(
+                "/api/config/acct/reg_grab",
+                json={"enabled": False, "tasks": [dict(ready), dict(ready)]},
+            )
+            assert res.status_code == 200, res.text
+            data = client.get("/api/config/acct/reg_grab").json()
+            again = client.get("/api/config/acct/reg_grab").json()
+
+        ids = [task["id"] for task in data["tasks"]]
+        assert ids == ["main", "main-2"], f"生成/避重不对：{ids}"
+        assert [task["id"] for task in again["tasks"]] == ids, "两次 GET 必须是同一个 id"
+        # 面板刷新 / 服务重启走的就是「重新加载配置文件」这条路，id 必须不变
+        saved = store.load_account_config("acct", create=False)
+        assert [task.id for task in saved.reg_grab.tasks] == ids
+
+    def test_panel_says_what_the_regex_will_grab(self) -> None:
+        html = _reg_grab_template()
+
+        # 弹窗里那一项要说明「抓的是第一个非空捕获组」，并给出想抓整串时的写法
+        assert "第一个非空捕获组" in html
+        assert "(XYING-Whitelist_[A-Za-z0-9]{10})" in html
+        # 试提取结果里的三块内容：抓到的注册码 / 整段匹配 / 提示怎么改成整串
+        assert "抓到的注册码" in html
+        assert "整段匹配" in html
+        assert "想抓整串就把整串括起来" in html
+        assert "(XYING-Whitelist_xxxxxxxxxx)" in html
+        assert 'id="rg-test-result"' in html
+        # 「可见位数至少」那个阈值说明不能被顺手删掉（同一个表单区块）
+        assert "可见位数至少" in html
+
+    def test_panel_uses_the_new_endpoint_and_the_engine_semantics(self) -> None:
+        body = _js_function_body(_reg_grab_template(), "testPattern")
+
+        assert "/api/reg_grab/test_extract" in body
+        assert "/api/rules/test" not in body, "别再走转发页那个只回答「匹配到了没有」的端点"
+        assert "from_group" in body, "面板要显示抓到的是第几个捕获组"
+        assert "escapeHtml" in body, "注进 innerHTML 的值必须先转义（正则/正文都是用户输入）"
+
+    def test_panel_does_not_block_a_blank_task_id(self) -> None:
+        html = _reg_grab_template()
+
+        assert "任务 ID（可留空，自动生成）" in html
+        assert "任务 ID 不能为空" not in html, "前端不该再拦 id 必填"
+        save = _js_function_body(html, "saveTask")
+        assert "if (!task.id)" not in save, "id 留空时保存路径不能提前 return"
 
 
 # --------------------------------------------------------------------------- #

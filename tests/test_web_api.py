@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -208,8 +209,169 @@ def test_forward_exclude_chats_does_not_clobber_rules(client, app, account) -> N
 
 
 # --------------------------------------------------------------------------- #
-# 账号级「发送者黑名单」
+# 全局排除名单（所有账号共用一份，data/forward_excludes.json）
+#
+# 上面那两节是**账号级**的（存在各自 config.json 里）。这一节是用户要的那份
+# 「全局」：写一次管所有账号。线上两个账号的名单本来完全一样
+# （2026-09-29 取证：-1003932130542 / 8817602576），同一份名单存了两遍。
 # --------------------------------------------------------------------------- #
+def test_rules_overview_exposes_global_excludes(client, app, two_accounts) -> None:
+    """总览接口顶层带一份 ``global_excludes`` —— 不在每个账号里各带一份。
+
+    塞进每个账号就等于把"两个号存着同一份名单"这个毛病原样搬到接口里，
+    面板也会被渲染成"每个账号一份"，用户又得填两遍。
+    """
+    body = client.get("/api/rules").json()
+
+    assert body["global_excludes"] == {
+        "exclude_chats": [],
+        "exclude_users": [],
+        # 读文件失败过几次。>0 说明磁盘上那份没读到、此刻按空名单在跑，
+        # 面板据此提示 —— 否则用户会对着一个"看起来配好了"的界面发呆。
+        "load_errors": 0,
+    }
+
+
+def test_rules_overview_has_global_excludes_without_any_account(client, app) -> None:
+    """一个账号都没有时也要给得出这份名单。
+
+    新装的环境里"先把这些群排除掉"正是第一件事；接口要是跟着账号列表一起
+    返空，页面顶部的区块就会缺失（或者 JS 读到 undefined）。
+    """
+    assert client.get("/api/rules").json()["global_excludes"]["exclude_chats"] == []
+
+
+def test_global_excludes_round_trip(client, app, account) -> None:
+    """写进去能读回来（归一化），落盘在 ``data/forward_excludes.json``。
+
+    ⚠️ 同时钉住"**没有**写进任何账号的 config.json" —— 那正是这个功能的全部意义。
+    如果一个顺手实现把它塞进了本账号配置，功能看起来一样能用（单账号时），
+    但第二个账号就漏了。
+    """
+    resp = client.put(
+        "/api/forward-excludes",
+        json={"exclude_chats": ["-1003932130542", "@Noisy_Channel"]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["exclude_chats"] == [-1003932130542, "noisy_channel"], "数字 id 必须归一化成 int"
+    assert body["exclude_users"] == [], "没提交的那个键要保持空，不能被清成一个错误的值"
+
+    # 面板刷新走的是总览接口，它不带上的话顶部区块会"消失"
+    assert client.get("/api/rules").json()["global_excludes"]["exclude_chats"] == [
+        -1003932130542,
+        "noisy_channel",
+    ]
+
+    # 真的落到了跨账号那份文件里
+    path = account.paths.forward_excludes_file
+    assert path.exists(), "全局名单没有落盘到 data/forward_excludes.json"
+    assert json.loads(path.read_text(encoding="utf-8"))["exclude_chats"] == [
+        -1003932130542,
+        "noisy_channel",
+    ]
+
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["exclude_chats"] == [], "全局名单被写进账号配置了 —— 那就不是跨账号一份"
+
+
+def test_global_excludes_partial_update_keeps_the_other_key(client, app, account) -> None:
+    """两个名单各改各的：面板一次只提交一个键，不能把另一个覆盖掉。
+
+    刻意做成部分更新（而不是让前端先读后写整份）：两个键互相覆盖的话，
+    表现就是"刚加完黑名单，排除频道就没了"，而且**没有任何报错**。
+    """
+    assert (
+        client.put("/api/forward-excludes", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+    body = client.put("/api/forward-excludes", json={"exclude_users": [555]}).json()
+
+    assert body["exclude_chats"] == [-100999], "写黑名单把「排除频道」覆盖掉了"
+    assert body["exclude_users"] == [555]
+    # 再读一次，确认是磁盘上的状态而不只是本次响应拼出来的
+    again = client.get("/api/rules").json()["global_excludes"]
+    assert again["exclude_chats"] == [-100999]
+    assert again["exclude_users"] == [555]
+
+
+def test_global_excludes_can_be_cleared(client, app, account) -> None:
+    """空数组 = 清空（与账号级那两个端点一致），用于"这个群现在要转了"。"""
+    assert (
+        client.put("/api/forward-excludes", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+
+    resp = client.put("/api/forward-excludes", json={"exclude_chats": []})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["exclude_chats"] == []
+
+
+def test_global_excludes_unknown_field_is_400(client, app, account) -> None:
+    """不认识的字段要 400，并且**说出来是哪个**。
+
+    静默忽略的话，前端把 ``exclude_chatz`` 拼错时会得到"保存成功"，
+    名单却没变 —— 用户完全无从下手。
+    """
+    resp = client.put("/api/forward-excludes", json={"exclude_chatz": []})
+
+    assert resp.status_code == 400
+    assert "exclude_chatz" in resp.json()["detail"]
+    assert not account.paths.forward_excludes_file.exists(), "400 时不该落盘"
+
+
+def test_global_excludes_empty_body_is_400(client, app, account) -> None:
+    """空 body 是客户端 bug，不能当"什么都不改"静默成功。
+
+    返回 200 会让面板显示"已保存"，而用户刚输入的那一项其实一条都没进去。
+    """
+    resp = client.put("/api/forward-excludes", json={})
+
+    assert resp.status_code == 400
+    assert not account.paths.forward_excludes_file.exists()
+
+
+def test_global_excludes_invalid_value_is_400_and_keeps_the_old_file(client, app, account) -> None:
+    """归一化不了的形状要 400，且**磁盘上那份好名单原样不动**。
+
+    注意单个字符串（``"@Foo"``）是**合法**的（与账号级一致：就排除这一个），
+    所以"非法值"只能是根本没法归一化的形状 —— 这里是浮点数
+    （归一化时要迭代它，当场抛错）。校验通过之前绝不能先写盘，
+    否则用户手抖一次就把好名单换成了一份没用的。
+    """
+    assert (
+        client.put("/api/forward-excludes", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+    path = account.paths.forward_excludes_file
+    before = path.read_bytes()
+
+    resp = client.put("/api/forward-excludes", json={"exclude_chats": 1.5})
+
+    assert resp.status_code == 400, resp.text
+    assert path.read_bytes() == before, "校验失败却把旧名单改了"
+
+
+def test_rules_overview_reports_global_excludes_load_errors(client, app, account) -> None:
+    """读坏时面板要能看出来"此刻按空名单在跑"。
+
+    只把 ``load_errors`` 记在 store 里、不往接口上带的话，这个数字谁都看不到，
+    面板仍然显示一屏正常的"未设置"，而磁盘上那份名单其实压根没读到。
+    """
+    path = account.paths.forward_excludes_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ 这不是合法 JSON", encoding="utf-8")
+
+    body = client.get("/api/rules").json()["global_excludes"]
+
+    assert body["load_errors"] == 1
+    assert body["exclude_chats"] == [] and body["exclude_users"] == []
+
+
+# --------------------------------------------------------------------------- #
+
 def test_forward_exclude_users_round_trip(client, app, account) -> None:
     """写进去能读回来，且 @ 前缀 / 大小写会被归一化。"""
     resp = client.put(
@@ -635,6 +797,134 @@ def test_global_rules_delete_can_be_scoped_to_one_account(client, app, two_accou
 
 def test_global_rules_delete_missing_is_404(client, app, two_accounts) -> None:
     assert client.delete("/api/rules/nope").status_code == 404
+
+
+def test_global_rules_can_be_added_to_or_removed_from_one_account(
+    client, app, two_accounts
+) -> None:
+    """规则卡片上「监听账号」那一下勾选，靠的就是这一对调用。
+
+    面板已经改成「一条规则一张主卡片 + 勾选监听账号」，于是这两个端点的语义成了
+    界面正确性的前提：
+      * 勾上要走 ``POST /api/rules {accounts:[name]}`` —— 只写**还没有**这条规则的
+        账号。PUT 是"覆盖已存在的副本"，账号里没有时它只算 missing，不写也不报错，
+        界面会看起来勾上了、其实什么都没发生。
+      * 取消要走 ``DELETE /api/rules/{id}?accounts=<name>`` —— 只移出那一个账号。
+        不带 accounts 的 DELETE 是"从所有账号删掉"（删除键的语义），误用会把别的
+        账号一起干掉。
+    """
+    client.post("/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME]})
+
+    def ids(name: str) -> list[str]:
+        return sorted(
+            r["id"] for r in client.get(f"/api/config/{name}/rules").json()["rules"]
+        )
+
+    # 勾上第二个账号
+    add = client.post("/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME2]})
+    assert add.status_code == 200, add.text
+    assert add.json()["saved"] == [NAME2]
+    assert ids(NAME) == ["r1"] and ids(NAME2) == ["r1"]
+
+    # 已经有的账号再勾一次：走 conflict（界面据 detail 报中文原因），不能重复写入
+    again = client.post("/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME]})
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]
+    assert ids(NAME) == ["r1"], "重复写入会让同一条消息被转发两次"
+
+    # 从第二个账号取消勾选：只动它
+    off = client.delete(f"/api/rules/r1?accounts={NAME2}")
+    assert off.status_code == 200, off.text
+    assert off.json()["removed"] == [NAME2]
+    assert ids(NAME) == ["r1"], "取消一个账号的监听把别的账号也删了"
+    assert ids(NAME2) == []
+
+
+def test_global_rules_can_be_fed_back_from_the_rules_overview(
+    client, app, two_accounts
+) -> None:
+    """面板勾「监听账号」时，POST 的规则体就是 ``GET /api/rules`` 里那一个对象。
+
+    所以要钉住这条回环：总览里序列化出来的规则必须能**原样**喂回 ``POST /api/rules``。
+    多一个未知字段（以后给模型加字段时很容易发生）就是 422，而用户在界面上看到的
+    只是"勾了没反应"—— 这是真实调用路径，和手写 payload 的用例不是一回事。
+    """
+    client.post("/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME]})
+    overview = client.get("/api/rules").json()
+    rule = next(
+        r
+        for acc in overview["accounts"]
+        if acc["name"] == NAME
+        for r in acc["rules"]
+        if r["id"] == "r1"
+    )
+
+    resp = client.post("/api/rules", json={"rule": rule, "accounts": [NAME2]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME2]
+
+    def copy_in(name: str) -> dict:
+        return next(
+            r
+            for r in client.get(f"/api/config/{name}/rules").json()["rules"]
+            if r["id"] == "r1"
+        )
+
+    # 两个账号里那份必须一模一样：不一样的话卡片上会一直挂着"内容不一致"的告警，
+    # 而"编辑一次全都改"又会把差异悄悄抹掉。
+    assert copy_in(NAME) == copy_in(NAME2)
+    assert copy_in(NAME2)["id"] == "r1"
+
+
+def test_edit_save_applies_the_account_diff(client, app, two_accounts) -> None:
+    """编辑弹窗一次保存 = PUT(内容) → POST(新增) → DELETE(取消)，最终分布必须正好是勾选的那些。
+
+    🔴 2026-09-29 用户反馈：「转发规则中新勾选账号无法勾选」——弹窗里的账号框被
+    ``locked=true`` 设成 disabled，点不动；修好之后保存必须真的按**差集**落盘，
+    否则界面显示"勾上了"而磁盘上没写进去。
+
+    这里用真 store 按界面的顺序跑一遍（面板 JS 的差集逻辑由 jsdom 台子覆盖，
+    这一条钉的是"这三个端点按这个顺序调用"的最终结果）：先 PUT 内容再增删，
+    不能把取消掉的账号又写回来，也不能漏掉新增的那个。
+    """
+    third = "third"
+    store = app.state.store
+    store.upsert_account(AccountRecord(name=third, created_at=utc_now_iso()))
+    store.load_account_config(third, create=True)
+
+    def owners() -> list[str]:
+        return [
+            acc["name"]
+            for acc in client.get("/api/rules").json()["accounts"]
+            if any(r["id"] == "r1" for r in acc["rules"])
+        ]
+
+    # 初始：规则先写进两个账号（显式给 accounts —— 不给的话会扇出到全部账号，
+    # 而这时 third 已经存在了）
+    assert client.post(
+        "/api/rules", json={"rule": _rule_payload("r1"), "accounts": [NAME, NAME2]}
+    ).status_code == 200
+    assert owners() == [NAME, NAME2]
+
+    # 用户在弹窗里改了内容、勾上 third、勾掉 acct ⇒ adds=[third], removes=[acct]
+    edited = {**_rule_payload("r1"), "name": "改过名"}
+    assert client.put("/api/rules/r1", json={"rule": edited}).status_code == 200
+    add = client.post("/api/rules", json={"rule": edited, "accounts": [third]})
+    assert add.status_code == 200, add.text
+    removed = client.delete(f"/api/rules/r1?accounts={NAME}")
+    assert removed.status_code == 200, removed.text
+
+    assert owners() == [NAME2, third], "差集没有落成界面上勾选的那两个账号"
+    # 内容改动要落在**仍在监听**的账号上（被取消的那个已经没有副本了）
+    for name in (NAME2, third):
+        assert client.get(f"/api/config/{name}/rules").json()["rules"][0]["name"] == "改过名"
+    assert client.get(f"/api/config/{NAME}/rules").json()["rules"] == []
+
+    # 一次取消**多个**账号：界面会把它们拼成 ?accounts=a,b（逗号分隔）
+    both = client.delete(f"/api/rules/r1?accounts={NAME2},{third}")
+    assert both.status_code == 200, both.text
+    assert both.json()["removed"] == [NAME2, third]
+    assert owners() == []
 
 
 def test_global_rules_test_needs_no_account(client, app) -> None:

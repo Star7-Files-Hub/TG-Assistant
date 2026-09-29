@@ -1130,6 +1130,61 @@ def test_rules_tag_input_ids_match_the_dom() -> None:
 # --------------------------------------------------------------------------- #
 # 优选 IP：「更新后发送通知」复选框
 # --------------------------------------------------------------------------- #
+def test_cloudflare_page_has_the_notify_checkbox() -> None:
+    """面板上要有「更新后发送通知」复选框（``cf-notify``）。"""
+    html = _cf_html()
+
+    assert 'id="cf-notify"' in html, "面板缺少通知开关复选框"
+    assert 'type="checkbox"' in html
+    assert "更新后发送通知" in html, "复选框没有说明文案"
+    # 默认勾上 = 与改动前行为一致（跟 cf-real-time 一个写法）
+    assert re.search(r'<input id="cf-notify" type="checkbox" checked', html)
+
+
+def test_cloudflare_page_loads_and_saves_the_notify_flag() -> None:
+    """复选框必须真的接上读写 —— 只画一个不接线的框等于没做。
+
+    ⚠️ 断言限定在 ``loadCfConfig()`` / ``saveCfConfig()`` 的函数体里：
+    模板别处也可能出现 ``cf-notify`` / ``notify``，全文搜的话把读写删掉
+    测试照样过。
+    """
+    html = _cf_html()
+
+    load_body = _js_function_body(html, "loadCfConfig")
+    assert "getElementById('cf-notify').checked = cfData.notify !== false" in load_body, (
+        "加载配置时没把 notify 反映到复选框上（老配置没有该字段时要默认勾选）"
+    )
+
+    save_body = _js_function_body(html, "saveCfConfig")
+    assert "notify: document.getElementById('cf-notify').checked" in save_body, (
+        "保存时没把复选框的值写进请求体"
+    )
+
+
+def test_cloudflare_notify_toggle_roundtrips_through_the_api(account, client) -> None:
+    """后端接口：默认 True（老前端不带该字段也照旧），提交 False 能写回。"""
+    url = f"/api/config/{NAME}/cloudflare_ip"
+
+    initial = client.get(url)
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["notify"] is True, "默认必须是 True，保持现有行为"
+
+    payload = dict(initial.json())
+    payload["notify"] = False
+    saved = client.put(url, json=payload)
+    assert saved.status_code == 200, saved.text
+
+    assert client.get(url).json()["notify"] is False, "notify=False 没写回配置"
+
+    # 状态接口也要带上它（跟 real_time_listen 一样由面板读）
+    status = client.get(f"{url}/status")
+    assert status.status_code == 200, status.text
+    assert status.json()["notify"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 抢注页：多任务（任务卡片列表 + 弹窗编辑）
+# --------------------------------------------------------------------------- #
 def _reg_grab_html() -> str:
     web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
     return (web_dir / "templates" / "reg_grab.html").read_text(encoding="utf-8")
@@ -1266,3 +1321,375 @@ def test_red_packet_page_edit_age_is_filled_in_minutes_stored_in_seconds() -> No
     collect = _js_function_body(html, "collectTask")
     assert "edit_max_age" in collect
     assert "* 60" in collect
+
+
+# --------------------------------------------------------------------------- #
+# 规则页：「全局排除」区块（所有账号共用一份）
+# --------------------------------------------------------------------------- #
+def test_rules_page_has_a_global_exclude_block() -> None:
+    """规则页顶部要有「全局排除」区块 —— 跨账号那份名单的**面板入口**。
+
+    用户原话：「将转发规则的黑名单及排除的频道也做成全局的」＋
+    「我设置的群id就不要转给我了」。后端 ``PUT /api/forward-excludes`` 做完了而面板上
+    没有入口的话，功能等于不存在 —— 这个项目已经踩过一次：账号级黑名单的字段、
+    引擎判定、测试全都在，**面板里连输入框都没有**，用户根本摸不到。
+
+    区块画在 ``#rules-list`` **外面**（它不属于任何一个账号分组），
+    所以它跟"有没有账号 / 有没有规则"无关。
+    """
+    html = _rules_html()
+
+    for dom in (
+        'id="rules-global"',
+        'id="rules-global-body"',
+        'id="rules-global-state"',
+    ):
+        assert dom in html, f"规则页缺少 {dom}"
+    assert "全局排除" in html, "区块没有标题，用户不知道这是干什么的"
+    assert "所有账号" in html, "没讲清这是跨账号共用的一份"
+    # 用户最关心的那句「我设置的群id就不要转给我了」：排除之后**通知也不会再发**
+    # （通知是转发成功之后才发的），页面上必须说出来，否则他会以为"至少还能收到提醒"。
+    assert "也不会再推送给你" in html
+
+    # 作用域标记：保存时要靠它决定走哪个端点（没有它就会去账号级端点找一个空账号）
+    assert 'data-global="1"' in html
+    # 区块在所有账号分组之前（也就是外面），不是某个账号分组的一部分
+    assert html.index('id="rules-global"') < html.index('id="rules-list"')
+
+    # 一个账号都没有的时候正是最该先把"这些群不要转给我"填上的时候 ⇒
+    # 渲染必须放在两个提前 return **之前**。
+    body = _js_function_body(html, "renderRules")
+    assert "renderGlobalExcludes();" in body
+    assert body.index("renderGlobalExcludes();") < body.index("if (accounts.length === 0)"), (
+        "全局区块跟着「没有账号」一起不渲染了 —— 新环境里用户第一步就是填它"
+    )
+
+
+def test_rules_global_block_saves_through_the_global_endpoint() -> None:
+    """全局那两行走 ``/api/forward-excludes``（没有账号参数），账号级走老端点。
+
+    两种作用域的数据来源、端点、DOM 标记都不一样，混成一条路径的话，
+    要么全局保存失败（账号名是空的），要么删 × 时去 accounts 里找一个叫 "" 的账号
+    然后**静默什么都不做**。
+    """
+    html = _rules_html()
+
+    save = _js_function_body(html, "saveExcludeList")
+    assert "/api/forward-excludes" in save
+    assert "isGlobal" in save
+    assert "/api/config/" in save, "账号级那条老端点不能被顺手删掉"
+
+    # 作用域从 DOM 标记读，不靠"账号存不存在"去猜（全局那份本来就没有账号）
+    assert "dataset.global" in _js_function_body(html, "onRuleListClick")
+    assert "dataset.global" in _js_function_body(html, "onExcludeListKeydown")
+
+    # 两个名单、两种作用域共用同一段标签 HTML（抄成四份的话下次改样式必漏一处）
+    row = _js_function_body(html, "excludeListRow")
+    assert 'data-global="1"' in row
+    assert "data-account=" in row
+    render = _js_function_body(html, "renderGlobalExcludes")
+    assert "excludeListRow(null, 'exclude-chats', true)" in render
+    assert "excludeListRow(null, 'exclude-users', true)" in render
+
+    # 区块在 #rules-list 外面 ⇒ 事件委托要单独接一次，否则回车 / 点 × 没人响应
+    init = _js_function_body(html, "init")
+    assert "getElementById('rules-global')" in init
+    assert "addEventListener('click'" in init
+    assert "addEventListener('keydown'" in init
+
+
+def test_rules_global_state_warns_when_the_name_list_could_not_be_read() -> None:
+    """名单文件读不到时页面必须**说出来**，而不是显示一屏正常的"未设置"。
+
+    ``forward_excludes.json`` 写坏时引擎按**空名单**继续跑（少排除几条好过所有账号
+    转不起来）。代价是"用户以为配好了、实际没生效"—— 所以这个失败必须在页面上
+    可见（状态里报"已失败 N 次"），否则他会对着一个干净的界面发呆，
+    然后在群里看到消息照样被转出去。
+    """
+    html = _rules_html()
+
+    state = _js_function_body(html, "renderGlobalState")
+    assert "globalExcludesErrors" in state, "状态没读失败次数"
+    assert "空名单" in state, "提示文案没说清此刻是按什么在跑"
+    assert "rules-global-state-warn" in state, "这种要用户注意的状态得用独立样式"
+
+    load = _js_function_body(html, "loadAll")
+    assert "data.global_excludes" in load, "总览响应里那一份没被读进来"
+    assert "load_errors" in load, "失败次数没有传到状态上"
+
+
+def test_rules_page_collapses_long_match_lists() -> None:
+    """匹配条件 ≥ 3 条时折叠成 ``<details>``，而不是把卡片铺满一屏。
+
+    用户原话：「正则规则不用全部展示，点击编辑或加个倒三角打开」。
+    线上那条规则配了 **20 条**正则（2026-09-29 取证），全铺出来一张卡片就是一屏，
+    真正有用的信息（来源 / 目标 / 模式）全被挤到看不见的地方。
+
+    阈值定在 3：1～2 条时不折叠 —— 为了两条条件多一次点击只会更碍事。
+    """
+    html = _rules_html()
+
+    assert "PATTERN_COLLAPSE_THRESHOLD = 3" in html
+    patterns = _js_function_body(html, "renderRulePatterns")
+    # 折叠的判定必须真的用上阈值（< 阈值就照原样铺开）
+    assert "patterns.length < PATTERN_COLLAPSE_THRESHOLD" in patterns
+    assert '<details class="rule-patterns-details">' in patterns
+    # 收起时给预览 + 条数：只留一个数字的话，用户判断不出这条规则到底匹配什么
+    assert "rule-patterns-count" in patterns
+    assert "rule-pattern-preview" in patterns
+
+    # 卡片必须走这个函数：只定义不调用的话，长规则照样全铺出来
+    card = _js_function_body(html, "renderRuleCard")
+    assert "renderRulePatterns(match, patterns)" in card
+
+
+
+# --------------------------------------------------------------------------- #
+# 转发规则页：以**任务**为维度展示（同一条规则不重复出现）
+# --------------------------------------------------------------------------- #
+def test_rules_page_renders_one_card_per_rule_not_per_account() -> None:
+    """同一条规则在 N 个账号里各存一份，页面上只能出现**一次**。
+
+    🔴 用户原话：「展示以及任务是以任务为维度，而不是以账号，同样的规则不做二次
+    展现，一条主规则，选择监听账号即可」。规则当初就是扇出写出去的（``POST
+    /api/rules`` 不带 accounts 写全部账号），按账号渲染会让同一条规则重复出现 N 次：
+    用户数不清自己有几条任务，也不知道改一处会不会影响别处。
+
+    所以渲染入口必须先做一次「账号 → 规则」的**转置**，再按 rule.id 出卡片。
+    """
+    html = _rules_html()
+
+    render = _js_function_body(html, "renderRules")
+    assert "collectRules()" in render, "规则列表没有按 rule.id 合并"
+    assert "entries.map(renderRuleCard)" in render, "主卡片不是按规则维度渲染的"
+    assert "accounts.map(renderAccountGroup)" not in render, (
+        "renderRules 又回到按账号渲染了 —— 同一条规则会重复出现"
+    )
+    assert "renderAccountSettings()" in render, "账号级设置没有单独的落点"
+    # 有账号但一条规则都没有时，账号级设置必须照样渲染：老代码在这一步整天提前
+    # return，排除名单连入口都没有 —— 而"先把我不要的群填上"正是新环境的第一步。
+    assert "return" not in render[render.index("collectRules()"):], (
+        "规则为空时又提前 return 了，账号级设置会跟着一起不渲染"
+    )
+
+    collect = _js_function_body(html, "collectRules")
+    assert "byId.get(rule.id)" in collect, "没有按 rule.id 去重"
+    assert "entry.owners.push(acc.name)" in collect, "没有聚出「这条规则落在哪些账号」"
+    # 各账号里那份内容可能分叉（手改过某个账号的 config.json / 走过单账号接口）。
+    # 分叉必须能被卡片说出来，否则显示一份、别的账号按另一份跑。
+    assert "entry.divergent" in collect
+
+    card = _js_function_body(html, "renderRuleCard")
+    assert "entry.owners" in card
+    assert "data-rule-id" in card
+
+    # 账号卡片里**不许**再有规则卡片：规则已经搬到主视图了
+    group = _js_function_body(html, "renderAccountGroup")
+    assert "renderRuleCard" not in group, "账号卡片里还在渲染规则 —— 同一条规则会重复出现"
+
+
+def test_rules_page_card_can_move_a_rule_between_accounts() -> None:
+    """卡片上的「监听账号」勾选 = 把这条规则写进 / 移出某个账号，其余账号不受影响。
+
+    两个端点绝不能弄混：
+      * 勾上要用 ``POST /api/rules``（只写缺这条规则的账号）。用 PUT 的话，账号里
+        没有这条规则时它只算 ``missing`` —— **不写也不报错**，界面看起来勾上了、
+        其实什么都没发生。
+      * 取消要用 ``DELETE /api/rules/{id}?accounts=<name>``。不带 accounts 的
+        DELETE 是"从所有账号删掉"（那是删除键的语义），混用会把其它账号一起干掉。
+    """
+    html = _rules_html()
+    set_owner = _js_function_body(html, "setRuleOwner")
+
+    assert "'/api/rules'" in set_owner and "method: 'POST'" in set_owner, (
+        "勾上监听账号没有走 POST /api/rules（用 PUT 时该账号没有这条规则就会静默不写）"
+    )
+    assert "?accounts=" in set_owner and "method: 'DELETE'" in set_owner, (
+        "取消监听账号没有走 DELETE ?accounts=（不带 accounts 会把其它账号一起删了）"
+    )
+    # 取消最后一个监听账号 = 这条规则没有任何账号在跑（等于删除），必须先问
+    assert "confirm(" in set_owner and "最后一个监听账号" in set_owner
+    # 成功失败都要重拉：界面不能停在"看起来成功了"的状态
+    assert set_owner.count("await loadAll()") >= 2
+
+    # 账号名从 checkbox 的 value 上取 —— 主卡片不在任何 [data-account] 里面，
+    # 靠 closest('[data-account]') 取账号会拿到 null（那样"勾了没反应"）。
+    change = _js_function_body(html, "onRuleListChange")
+    assert "rule-owner" in change and "input.value" in change
+
+    row = _js_function_body(html, "ruleOwnersRow")
+    assert 'data-role="rule-owner"' in row
+    assert 'value="${escapeHtml(acc.name)}"' in row
+    assert "监听账号" in row
+    assert "checked" in row, "卡片刻不出哪些账号在监听"
+
+
+def test_rules_page_account_scoped_settings_stay_out_of_the_rule_cards() -> None:
+    """账号级的东西（转发总开关 / 排除名单 / 已用注册码）单独一区，别混进规则卡片。
+
+    规则改成按 rule.id 合并之后，这些设置不再属于任何一条规则。混在卡片里的话，
+    用户又会以为"这个排除名单只对当前这条规则生效"—— 而"账号级"正是它最容易被
+    误解的地方（弹窗里那份才是规则级的）。
+    """
+    html = _rules_html()
+
+    settings = _js_function_body(html, "renderAccountSettings")
+    assert "rules-account-settings" in settings
+    assert "accounts.map(renderAccountGroup)" in settings
+    assert "各账号单独设置" in settings, "没有标题，用户不知道这一节是干什么的"
+    # 每次 loadAll 都会重建 innerHTML：展开状态必须带过去，
+    # 否则用户改一次名单（保存后会重拉）这一节就自己合上了。
+    assert "document.querySelector('.rules-account-settings')" in settings
+    assert "open" in settings
+
+    group = _js_function_body(html, "renderAccountGroup")
+    for needle in ("forward-enabled", "excludeChatsRow(acc)", "usedCodesRow(acc)"):
+        assert needle in group, f"账号卡片里少了 {needle}"
+
+    # 这一节是 #rules-list 的子元素 ⇒ 已有的委托（click / change / keydown）照旧覆盖它
+    init = _js_function_body(html, "init")
+    assert "getElementById('rules-list')" in init
+    assert "addEventListener('change', onRuleListChange)" in init
+
+
+def test_rules_page_says_a_person_name_can_never_match() -> None:
+    """人名 / 中文昵称不能在输入框里被**静默接受** —— 它永远匹配不到。
+
+    🔴 用户原话：「转发规则编辑内想加人加不上」。必然发生的那条根因：
+    ``config.parse_chat_ref()`` 对"非数字、非 @"的输入返回 ``text.lower()``，当成
+    username 存进 ``RefSet``；而引擎只比 sender_id 与 username，Telegram 的
+    @username 又只允许 ASCII ⇒ 中文名**标签显示、保存成功、规则永远不生效**
+    （2026-09-29 jsdom 实测：保存请求体里原样带着 "张三"，toast 还报"已保存"）。
+
+    静默接受是最坏的选择：用户以为配好了，然后在群里等一条永远不来的转发。
+    所以这里钉住三层：判断逻辑、被拒时不吃掉输入、以及用户看得见的提示语。
+    """
+    html = _rules_html()
+
+    reason = _js_function_body(html, "refRejectReason")
+    assert "NUMERIC_ID_RULE" in reason and "USERNAME_RULE" in reason
+    assert "TME_LINK_RULE" in reason, "频道还要接受 t.me 链接"
+    assert "人名 / 昵称" in reason and "@username" in reason, "拒绝原因是中文的吗？"
+
+    # 适用范围要卡准：引用类字段才校验
+    fields = re.search(r"const REF_FIELDS = \{(.*?)\};", html, re.S)
+    assert fields, "找不到 REF_FIELDS"
+    for key in ("sources", "exclude_sources", "targets", "from_users", "exclude_users"):
+        assert f"{key}:" in fields.group(1), f"{key} 不在校验范围里"
+    for key in ("patterns", "exclude_patterns"):
+        assert f"{key}:" not in fields.group(1), (
+            f"{key} 是**正则**不是引用 —— (?:Whitelist)_([A-Za-z0-9]{{10}}) / 张三 都可能"
+            "是合法正则，拿这套规则去拦会误杀"
+        )
+
+    # 被拒时不清空输入框：用户得能在原值上改一个字符，而不是重打一遍
+    assert "if (addTag(field, this.value.trim())) this.value = '';" in html, (
+        "校验失败时把输入框清空了 —— 用户刚打的内容会凭空消失"
+    )
+    add_tag = _js_function_body(html, "addTag")
+    assert "return false;" in add_tag and "toast(" in add_tag
+
+    # 账号级排除名单复用同一个 helper，不写第二套判断
+    excl = _js_function_body(html, "onExcludeListKeydown")
+    assert "refRejectReason(EXCLUDE_LISTS[role].key" in excl
+    assert "return;   // 不清空输入框" in excl or "不清空输入框" in excl
+
+    # 提示要写在用户看得见的地方（弹窗里两个名单下面各一行）
+    assert "只能填数字 ID" in html and "匹配不到" in html
+
+
+def test_rules_page_warns_about_unmatchable_values_already_saved() -> None:
+    """已经被静默存进去的人名，打开编辑器时要被**指出来**（但只提示、不拦保存）。
+
+    光"以后不再收坏人名"还不够：修复前被坑过的用户，配置里已经躺着「张三」了，
+    他打开编辑器看到的还是一堆正常的标签，永远不知道那些人从来没生效过。
+    所以编辑一条老规则时，把匹配不到的值点名报出来。
+
+    ⚠️ 只提示不拦：拦了就是"我的老规则打不开 / 存不了"，那是比原 bug 更糟的结果。
+    """
+    html = _rules_html()
+
+    assert 'id="rule-refs-warn"' in html, "缺少提示条的位置"
+    warn = _js_function_body(html, "warnAboutUnmatchableRefs")
+    assert "refRejectReason(field, value)" in warn, "没复用同一套判断（会跟输入时的口径不一致）"
+    assert "form-hint-warn" in html
+    # 只提示：不能 return false / 不能 toast 之后拦掉保存
+    assert "return false" not in warn
+
+    edit = _js_function_body(html, "editRule")
+    assert "warnAboutUnmatchableRefs(rule)" in edit, "编辑时没有检查已存的值"
+    # 新建时必须清掉，否则会把上一条规则的告警带到新表单上
+    assert "warnAboutUnmatchableRefs({})" in _js_function_body(html, "openAddRule")
+
+
+def test_rules_page_ignores_the_enter_that_commits_an_ime_candidate() -> None:
+    """中文输入法**选字/上屏**那一下的回车不是"提交"，退格也不是"删除"。
+
+    用户是中国用户：打「张三」时按回车先是在选字，浏览器照样派发 keydown(Enter)，
+    只多带一个 ``isComposing=true``（老浏览器是 keyCode 229）。修复前这一下会把还
+    没上屏的拼音当成标签加进去**并清空输入框** —— 字没了、进去一个半截值，主观
+    感受就是"想加人加不上"（2026-09-29 jsdom 实测：tagInputs 里出现 "zhangsan"、
+    输入框被清空）。
+
+    守卫必须放在所有分支**之前**：上屏那一下的退格同样不该顺手删掉一个已有标签。
+    """
+    html = _rules_html()
+
+    cases = (("initTagInputs", "e"), ("onExcludeListKeydown", "event"))
+    for name, var in cases:
+        body = _js_function_body(html, name)
+        assert f"{var}.isComposing || {var}.keyCode === 229" in body, (
+            f"{name} 缺少输入法守卫：选字那一下的回车会被当成提交"
+        )
+        assert body.index("isComposing") < body.index("'Enter'"), (
+            f"{name} 里的守卫放在了回车分支之后 —— 等于没防"
+        )
+
+
+def test_rules_page_edit_modal_can_change_listening_accounts() -> None:
+    """编辑弹窗里的账号勾选必须**可点**，而且保存时要按「差集」真落地。
+
+    🔴 2026-09-29 用户反馈：「转发规则中新勾选账号无法勾选」。根因是编辑流程里传了
+    ``renderAccountPicker(editingOwners, true)``，``locked=true`` 把弹窗里的账号
+    框全设成 ``disabled`` —— 物理上点不动，点了也不产生任何请求（面板日志里确实
+    没有任何用户发起的 ``POST /api/rules``）。
+
+    只解锁 UI 同样不行：保存时若不落地差集，界面会显示"勾上了"而磁盘上根本没写
+    进去 —— 那比锁着更糟。所以这里两类断言一起钉：可点 + 差集落地 + 失败回读。
+    """
+    html = _rules_html()
+
+    # 1) 不能再锁
+    assert "renderAccountPicker(editingOwners, true)" not in html, "编辑弹窗的账号框又被锁上了"
+    assert "disabled" not in _js_function_body(html, "renderAccountPicker"), (
+        "账号勾选框里又出现了 disabled —— 用户会点不动"
+    )
+    # 卡片底部那行勾选保持可用（别为了修这个把它一起改成只读）
+    assert 'data-role="rule-owner"' in _js_function_body(html, "ruleOwnersRow")
+    assert "setRuleOwner" in html
+
+    # 2) 保存时落地差集：新增 POST / 取消 DELETE ?accounts= / 取消最后一个先 confirm
+    save = _js_function_body(html, "saveEditedRule")
+    assert "selectedRuleAccounts()" in save
+    assert "adds" in save and "removes" in save, "没有算差集"
+    assert "postJson('/api/rules', {rule: rule, accounts: adds})" in save, (
+        "新增监听账号没有走 POST /api/rules（用 PUT 的话账号里没有这条规则时不会写）"
+    )
+    assert "?accounts=" in save and "deleteJson(" in save, (
+        "取消监听账号没有走 DELETE ?accounts=（不带 accounts 会从所有账号删掉）"
+    )
+    assert "confirm(" in save, "取消最后一个监听账号要先问"
+    assert "await loadAll()" in save, "保存后必须回读磁盘真实状态"
+    # 失败也要回读：否则弹窗还停在"我勾上了"的样子，用户会以为已经生效
+    assert "failEditSave" in save
+    resync = _js_function_body(html, "reloadAndResyncEdit")
+    assert "renderAccountPicker(" in resync, "保存失败后弹窗里的勾选没有回读真实状态"
+    assert "findRule(ruleId)" in resync
+
+    # 3) 「将写入：…」要说差集，不能再说"全部账号"（编辑时那个框不是这个意思）
+    summary = _js_function_body(html, "updateAccountSummary")
+    assert "新增监听" in summary and "取消监听" in summary
+    assert "editingOwners" in summary
+    # 编辑分支里不能再出现"全部账号"的说法（那个框是既有监听账号的勾选状态）
+    edit_branch = summary[summary.index("if (editingRuleId)"):summary.index("return;")]
+    assert "全部账号" not in edit_branch, "编辑分支还在说「全部账号」—— 与实际做的事对不上"
