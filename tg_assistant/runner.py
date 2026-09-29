@@ -724,6 +724,12 @@ class AccountRunner:
                         "persisted", False
                     ),
                     "downgraded": snapshot["downgraded"],
+                    # 「已使用注册码」拦截：学到多少条、拦下多少次、现在记着多少条。
+                    # 🔴 ``used_known`` 一直是 0 就说明**通知根本没被认出来** ——
+                    # 这是「拦不住已用码」时唯一能直接看出问题在哪的数字。
+                    "used_learned": snapshot.get("used_learned", 0),
+                    "used_skipped": snapshot.get("used_skipped", 0),
+                    "used_known": (snapshot.get("used_codes") or {}).get("known", 0),
                 }
             )
         if self.hunter is not None:

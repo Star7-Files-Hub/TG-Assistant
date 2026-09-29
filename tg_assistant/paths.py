@@ -80,6 +80,32 @@ class AccountPaths:
     def state_file(self) -> Path:
         return self.root / "state.json"
 
+    @property
+    def used_codes_file(self) -> Path:
+        """「已被用掉的注册码」记忆（转发前靠它拦掉废码）。
+
+        🔴 **为什么必须落盘**：码被用掉是**永久事实**，而这份记忆原本只在内存里 ——
+        一次重启就忘光，重启之后同一条已经用掉的码又能被转发出去，用户拿到的还是废码。
+        这与 ``RecentContentDedupe`` 落盘（``Paths.dedupe_file``）是同一个理由。
+
+        放在**账号目录**下、而不是像去重表那样放 ``data/`` 根共享：``ttl`` /
+        ``min_visible`` 都是账号级配置，共用一份数据就等于让 A 账号的策略去裁剪
+        B 账号的记忆（A 的 TTL 一到就把 B 还要用的前缀删了）。
+        """
+        return self.root / "used_codes.json"
+
+    @property
+    def red_packet_settled_file(self) -> Path:
+        """抢红包「已得出定论的消息」记忆（``_settled`` 的落盘）。
+
+        🔴 **为什么必须落盘**：``_settled`` 原本只在内存里，而它的作用是让**同一条红包
+        消息不再被点第二次**（红包 bot 会反复编辑同一条消息，见 ``RedPacketHunter._settle``）。
+        一次重启就忘光 —— 线上实测（2026-09-29）一条长驻红包 8 小时里被点了 8 次，
+        中间夹着 8 次服务重启：11:16 已经判出「你已经领过」，13:50 重启之后就又点了一次。
+        与 ``used_codes_file`` 同理，这是账号级的状态。
+        """
+        return self.root / "red_packet_settled.json"
+
     def ensure(self) -> "AccountPaths":
         self.root.mkdir(parents=True, exist_ok=True)
         return self

@@ -603,6 +603,68 @@ async def api_forward_set_exclude_users(
     return {"ok": True, "exclude_users": list(config.forward.exclude_users)}
 
 
+@router.put("/config/{name}/forward-used-codes")
+async def api_forward_set_used_codes(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """「已使用注册码」拦截设置：命中使用通知的注册码不再转发。
+
+    这些码频道会发「🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░」，
+    码尾被遮罩 —— 已经用掉的码再转出去，别人拿到的是一串用不了的字符，
+    所以让引擎记住用过的码，命中就不再发。
+
+    请求体两种写法都收：平铺的六个字段，或 ``{"used_codes": {...}}`` ——
+    面板用前者，手搓 curl / 脚本更习惯后者（和 ``rules`` 的 ``{"rule": {...}}`` 一致）。
+    """
+    from tg_assistant.config import ForwardConfig, ForwardUsedCodes
+    from tg_assistant.matching import compile_user_pattern
+
+    _require_account(store, name)
+    config = store.load_account_config(name, create=False)
+
+    nested = payload.get("used_codes") if isinstance(payload, dict) else None
+    raw: Any = payload if nested is None else nested
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="used_codes 必须是对象")
+
+    # 正则**先**单独编译一次，为的是错误信息：pydantic 会把校验失败糊成一大段
+    # 英文（还带 input_value / type 之类），而这一项恰恰是用户手写、最容易写错的。
+    # 只判「能不能编译」；**范围**（min_visible / ttl）留给模型判，不在路由里
+    # 手写第二份阈值 —— 「同一个判断抄两份」是这个项目踩过的坑。
+    # 模型自己也校验这个字段（``ForwardUsedCodes._check_pattern``），flags 不影响
+    # 合法性，所以两处不会给出"这里放行、引擎那边报错"的分歧。
+    candidate = raw.get("notice_pattern")
+    if isinstance(candidate, str) and candidate:
+        try:
+            compile_user_pattern(candidate)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"通知正则表达式无效：{exc}") from exc
+
+    # 🔴 在**现有值**上做增量，而不是拿 payload 从零构造：面板只暴露 5 个控件
+    # （没有 persist），从零构造会把没传的字段悄悄打回默认值 —— 用户改个时长，
+    # 落盘开关就被重置了，而且毫无提示。顺带也支持「只改一个字段」的写法。
+    current = getattr(config.forward, "used_codes", None)
+    base = current.model_dump() if current is not None else {}
+    try:
+        parsed = ForwardUsedCodes.model_validate({**base, **raw})
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"已使用注册码配置校验失败：{exc}") from exc
+
+    # 和「排除频道 / 黑名单」同一套写法：整体重建 forward 再校验。
+    # 这样 rules / exclude_* 一个都不会被这次保存带走（有回归用例钉着）。
+    try:
+        config.forward = ForwardConfig.model_validate(
+            {**config.forward.model_dump(), "used_codes": parsed.model_dump()}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"已使用注册码配置校验失败：{exc}") from exc
+
+    store.save_account_config(name, config)
+    return {"ok": True, "used_codes": parsed.model_dump(mode="json")}
+
+
 # --------------------------------------------------------------------------- #
 # 全局转发规则（跨账号）
 #
@@ -698,6 +760,21 @@ async def api_rules_overview(
     for record in store.load_registry().accounts:
         config = store.load_account_config(record.name, create=False)
         info = status.get(record.name, {})
+        # 「已使用注册码」的运行统计由转发引擎放在 snapshot 的 forward 段里。
+        # ⚠️ 三层都要防御：账号没在跑时 ``stats`` 是空 dict；引擎没起时 ``forward``
+        # 是 ``None``；核心（forwarder）还没部署时那三个键**根本不存在** ——
+        # 整个「转发规则」页共用这一个响应，为三个计数器把接口打成 500
+        # 等于整页白屏，代价完全不对称。
+        forward_stats = (info.get("stats") or {}).get("forward") or {}
+        # 计数器的名字变过：最早定的是 ``used_learned`` / ``used_skipped`` /
+        # ``used_known`` 三个平铺键，后来引擎把 ``UsedCodeStore.snapshot()``
+        # （含 ``known`` / ``learned``）整个塞进了 ``forward["used_codes"]``。
+        # 两种形状都认：顶层键读不到就退回嵌套快照，都取不到才是 0 ——
+        # 「已记住」永远显示 0 时，用户会以为拦截没用（其实只是名字对不上）。
+        used_store = forward_stats.get("used_codes") or {}
+        # 同理：配置字段由核心提供，读不到就退回空 dict（面板自己会填默认值），
+        # 不让「规则总览」因为一个还没上线的功能挂掉。
+        used_codes_cfg = getattr(config.forward, "used_codes", None)
         accounts.append(
             {
                 "name": record.name,
@@ -709,6 +786,22 @@ async def api_rules_overview(
                 "forward_enabled": config.forward.enabled,
                 "exclude_chats": list(config.forward.exclude_chats),
                 "exclude_users": list(config.forward.exclude_users),
+                "used_codes": (
+                    used_codes_cfg.model_dump(mode="json")
+                    if used_codes_cfg is not None
+                    else {}
+                ),
+                # learned = 累计学到多少条（只增）；known = **当前**还记着多少条
+                # （会因 TTL 到期而减少）。两者的名字很像，别配反了。
+                "used_code_stats": {
+                    "learned": forward_stats.get("used_learned")
+                    or used_store.get("learned")
+                    or 0,
+                    "skipped": forward_stats.get("used_skipped") or 0,
+                    "known": forward_stats.get("used_known")
+                    or used_store.get("known")
+                    or 0,
+                },
                 "rules": [rule.model_dump(mode="json") for rule in config.forward.rules],
             }
         )

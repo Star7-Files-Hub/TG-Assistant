@@ -346,6 +346,83 @@ class ForwardRule(StrictModel):
         return self.name or self.id
 
 
+class ForwardUsedCodes(StrictModel):
+    """转发前拦掉**已经被用掉的**注册码。
+
+    🔴 为什么需要它：这些 Emby 码频道在码被用掉后会播报一条**使用通知**
+    （``🎟️ 注册码使用 - jf [...] 使用了 MSKY-30-Register_f1t░░░░░░░``），
+    而通知里的码**尾部是遮罩的**。于是经常出现：通知早就播过了，过几分钟
+    又有人把完整码发出来（猜码谜底 / 二次转发），此时转发规则照样命中，
+    但那个码其实已经没用了 —— 用户拿到的是一条废码。
+
+    做法就是从通知里认出**露出的那截前缀**记下来，之后凡是含同一个码的内容
+    都不再转发。与抢注引擎 :class:`RegGrabDetect` 里的 ``used_pattern`` /
+    ``used_min_len`` 是同一个思路（默认值也保持一致），区别只是这里作用于**转发**，
+    因此不依赖抢注功能是否开启。
+    """
+
+    enabled: bool = True
+
+    #: 「使用通知」的关键词：命中任一才算通知。
+    #:
+    #: 这些码频道量很大，而通知正则（``使用 xxx``）本身比较宽 ——
+    #: 不加关键词的话，群里一句「这个插件怎么使用 1panel」都可能被当成通知。
+    #: 「注册码使用」里天然含「码使用」，正是既有转发规则里
+    #: ``(?!.*码使用)`` 防的那个串。
+    notice_keywords: list[str] = Field(default_factory=lambda: ["码使用"])
+
+    #: 从通知里抠出那个（可能被遮罩的）码。默认与 ``RegGrabDetect.used_pattern`` 同款。
+    notice_pattern: str = r"使用[了]?\s*([A-Za-z0-9][^\s，。、]*)"
+
+    #: 「忽略形状」：可见 token **匹配到这个正则就整条跳过**，不记进记忆。
+    #:
+    #: 🔴 为什么需要它：线上有两种码形状，但只有一种**真会被转发**。
+    #: 2026-09-29 用生产配置逐条规则试跑取证：
+    #:
+    #: * ``7017826500-2cIExxxx``（``<用户id>-<值>``，没有下划线）——
+    #:   20 条规则**没有任何一条**命中它，也就是说它压根不会被转发。
+    #:   学它只会白占记忆，而且它只有 4 位区分度，还有误伤别的码的风险；
+    #: * ``ChaPanda-30-Register_Ayqxxxx`` —— 规则 1 命中、确实会被转发，
+    #:   这种才是**必须**学的。
+    #:
+    #: 默认值就是前者那种形状。留空 = 什么都学。
+    ignore_token_pattern: str = r"^\d+-\w+$"
+
+    #: 通知里可见位数**少于**这个值就不记。
+    #:
+    #: 只露一两位时几乎任何码都能「对得上」，记下来只会误伤好码。
+    #: 默认 3，与 ``RegGrabDetect.used_min_len`` 一致 —— 通知一般露 3 位、遮 7 位。
+    min_visible: int = Field(default=3, ge=1, le=32)
+
+    #: 记住多久（秒）。默认 1 小时，与 ``RegGrabTask.code_ttl`` 一致。
+    #:
+    #: 前缀比对天生有误伤可能（另一个码可能共享同样 3 位），TTL 越短误伤窗口越小；
+    #: 而码从被用掉到再被转发出来通常只有几分钟，1 小时足够。
+    #: 0 = 永不过期。
+    ttl: float = Field(default=3600.0, ge=0.0, le=86400.0)
+
+    #: 是否落盘。关掉则只在内存里记（进程重启就忘）。
+    #: 默认开：码被用掉是**永久事实**，重启后重新转发一条废码是最难查的那种 bug。
+    persist: bool = True
+
+    @field_validator("notice_keywords", mode="before")
+    @classmethod
+    def _as_list(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.replace("，", ",").split(",") if item.strip()]
+        return value
+
+    @field_validator("notice_pattern", "ignore_token_pattern")
+    @classmethod
+    def _check_pattern(cls, value: str) -> str:
+        # 空串表示「不认通知」/「什么都学」，是合法配置 —— 只有写错的正则才拦。
+        if value:
+            _check_regex(value, "forward.used_codes.notice_pattern")
+        return value
+
+
 class ForwardConfig(StrictModel):
     enabled: bool = True
     rules: list[ForwardRule] = Field(default_factory=list)
@@ -374,6 +451,10 @@ class ForwardConfig(StrictModel):
     #: 判定放在**规则循环之前** —— 黑名单里的人发什么都不会被转发，
     #: 不需要给每条规则各配一遍（配 N 遍就一定会漏配一条）。
     exclude_users: list[ChatRef] = Field(default_factory=list)
+
+    #: 已使用注册码拦截（见 :class:`ForwardUsedCodes`）。
+    #: 挂在账号级而不是每条规则上：一个码被用掉是**全局事实**，不分规则。
+    used_codes: ForwardUsedCodes = Field(default_factory=ForwardUsedCodes)
 
     @field_validator("exclude_chats", "exclude_users", mode="before")
     @classmethod
@@ -1588,6 +1669,7 @@ __all__ = [
     "CONFIG_VERSION",
     "ChatRef",
     "ForwardConfig",
+    "ForwardUsedCodes",
     "ForwardMode",
     "ForwardRule",
     "MatchConfig",

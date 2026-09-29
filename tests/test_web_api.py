@@ -267,6 +267,179 @@ def test_forward_exclude_users_is_independent_of_chats_and_rules(client, app, ac
 
 
 # --------------------------------------------------------------------------- #
+# 「已使用注册码」拦截
+# --------------------------------------------------------------------------- #
+def test_used_codes_round_trip(client, app, account) -> None:
+    """写进去能读回来 —— 总览接口必须带上它，否则面板一刷新设置就"消失"。"""
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes",
+        json={
+            "enabled": True,
+            "notice_keywords": ["码使用", "已使用"],
+            "notice_pattern": r"使用[了]?\s*([A-Za-z0-9][^\s，。、]*)",
+            "min_visible": 4,
+            "ttl": 1800,
+            "persist": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["used_codes"]["min_visible"] == 4
+    assert row["used_codes"]["ttl"] == 1800
+    assert row["used_codes"]["notice_keywords"] == ["码使用", "已使用"]
+
+
+def test_used_codes_ignore_shape_round_trip(client, app, account) -> None:
+    """「忽略形状」也要能读写 —— 默认值就是线上那种不会被转发的形状。"""
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["used_codes"]["ignore_token_pattern"] == r"^\d+-\w+$"
+
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes", json={"ignore_token_pattern": ""}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["used_codes"]["ignore_token_pattern"] == ""
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["used_codes"]["ignore_token_pattern"] == ""
+
+
+def test_used_codes_rejects_bad_ignore_pattern(client, app, account) -> None:
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes",
+        json={"ignore_token_pattern": "([A-Za-z0-9"},
+    )
+    assert resp.status_code == 400
+
+
+def test_metrics_endpoint_shape_and_auth(client, app, account) -> None:
+    """数据大盘：三个口径一次返回，「天」要写明是北京时间。"""
+    response = client.get("/api/metrics")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["timezone"] == "北京时间 (UTC+8)"
+    assert set(payload["ranges"]) == {"day", "month", "total"}
+    for name, view in payload["ranges"].items():
+        assert view["label"], f"{name} 少了标题，面板上会显示成空白"
+        assert set(view) >= {"forward", "red_packet", "reg_grab"}
+    # 用户在需求里专门写了「按北京时间0点开始计算」，这个口径必须能被界面表达出来。
+    assert "北京时间" in payload["timezone"]
+
+
+def test_metrics_reads_history_from_disk_without_a_runner(client, app, account) -> None:
+    """面板「还没点启动」时也要看得见历史 —— 这些数是从磁盘读的，不是运行期才有的。
+
+    顺带钉住：接口惰性建出来的实例要落盘，重启进程后历史还在。
+    """
+    from tg_assistant.metrics import MetricsStore
+
+    store = app.state.store
+    seeded = MetricsStore(state_path=store.paths.metrics_file)
+    seeded.record("forward")
+    seeded.record("forward")
+    seeded.record("red_packet")
+
+    payload = client.get("/api/metrics").json()
+    assert payload["ranges"]["day"]["forward"] == 2
+    assert payload["ranges"]["day"]["red_packet"] == 1
+    assert payload["ranges"]["total"]["forward"] == 2
+    assert payload["ranges"]["month"]["reg_grab"] == 0
+
+
+def test_used_codes_stats_present_without_runtime(client, app, account) -> None:
+    """没跑起来时统计也要在，而且是 0 —— 面板拿到 ``undefined`` 会显示成字面量。"""
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["used_code_stats"] == {"learned": 0, "skipped": 0, "known": 0}
+
+
+def test_used_codes_partial_update_keeps_other_fields(client, app, account) -> None:
+    """只改一个字段不能把没传的字段打回默认值。
+
+    面板只暴露 5 个控件（没有 ``persist``）—— 从零构造会把落盘开关悄悄重置成
+    默认值，用户改个时长就丢了设置，而且毫无提示。
+    """
+    assert (
+        client.put(
+            f"/api/config/{NAME}/forward-used-codes",
+            json={"enabled": True, "persist": False, "ttl": 7200},
+        ).status_code
+        == 200
+    )
+    resp = client.put(f"/api/config/{NAME}/forward-used-codes", json={"min_visible": 5})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["used_codes"]["persist"] is False, "没传 persist 不能被重置"
+    assert resp.json()["used_codes"]["ttl"] == 7200, "没传 ttl 不能被重置"
+    assert resp.json()["used_codes"]["min_visible"] == 5
+
+
+def test_used_codes_accepts_nested_payload(client, app, account) -> None:
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes",
+        json={"used_codes": {"enabled": False}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["used_codes"]["enabled"] is False
+
+
+def test_used_codes_rejects_bad_regex_with_readable_error(client, app, account) -> None:
+    """正则是最容易写错的一项，报错必须是人能看懂的中文，而不是 pydantic 那一大段。"""
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes",
+        json={"notice_pattern": "([A-Za-z0-9"},
+    )
+    assert resp.status_code == 400
+    assert "正则" in resp.json()["detail"]
+
+
+def test_used_codes_rejects_out_of_range(client, app, account) -> None:
+    assert (
+        client.put(f"/api/config/{NAME}/forward-used-codes", json={"min_visible": 0}).status_code == 400
+    )
+    assert client.put(f"/api/config/{NAME}/forward-used-codes", json={"min_visible": 99}).status_code == 400
+
+
+def test_used_codes_rejects_unknown_field(client, app, account) -> None:
+    resp = client.put(f"/api/config/{NAME}/forward-used-codes", json={"nonsense": 1})
+    assert resp.status_code == 400
+
+
+def test_used_codes_unknown_account_is_404(client, app) -> None:
+    resp = client.put("/api/config/ghost/forward-used-codes", json={"enabled": True})
+    assert resp.status_code == 404
+
+
+def test_used_codes_does_not_clobber_rules_or_excludes(client, app, account) -> None:
+    """四个东西互不覆盖 —— 它们都是「整个 forward 对象重建」的写法。
+
+    重建时顺手把兄弟字段清掉，会变成"加个已用码拦截，规则就没了"，而且**没有任何报错**。
+    """
+    assert client.post(f"/api/config/{NAME}/rules", json=_rule_payload()).status_code == 200
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": [-100999]}).status_code
+        == 200
+    )
+    assert (
+        client.put(f"/api/config/{NAME}/forward-exclude-users", json={"exclude_users": [555]}).status_code
+        == 200
+    )
+    assert client.put(f"/api/config/{NAME}/forward-used-codes", json={"min_visible": 5}).status_code == 200
+
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert [r["id"] for r in row["rules"]] == ["r1"], "写已用码设置不能把规则清掉"
+    assert row["exclude_chats"] == [-100999]
+    assert row["exclude_users"] == [555]
+    assert row["used_codes"]["min_visible"] == 5
+
+
+def test_used_codes_defaults_are_on(client, app, account) -> None:
+    """默认开着 —— 用户没配过也该拦住已经用掉的码（这正是他提这个需求的场景）。"""
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert row["used_codes"]["enabled"] is True
+    assert row["used_codes"]["min_visible"] == 3
+    assert row["used_codes"]["ttl"] == 3600.0
+
+
+# --------------------------------------------------------------------------- #
 # 规则试跑
 # --------------------------------------------------------------------------- #
 def test_rules_test_regex_match_and_groups(client, app, account) -> None:

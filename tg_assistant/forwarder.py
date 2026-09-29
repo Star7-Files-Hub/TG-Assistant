@@ -79,6 +79,7 @@ from .matching import (
     truncate,
 )
 from .notify import BotNotifier, NotifyTask, build_notify_text
+from .used_codes import UsedCodeStore
 
 
 # --------------------------------------------------------------------------- #
@@ -849,7 +850,71 @@ class ForwardEngine:
             #: ``exclude_users``），且这条消息本来会命中 —— 因而没转发的次数。
             #: 只统计"本来要发"的：黑名单里的人闲聊不该把日志和这个数字刷起来。
             "blocked_senders": 0,
+            #: 从「使用通知」里认出的**已用码前缀**条数（累计新增，去重）。
+            "used_learned": 0,
+            #: 因为内容里的码**已经被用掉**而没转发的次数。
+            #: 只统计"本来真要发出去"的：认通知是全量的，不能拿它刷数字。
+            "used_skipped": 0,
         }
+        #: 「已被用掉的注册码」记忆（学使用通知 + 转发前比对）。
+        self.used_codes = UsedCodeStore(state_path=self._used_codes_path())
+        self._configure_used_codes()
+
+    # ------------------------------------------------------------------ #
+    # 已使用注册码（学「使用通知」→ 转发前拦掉废码）
+    # ------------------------------------------------------------------ #
+    def _used_codes_path(self) -> Optional[Any]:
+        """已用码记忆的落盘位置；没给 store/account（单测 / 离线）时返回 ``None``。
+
+        返回 ``None`` 只会退化成**纯内存**，功能照常可用，只是重启就忘。
+        """
+        if self._store is None or self._account is None:
+            return None
+        try:
+            return self._store.paths.account(self._account).used_codes_file
+        except Exception:  # pragma: no cover - 账号名异常时退化为纯内存
+            return None
+
+    def _configure_used_codes(self) -> None:
+        """把 ``forward.used_codes`` 灌进记忆体。
+
+        热重载时也会走这里 —— 改完配置**立刻**生效，不用重启账号。
+        """
+        guard = self.config.forward.used_codes
+        self.used_codes.configure(
+            enabled=guard.enabled,
+            keywords=guard.notice_keywords,
+            pattern=guard.notice_pattern,
+            min_visible=guard.min_visible,
+            ttl=guard.ttl,
+            persist=guard.persist,
+            state_path=self._used_codes_path(),
+            ignore_pattern=guard.ignore_token_pattern,
+        )
+
+    def _learn_used_codes(self, text: str, *, chat: Any, message_id: Optional[int]) -> None:
+        """从**每一条**收到的消息里学「哪些码被用掉了」。
+
+        刻意放在规则循环**之外**、也放在账号级排除**之前**：
+
+        * 使用通知本身通常不命中任何转发规则（用户甚至在正则里主动写了
+          ``(?!.*码使用)`` 把它排除掉），所以"等规则命中再学"就永远学不到；
+        * 「一个码被用掉了」是**全局事实**，与来源会话在不在监听范围、命中哪条规则
+          都无关 —— 在被排除的会话里学到的已用码，同样应该保护别的会话里的转发。
+        """
+        if not text:
+            return
+        fresh = self.used_codes.learn(text)
+        if not fresh:
+            return
+        self.stats["used_learned"] += len(fresh)
+        self.alog.info(
+            "记下已使用的注册码",
+            code_prefix=",".join(fresh),
+            chat=chat,
+            message_id=message_id,
+            known=self.used_codes.known,
+        )
 
     # ------------------------------------------------------------------ #
     # 规则热重载（改完配置不用重启账号）
@@ -881,28 +946,29 @@ class ForwardEngine:
             # 热重载会判定"没变化"直接返回，黑名单要等重启才生效 ——
             # 而用户改完黑名单**立刻**就会去群里验证，看到没拦住只会以为功能坏了。
             tuple(str(user) for user in self.config.forward.exclude_users),
+            # 已使用码拦截的策略也要进指纹：它的正则/TTL 一变，热重载必须承认
+            # 「确实变了」，否则会被判定成"没变化"而白改一场（与上面黑名单同理）。
+            self.config.forward.used_codes.model_dump(mode="json"),
         )
 
-    def reload_rules(self) -> bool:
-        """重新从磁盘读账号配置，重建规则与 handler 过滤器。返回 True 表示确实变了。
+    def apply_config(self, config: AccountConfig) -> bool:
+        """把**已读好**的配置应用到运行中的引擎。返回 True 表示确实变了。
+
+        与 :meth:`reload_rules` 的分工：``reload_rules`` 自己读盘（保留给旧调用方
+        与测试），``apply_config`` 收一份现成的配置 —— 账号级的配置监视器
+        只为所有引擎读**一次**盘，避免三个引擎各读一次、还可能读到不同版本。
 
         **为什么 handler 必须一起重建**：``sources`` 决定 handler 的过滤器
         （限定了来源用 ``filters.chat(chats)``，未限定用 ``filters.group | filters.channel``）。
         只换 ``self.rules`` 而不换过滤器的话，把 ``sources`` 从「指定群」改成 ``[]``
         （= 监听全部）之后，**新群的消息根本进不来** —— 规则配得再对也没用。
         """
-        if self._store is None or self._account is None:
-            return False
-        try:
-            config = self._store.load_account_config(self._account, create=False)
-        except Exception as exc:
-            # 配置被写坏（例如面板提交了非法正则）时**保留旧规则继续跑**，
-            # 不能因为一次坏写就让转发整个停摆。
-            self.alog.warning("规则热重载失败，继续沿用旧规则", error=str(exc))
-            return False
-
         before = self._rules_signature()
         self.config = config
+        # 先把新策略灌进记忆体，再判"变没变" —— 只改了 used_codes 时上面的指纹
+        # 会诚实报出变化，但即使指纹没变（例如 save 时字段归一化成同一个值），
+        # 策略也已经是最新的，不会出现「配置改了、判定口径还是旧的」。
+        self._configure_used_codes()
         self.rules = [PreparedRule.build(rule) for rule in config.forward.active_rules]
         self._exclude_chats = RefSet(config.forward.exclude_chats)
         self._exclude_users = RefSet(config.forward.exclude_users)
@@ -919,6 +985,19 @@ class ForwardEngine:
         )
         self._refresh_handlers()
         return True
+
+    def reload_rules(self) -> bool:
+        """重新从磁盘读账号配置，重建规则与 handler 过滤器。返回 True 表示确实变了。"""
+        if self._store is None or self._account is None:
+            return False
+        try:
+            config = self._store.load_account_config(self._account, create=False)
+        except Exception as exc:
+            # 配置被写坏（例如面板提交了非法正则）时**保留旧规则继续跑**，
+            # 不能因为一次坏写就让转发整个停摆。
+            self.alog.warning("规则热重载失败，继续沿用旧规则", error=str(exc))
+            return False
+        return self.apply_config(config)
 
     def _maybe_reload(self) -> None:
         """按 :attr:`RELOAD_CHECK_INTERVAL` 节流检查 mtime，变了才真去读盘。
@@ -1051,6 +1130,16 @@ class ForwardEngine:
         sender_id, sender_username, is_self, _is_bot = sender_of(message)
         now = time.monotonic()
 
+        # 顺带学「哪些码已经被用掉了」—— 只读正文，不改任何转发路径。
+        # 位置讲究：在规则循环**之外**、账号级排除**之前**（理由见方法注释）。
+        try:
+            body = str(message_text(message))
+        except Exception:
+            # 消息里可能有非法代理对，str() 会抛；这里只是拿去认通知，
+            # 不该因为一条脏消息把整条转发链路带崩。
+            body = ""
+        self._learn_used_codes(body, chat=chat_title or chat_id, message_id=message_id)
+
         # 账号级全局排除：命中就直接丢弃，连规则都不看。
         # 放在规则循环**外面**是刻意的 —— 它是"所有规则都不监听"的语义，
         # 每条规则各判一次既浪费又容易漏（漏一条就等于没排除）。
@@ -1140,6 +1229,26 @@ class ForwardEngine:
                     rule=prepared.label,
                     sender=sender_username or sender_id,
                     sender_id=sender_id,
+                    chat=chat_title or chat_id,
+                    message_id=message_id,
+                )
+                continue
+
+            # 已经用掉的码不转发。与黑名单同理，放在 ``interval_ok`` 和三层去重
+            # **之前**：被它拦下的这条不该白占最小间隔的名额，也不该在去重表里
+            # 留下记录把后面真正该发的那条顶掉。
+            #
+            # 线上来由：2026-09-29 12:47 转发出去的
+            # ``CineTrail-30-Register_gCKHLMOCCM`` —— 这条码 12:31 就已经以
+            # 猜码形式（``gCKHL**CCM``）出现过，期间群里早有人用掉了。
+            used_prefix = self.used_codes.is_used(body)
+            if used_prefix is not None:
+                self.stats["used_skipped"] += 1
+                prepared.stats["skipped"] += 1
+                self.alog.info(
+                    "注册码已被使用，不转发",
+                    rule=prepared.label,
+                    code_prefix=used_prefix,
                     chat=chat_title or chat_id,
                     message_id=message_id,
                 )
@@ -1754,6 +1863,9 @@ class ForwardEngine:
             # 配了却不生效时，第一个要确认的就是"它到底读进去了没有"。
             "exclude_chats": len(self._exclude_chats.ids) + len(self._exclude_chats.usernames),
             "exclude_users": len(self._exclude_users.ids) + len(self._exclude_users.usernames),
+            # 「已使用码」拦截的状态：`known` 直接回答"它到底学到东西没有" ——
+            # 拦不住时第一个要确认的就是这个数（一直是 0 说明通知没被认出来）。
+            "used_codes": self.used_codes.snapshot(),
         }
         if self._shared_dedupe is not None:
             # ⚠️ 这是**跨账号共享表**的数字（所有账号合计），不是本账号的。

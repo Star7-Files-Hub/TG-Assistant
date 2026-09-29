@@ -416,6 +416,7 @@
                     </div>
                 </div>
                 ${excludeChatsRow(acc)}
+                ${usedCodesRow(acc)}
                 <div class="rules-account-group-body">
                     ${rules.length
                         ? rules.map(rule => renderRuleCard(acc, rule)).join('')
@@ -579,6 +580,9 @@
         else if (action === 'stop') stopAccount(account);
         else if (action === 'edit') editRule(account, ruleId);
         else if (action === 'delete') deleteRule(account, ruleId);
+        // 「已使用注册码」的保存键同样走委托：它长在按账号渲染出来的行里，
+        // 每渲染一次挂一次监听既啰嗦又容易漏（内联 handler 带数据是被明令禁止的）。
+        else if (action === 'save-used-codes') saveUsedCodes(account, btn.closest('[data-role="used-codes"]'));
     }
 
     function onRuleListChange(event) {
@@ -713,6 +717,136 @@
             const items = (acc && acc[EXCLUDE_LISTS[role].key]) || [];
             if (items.length) removeExcludeItem(role, box.dataset.account, items.length - 1);
         }
+    }
+
+    // ==================== 已使用注册码拦截（账号级） ====================
+    // 码频道会发「🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░」，
+    // 码尾被遮罩。这类码**已经被人用掉了**，再转出去只会让群里的人白折腾一轮 ——
+    // 所以让引擎从「使用通知」里学会这些码，之后命中就不再转发。
+    //
+    // 和排除名单一样是账号级配置（该账号所有规则通用），所以放在同一个分组标题下面。
+    // 保存走 PUT /api/config/{name}/forward-used-codes。
+    //
+    // ⚠️ 核心（config / forwarder）还没部署时 /api/rules 不返回 used_codes，
+    // 这里必须用一份**和后端 ForwardUsedCodes 默认值一致**的兜底：输入框空着保存
+    // 会被后端判 400，用户看到的是"保存失败"却不知道要填什么。
+    const USED_CODES_DEFAULTS = {
+        enabled: true,
+        notice_keywords: ['码使用'],
+        notice_pattern: '使用[了]?\\s*([A-Za-z0-9][^\\s，。、]*)',
+        ignore_token_pattern: '^\\d+-\\w+$',
+        min_visible: 3,
+        ttl: 3600
+    };
+
+    function usedCodesRow(acc) {
+        const cfg = Object.assign({}, USED_CODES_DEFAULTS, acc.used_codes || {});
+        const keywords = Array.isArray(cfg.notice_keywords) ? cfg.notice_keywords : [];
+        // 数字框只在后端给了 null / 空串时才落到 0（上面 merge 过默认值，
+        // "整个字段缺失"走的是默认值那一路）—— 0 在 min_visible 上是非法值，
+        // 后端会 400 并把原因显示出来，好过这里假装成 1 悄悄改了用户的配置。
+        const num = v => (v === null || v === undefined || v === '' ? 0 : v);
+        return `
+            <div class="rules-account-exclude" data-role="used-codes" data-account="${escapeHtml(acc.name)}">
+                <span class="rules-account-exclude-label"
+                      title="被「使用通知」点名用过的注册码不再转发（码尾被遮罩，转出去没人能兑换）">
+                    已使用注册码拦截
+                </span>
+                <label class="tg-checkbox" title="关掉后不再拦截；已经记住的码不会因此丢失（改完要点右侧「保存」）">
+                    <input type="checkbox" data-role="used-codes-enabled" ${cfg.enabled ? 'checked' : ''} />
+                    <span class="tg-checkmark"></span>
+                    <span>启用</span>
+                </label>
+                <input type="text" data-role="used-codes-keywords" style="flex:1;min-width:190px"
+                       value="${escapeHtml(keywords.join(','))}"
+                       placeholder="使用通知关键词，逗号分隔（如：码使用）"
+                       title="消息里命中任一关键词才当成「使用通知」，否则不学码" />
+                <input type="text" data-role="used-codes-pattern" style="flex:1;min-width:230px"
+                       value="${escapeHtml(cfg.notice_pattern || '')}"
+                       placeholder="通知正则（必须含一个捕获组）"
+                       title="从使用通知里抠出被遮罩的码，必须有一个捕获组" />
+                <input type="text" data-role="used-codes-ignore" style="flex:1;min-width:200px"
+                       value="${escapeHtml(cfg.ignore_token_pattern || '')}"
+                       placeholder="忽略形状（留空 = 什么都学）"
+                       title="可见的码**匹配到这个正则就整条跳过**，不记进记忆。线上有两种码形状，但只有一种真会被转发：「7017826500-2cIE」这种（用户id-值）用你这套规则试跑过，20 条规则没有一条命中它 —— 学它只会白占记忆，还可能误伤别的码。要连这种也学，清空本框即可。" />
+                <label class="rules-account-exclude-label"
+                       title="遮罩后可见位数少于这个值就不记 —— 可见位太少，学进去会把正常消息误伤">
+                    可见位数≥
+                    <input type="number" data-role="used-codes-min-visible" style="width:64px"
+                           value="${num(cfg.min_visible)}" min="1" max="32" step="1" />
+                </label>
+                <label class="rules-account-exclude-label"
+                       title="一个码记住多久（秒）；过期后会被当成新码重新转发（0 = 永不忘记）">
+                    记忆(秒)
+                    <input type="number" data-role="used-codes-ttl" style="width:88px"
+                           value="${num(cfg.ttl)}" min="0" max="86400" step="60" />
+                </label>
+                <button class="tg-btn tg-btn-sm tg-btn-primary" data-action="save-used-codes"
+                        title="保存该账号的拦截设置">保存</button>
+                <span class="rules-account-exclude-label" data-role="used-codes-stats"
+                      title="已记住 = 当前记着的码；已拦截 = 因此没转发的次数；累计学到 = 学习总条数（含已过期的）">
+                    ${usedCodesStatsText(acc.used_code_stats)}
+                </span>
+            </div>`;
+    }
+
+    function usedCodesStatsText(st) {
+        // 账号没在跑 / 核心还没部署时这几个字段是缺的 —— 一律显示 0。
+        // 显示成 undefined 的话，用户会以为拦截没生效（"怎么是空的？"）。
+        st = st || {};
+        const n = v => (typeof v === 'number' && isFinite(v) ? v : 0);
+        // ⚠️ 别按字段顺序配文案：``known`` 是**当前**还记着的条数（TTL 到期会掉），
+        // ``learned`` 是**累计**学到的条数（只增）。配反的话「已记住」会越用越多、
+        // 「累计学到」反而缩水 —— 两个数都"有数"，但都是错的，最难查。
+        return `已记住 ${n(st.known)} 个 · 已拦截 ${n(st.skipped)} 次 · 累计学到 ${n(st.learned)} 条`;
+    }
+
+    async function saveUsedCodes(name, row) {
+        if (!name || !row) return;
+        const field = role => row.querySelector(`[data-role="${role}"]`);
+        const value = role => {
+            const el = field(role);
+            return el ? String(el.value || '') : '';
+        };
+        const number = role => {
+            const raw = value(role).trim();
+            return raw === '' ? NaN : Number(raw);
+        };
+        const minVisible = number('used-codes-min-visible');
+        const ttl = number('used-codes-ttl');
+        // 空值 / 非数字在本地就拦掉：发给后端会被 pydantic 翻成一段英文报错，
+        // 对用户毫无用处。**范围**（1~32、0~86400）故意留给后端判 ——
+        // 同一个判断抄两份，早晚会两边不一致（这个项目已经踩过）。
+        if (!isFinite(minVisible) || !isFinite(ttl)) {
+            toast('「可见位数」和「记忆时长」都要填数字', false);
+            return;
+        }
+        const enabledEl = field('used-codes-enabled');
+        const body = {
+            enabled: !!(enabledEl && enabledEl.checked),
+            notice_keywords: value('used-codes-keywords')
+                .split(/[,，]/).map(s => s.trim()).filter(Boolean),
+            notice_pattern: value('used-codes-pattern').trim(),
+            ignore_token_pattern: value('used-codes-ignore').trim(),
+            min_visible: minVisible,
+            ttl: ttl
+        };
+        const res = await fetch(`/api/config/${encodeURIComponent(name)}/forward-used-codes`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            // 非法正则 / 越界值的中文原因都在 detail 里，必须原样显示：
+            // 只说一句"保存失败"，用户根本不知道该改哪儿。
+            toast(detailText(data) || '保存失败', false);
+            return;
+        }
+        toast(`已保存「${name}」的已使用注册码拦截设置`, true);
+        // 保存成功后重拉：后端会把关键词去空、补默认值，界面要显示**磁盘上的那份**，
+        // 而不是"我刚输进去的那份"。
+        await loadAll();
     }
 
     // ==================== 规则级操作（作用于所有拥有该规则的账号） ====================

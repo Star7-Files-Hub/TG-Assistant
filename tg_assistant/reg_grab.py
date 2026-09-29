@@ -72,6 +72,10 @@ from .matching import (
 from .notify import BotNotifier, NotifyTask
 from .red_packet import ChatEventBus
 
+#: 「使用通知」里的码怎么切、怎么比对，两个引擎共用同一套口径（见该模块的说明）。
+#: 这里再导出，既有的调用方 ``from .reg_grab import code_value_of`` 与测试不受影响。
+from .used_codes import code_value_of, visible_code_part  # noqa: F401
+
 
 # --------------------------------------------------------------------------- #
 # 结果类型
@@ -164,38 +168,6 @@ def button_label(button: Any) -> str:
 def step_label(step: RegGrabStep) -> str:
     """步骤在日志/界面里的名字：优先用备注，否则用类型中文名。"""
     return step.name.strip() or REG_GRAB_STEP_LABELS.get(step.type, step.type)
-
-
-#: 遮罩字符：使用通知里的码尾部会被 ``░▒▓*•`` 之类盖掉。
-#: 只剥**结尾**那一段（遮罩都在尾部），不碰中间 —— 免得把
-#: ``..._f1t░░░abc`` 这种奇怪格式硬拼成一个不存在的码。
-_MASK_TAIL = re.compile(r"[^A-Za-z0-9]+$")
-
-
-def visible_code_part(token: str) -> str:
-    """从使用通知里那个被遮罩的码中取出**可见部分**。
-
-    ``MSKY-30-Register_f1t░░░░░░░`` → ``MSKY-30-Register_f1t``
-
-    没有遮罩时原样返回（通知偶尔会印完整码）。
-    """
-    return _MASK_TAIL.sub("", (token or "").strip())
-
-
-def code_value_of(token: str) -> str:
-    """取码的**值**部分 —— 最后一个 ``_`` 之后那一段（统一小写）。
-
-    两边必须按同一口径切，否则永远比不上：
-
-    * 通知里是 ``MSKY-30-Register_f1t``，值是 ``f1t``；
-    * 配置里的 ``code_pattern`` 通常只抓 ``f1tAbCdEfGh``，值就是它本身；
-      没写捕获组时抓到 ``Register_f1tAbCdEfGh``，切完同样是 ``f1tAbCdEfGh``。
-
-    这个口径假设「码的值里不含 ``_``」（``MSKY-30-Register_<10位字母数字>``
-    这种格式成立）。若某天码里真的带下划线，``used_pattern`` 换成能直接圈出
-    值部分的正则即可。
-    """
-    return (token or "").rsplit("_", 1)[-1].strip().lower()
 
 
 # --------------------------------------------------------------------------- #
