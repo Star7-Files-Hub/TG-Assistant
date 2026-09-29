@@ -520,6 +520,14 @@ class CodeLoginSession:
 class AccountRunner:
     """驱动单个账号的完整运行期。"""
 
+    #: 配置热重载的轮询间隔（秒）。
+    #:
+    #: 1 秒是「面板点保存 → 群里立刻生效」的手感上限，同时把 ``stat()`` 的开销压到
+    #: 可以忽略。**刻意不靠"下一条消息顺带检查"**（转发引擎早期就是这么做的）：
+    #: 那样在零流量的群里等于永远不重载，而且一旦 handler 过滤器把新群挡在外面，
+    #: 新群的消息永远进不来 ⇒ 检查永远不触发 ⇒ 过滤器永远不更新，死锁。
+    CONFIG_RELOAD_INTERVAL = 1.0
+
     def __init__(
         self,
         record: AccountRecord,
@@ -556,6 +564,10 @@ class AccountRunner:
         self.bundle: Optional[ClientBundle] = None
         self.started_at: Optional[float] = None
         self._stopped = asyncio.Event()
+        #: 配置热重载用：账号 ``config.json`` 的路径与上次看到/已应用的 mtime。
+        #: 三个引擎共用这一份读盘结果（见 :meth:`_reload_config_if_changed`）。
+        self._config_file: Optional[Any] = None
+        self._config_mtime: Optional[float] = None
 
     @property
     def name(self) -> str:
@@ -571,9 +583,16 @@ class AccountRunner:
             )
 
         needs_updates = self.config.needs_updates
-        self.client = build_client(
-            self.record, self.settings, self.paths, no_updates=not needs_updates
-        )
+        # 🔴 ``no_updates`` 一律给 False，**不再**按启动时的配置裁剪。
+        #
+        # 它是"客户端建好就定死"的开关：一旦按启动快照关掉更新流，之后无论怎么
+        # 改配置都收不到任何消息 —— 而热重载的承诺恰恰是"面板上打开某个功能，
+        # 立刻生效"。用户很自然会「先把抢红包关着填配置，填完再打开」，
+        # 若账号启动时刚好什么都没开（``needs_updates`` 为 False），
+        # 打开之后就会毫无动静、且没有任何线索 —— 只能重启账号。
+        #
+        # 代价是空闲账号也会处理更新流；与"配置改完即生效"相比这个代价是值得的。
+        self.client = build_client(self.record, self.settings, self.paths, no_updates=False)
         proxy = resolve_proxy(self.record, self.settings)
         self.alog.info(
             "正在启动账号",
@@ -662,6 +681,15 @@ class AccountRunner:
             self.cf_ip_listener.register()
 
         self.started_at = time.time()
+
+        # 配置热重载：记住 config.json 的位置。``_config_mtime`` 刻意留 ``None`` ——
+        # 启动后的第一次检查必定读一次盘，这样"启动过程中配置刚好被改过"
+        # 也不会漏掉；内容没变时各引擎的指纹比较会直接返回 False，不会白重建。
+        if self.store is not None:
+            with contextlib.suppress(Exception):
+                self._config_file = self.store.paths.account(self.name).config_file
+                self._config_mtime = None
+
         if not needs_updates:
             self.alog.warning(
                 "当前配置没有任何需要实时监听的功能（转发规则为空、未开启抢红包、"
@@ -692,12 +720,92 @@ class AccountRunner:
         self._stopped.set()
 
     async def run_forever(self, heartbeat: float = 300.0) -> None:
-        """保持运行并周期性输出心跳统计。"""
+        """保持运行、周期性输出心跳统计，并**顺便**驱动配置热重载。
+
+        循环改成按 :attr:`CONFIG_RELOAD_INTERVAL` 小步醒来：心跳仍按 ``heartbeat``
+        的节奏打（用单调时钟记账，不会因为检查间隔而被拖长），中间的空档用来
+        看 ``config.json`` 有没有被面板改过。
+        """
+        next_heartbeat = time.monotonic() + max(heartbeat, 0.0)
         while not self._stopped.is_set():
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=heartbeat)
+                await asyncio.wait_for(
+                    self._stopped.wait(), timeout=self.CONFIG_RELOAD_INTERVAL
+                )
             except asyncio.TimeoutError:
+                pass
+            if self._stopped.is_set():
+                return
+            try:
+                await self._reload_config_if_changed()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # 热重载出任何岔子都**不能**把账号带下去（``_supervise`` 会把它
+                # 当成崩溃然后重启账号，用户会莫名其妙掉线）。记一笔就好。
+                self.alog.warning(
+                    "配置热重载出错，已跳过这一轮",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            if time.monotonic() >= next_heartbeat:
                 self._log_heartbeat()
+                next_heartbeat = time.monotonic() + max(heartbeat, 0.0)
+
+    # ------------------------------------------------------------------ #
+    # 配置热重载
+    async def _reload_config_if_changed(self) -> bool:
+        """``config.json`` 变了就把新配置应用到所有引擎。返回 True 表示确实应用了。
+
+        🔴 **只为整个账号读一次盘**，再把同一份 ``AccountConfig`` 分发给三个引擎。
+        让每个引擎各自去读的话，一次面板保存会触发 3 次读盘 + 解析，更糟的是
+        它们可能读到**不同版本**（用户连点两次保存时），于是三个功能的生效状态
+        对不上，排查起来毫无头绪。
+        """
+        if self._config_file is None or self.store is None:
+            return False
+        try:
+            mtime = self._config_file.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self._config_mtime:
+            return False
+        # 先记下 mtime 再解析：解析失败时不会每一轮都重试同一次坏写，
+        # 用户改回一个合法配置就会重新触发（mtime 又变了）。
+        self._config_mtime = mtime
+        try:
+            config = self.store.load_account_config(self.name, create=False)
+        except Exception as exc:
+            # 面板写坏了配置（非法正则等）时**保留旧配置继续跑** ——
+            # 一次坏写不该让转发/抢红包/抢注一起停摆。
+            self.alog.warning(
+                "配置热重载失败，继续沿用旧配置",
+                error=f"{type(exc).__name__}: {exc}",
+                hint="改回一份合法配置即可自动恢复",
+            )
+            return False
+        return await self._apply_config(config)
+
+    async def _apply_config(self, config: AccountConfig) -> bool:
+        """把新配置分发给三个引擎。返回 True 表示至少有一个真的变了。"""
+        changed: list[str] = []
+        if self.forwarder is not None and self.forwarder.apply_config(config):
+            changed.append("转发")
+        if self.hunter is not None and await self.hunter.apply_config(config):
+            changed.append("抢红包")
+        if self.reg_grab is not None and await self.reg_grab.apply_config(config):
+            changed.append("抢注")
+        if not changed:
+            # 内容其实没变（面板原样保存一次）。mtime 已更新，不会反复重试。
+            return False
+        self.config = config
+        self.alog.info(
+            "配置已热重载（无需重启账号）",
+            changed="、".join(changed),
+            forward_rules=len(self.forwarder.rules) if self.forwarder is not None else 0,
+            red_packet_tasks=len(self.hunter.prepared) if self.hunter is not None else 0,
+            reg_grab_tasks=len(self.reg_grab.prepared) if self.reg_grab is not None else 0,
+        )
+        return True
 
     def _log_heartbeat(self) -> None:
         uptime = time.time() - self.started_at if self.started_at else 0

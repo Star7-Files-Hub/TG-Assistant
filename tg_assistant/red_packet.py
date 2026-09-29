@@ -243,6 +243,7 @@ class RedPacketHunter:
         self.settled_path = settled_path
         #: 热重载指纹：记下「当前生效的是哪一份配置」。mtime 变了但内容没变
         #: （面板原样保存一次）时据此跳过重建。
+        self._applied_signature = self._apply_signature(config)
 
         # 只编译**启用**的任务：停用的任务连正则都不该编译。
         self.prepared: list[PreparedTask] = [
@@ -307,10 +308,34 @@ class RedPacketHunter:
         """所有任务监听会话的并集；任一任务留空 ⇒ 空列表（= 不过滤，全监听）。"""
         return list(self.config.watched_chats)
 
+    @staticmethod
+    def _apply_signature(config: AccountConfig) -> tuple[Any, ...]:
+        """热重载指纹：这些字段变了才需要重建。
+
+        刻意**不含**运行期状态（计数、同码去重表、回复冷却）—— 那些必须活着，
+        改一次配置不该把「一共抢到几个」清零。
+        """
+        return (
+            config.red_packet.model_dump(mode="json"),
+            config.notify.model_dump(mode="json"),
+        )
+
     async def register(self) -> None:
         if not self.enabled:
             self.alog.info("抢红包功能未启用")
             return
+        self._install_handlers()
+        self._log_registered()
+
+    def _install_handlers(self) -> None:
+        """装上 handler；**先拆旧的**，保证过滤器跟着新的监听会话走。
+
+        ``watched_chats()`` 决定 handler 的过滤器。只换 ``self.config`` 而不换
+        过滤器的话，把监听从「某个群」改成另一个群之后，**新群的消息根本进不来**
+        —— 配置改得再对也没用。这与转发引擎是同一类坑（见
+        ``ForwardEngine.reload_rules`` 的注释）。
+        """
+        self._remove_handlers()
 
         me = getattr(self.client, "me", None)
         if me is not None:
@@ -340,6 +365,14 @@ class RedPacketHunter:
                 )
             )
 
+    def _remove_handlers(self) -> None:
+        for handler, group in self._handlers:
+            with contextlib.suppress(Exception):
+                self.client.remove_handler(handler, group)
+        self._handlers.clear()
+
+    def _log_registered(self) -> None:
+        chats = self.watched_chats()
         self.alog.info(
             "抢红包引擎已注册",
             tasks=len(self.prepared),
@@ -360,11 +393,58 @@ class RedPacketHunter:
                 problem=task.config.problem,
             )
 
+    async def apply_config(self, config: AccountConfig) -> bool:
+        """把新配置应用到**正在运行**的引擎上（面板改完即生效，无需重启账号）。
+
+        返回 True 表示确实变了。三类变更都必须照顾到：
+
+        * **增删/修改任务** —— 重建 ``prepared`` 与 ``task_stats``、按新并发上限换信号量；
+        * **开/关总开关** —— 注册或注销 handler。多任务之后这是常态：
+          用户先关着把配置填好，填完再打开；
+        * **改监听会话** —— handler 的过滤器必须跟着换（见 :meth:`_install_handlers`）。
+
+        🔴 全程**不重建** ``self._bus`` / ``self._seen`` / 在途任务：正在抢的那个包
+        不能因为用户随手点了保存就被打断。
+        """
+        signature = self._apply_signature(config)
+        if signature == self._applied_signature:
+            return False
+        self._applied_signature = signature
+        was_enabled = self.enabled
+
+        self.config = config.red_packet
+        self.notify_config = config.notify
+        self.prepared = [
+            PreparedTask.build(task) for task in self.config.active_tasks
+        ]
+        self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        # 计数按任务 id 继承：改配置不该让历史统计消失，只对**新增**的任务补零。
+        self.task_stats = {
+            task.id: self.task_stats.get(task.id) or dict.fromkeys(self.stats, 0)
+            for task in self.config.active_tasks
+        }
+
+        if self.enabled:
+            self._install_handlers()
+        else:
+            self._remove_handlers()
+
+        self.alog.info(
+            "抢红包配置已热重载（无需重启）",
+            enabled=self.config.enabled,
+            tasks=len(self.prepared),
+            task_labels=" | ".join(task.label for task in self.prepared) or "-",
+            watched_chats=len(self.watched_chats()) or "全部",
+            max_concurrency=self.config.max_concurrency,
+            turned_on=self.enabled and not was_enabled,
+        )
+        if self.enabled and not was_enabled:
+            # 刚被打开：把「哪条任务配得不全」再喊一遍，用户正等着看它动没动。
+            self._log_registered()
+        return True
+
     async def close(self) -> None:
-        for handler, group in self._handlers:
-            with contextlib.suppress(Exception):
-                self.client.remove_handler(handler, group)
-        self._handlers.clear()
+        self._remove_handlers()
         if self._tasks:
             self.alog.info("等待在途抢包任务结束", pending=len(self._tasks))
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
