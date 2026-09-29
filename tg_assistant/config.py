@@ -40,6 +40,15 @@ MatchMode = Literal["regex", "contains", "exact", "all"]
 ForwardMode = Literal["forward", "copy", "text"]
 NotifyMode = Literal["forward", "copy", "text"]
 RedPacketStrategy = Literal["auto", "button", "keyword"]
+#: 抢红包「什么结果才推送给我」。
+#:
+#: 判定的依据**就是机器人的回显**（按钮回执 / 随后的消息），所以这个策略等于
+#: 「按机器人的提示决定要不要打扰我」：
+#:
+#: * ``success``：只在**确认抢到**时推（默认）；
+#: * ``attention``：抢到 + 出错都推，跳过「没抢到 / 已经领过 / 未知」这类噪音；
+#: * ``always``：任何结果都推（改造前的旧行为）。
+RedPacketNotifyPolicy = Literal["success", "attention", "always"]
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _TME_PATTERN = re.compile(
@@ -572,6 +581,98 @@ class NotifyConfig(StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# 动手时段（抢注 / 抢红包 共用）
+# --------------------------------------------------------------------------- #
+#: ``HH:MM`` 时钟字面量（也接受 ``H:MM``、中文冒号、以及纯分钟数）。
+_CLOCK_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$")
+
+
+def _parse_clock(value: Any, field: str) -> int:
+    """把 ``"HH:MM"`` 解析成「当天第几分钟」；格式不对直接报错。
+
+    🔴 **不做静默兜底**（比如解析失败就当 0 点）。时间窗这种地方，静默兜底是最危险的：
+    配错了要么整天不抢、要么半夜照抢，而两种情况都「看起来一切正常」——
+    用户只会觉得「功能没生效」，排查时毫无线索。
+    """
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
+        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
+    if isinstance(value, int):
+        if 0 <= value <= 1439:
+            return value
+        raise ValueError(f"{field} 的分钟数要在 0~1439 之间，当前是 {value!r}")
+    match = _CLOCK_RE.match(str(value))
+    if match is None:
+        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{field} 不是合法时间（00:00 ~ 23:59），当前是 {value!r}")
+    return hour * 60 + minute
+
+
+def _format_clock(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+class TimeWindow(StrictModel):
+    """**通用**的动手时段：只在这段时间里动手，其余时间看着不动。
+
+    抢注与抢红包共用这一个模型 —— 两者的动机完全一样：**半夜三点还能精准抢到**
+    是脚本最好认的特征之一，把动手时间限制在人类活动时段能明显降低被识别的概率。
+
+    语义（``enabled=False`` 时 :meth:`contains` 恒为 ``True``，即全天动手）：
+
+    - ``start`` / ``end`` 用 ``HH:MM``，**本地时区**（服务进程 ``TZ=Asia/Shanghai``）；
+    - ``start < end``（如 ``08:00`` ~ ``23:00``）⇒ 当天的这一段；
+    - ``start > end``（如 ``22:00`` ~ ``06:00``）⇒ **跨零点**，从 start 到次日 end；
+    - ``start == end`` 直接报错 —— 想全天就把开关关掉，不要用「相等」去猜语义。
+
+    区间**左闭右开** ``[start, end)``：``08:00~23:00`` = 08:00:00 到 22:59:59。
+    这样 ``08:00~09:00`` 和 ``09:00~10:00`` 首尾相接不会重叠。
+    """
+
+    enabled: bool = False
+    start: str = "08:00"
+    end: str = "23:00"
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _normalize_clock(cls, value: Any, info: ValidationInfo) -> str:
+        return _format_clock(_parse_clock(value, f"window.{info.field_name}"))
+
+    @model_validator(mode="after")
+    def _check_range(self) -> TimeWindow:
+        if self.start == self.end:
+            raise ValueError(
+                f"动手时段的开始和结束时间不能相同（都是 {self.start}）——"
+                " 想全天动手请把时段的开关关掉"
+            )
+        return self
+
+    def contains(self, moment: Optional[datetime] = None) -> bool:
+        """``moment``（默认「现在」）是否落在动手时段内。"""
+        if not self.enabled:
+            return True
+        moment = moment or datetime.now()
+        minute = moment.hour * 60 + moment.minute
+        start = _parse_clock(self.start, "window.start")
+        end = _parse_clock(self.end, "window.end")
+        if start < end:
+            return start <= minute < end
+        return minute >= start or minute < end  # 跨零点
+
+    def describe(self) -> str:
+        """给人看的一句话，用于日志 / 面板 / CLI。"""
+        if not self.enabled:
+            return "全天"
+        suffix = "（跨零点）" if self.start > self.end else ""
+        return f"{self.start}~{self.end}{suffix}"
+
+
+#: 旧名 —— 这个模型最早是抢注专用的。保留别名，既有 import 与配置照旧可用。
+RegGrabWindow = TimeWindow
+
+
+# --------------------------------------------------------------------------- #
 # 抢红包
 # --------------------------------------------------------------------------- #
 class RedPacketDetect(StrictModel):
@@ -616,6 +717,55 @@ class RedPacketDetect(StrictModel):
         return self
 
 
+#: 默认的失败特征。放在模块层是因为 :class:`RedPacketSuccess` 还要拿它认出
+#: 「用户从没动过这份默认值」的旧配置（见 ``_RedPacketSuccess._upgrade_failure``）。
+_DEFAULT_FAILURE_PATTERNS = (
+    r"已被(抢|领)完",
+    r"手慢",
+    r"红包已过期",
+    r"已领完",
+    r"来晚了",
+    # 🔴 线上实测：白嫖分享社那个 bot 对「重复点同一个红包」回的是
+    # 「你已经领过这个红包啦。」—— 原来的 ``已经(领取|抢)过`` 匹配不上它
+    # （"领过" 既不是 "领取过" 也不是 "抢过"），于是被判成**未知**：
+    # 统计算错，而且"结果未知"的通知会一直打扰用户。
+    # 「已领过 / 已经领过 / 已领取过 / 已经领取过」都要认。
+    r"已(?:经)?领(?:取)?过",
+    r"已(?:经)?抢过",
+    r"重复领取",
+    r"不能领取",
+    r"无效",
+    r"感谢参与",
+    r"未抢到",
+    r"抢光了",
+)
+
+#: 改造**之前**的默认失败特征 —— 只用来认出「老配置里存的那份旧清单」。
+#:
+#: 🔴 为什么必须专门处理：面板保存时会把**整份**配置（含这份默认清单）写盘，
+#: 所以老用户的 ``config.json`` 里**存着**旧的默认值；而 pydantic 只在字段
+#: **缺失**时才用默认值 —— 也就是说**光改默认值对老配置毫无作用**。
+#: 这不是推演出来的，是线上实测撞出来的：代码里加了「已领过」，用户那份配置里
+#: 没有，机器人回「你已经领过这个红包啦」照样被判成「未知」。
+_LEGACY_FAILURE_PATTERNS = (
+    r"已被(抢|领)完",
+    r"手慢",
+    r"红包已过期",
+    r"已领完",
+    r"来晚了",
+    r"已经(领取|抢)过",
+    r"重复领取",
+    r"不能领取",
+    r"无效",
+    r"感谢参与",
+    r"未抢到",
+    r"抢光了",
+)
+
+#: 本次新增（旧默认里没有）的那几条 —— 老配置要补的就是它们。
+_ADDED_FAILURE_PATTERNS = (r"已(?:经)?领(?:取)?过", r"已(?:经)?抢过")
+
+
 class RedPacketSuccess(StrictModel):
     """抢红包成功/失败判定。
 
@@ -638,25 +788,32 @@ class RedPacketSuccess(StrictModel):
         ]
     )
     failure_patterns: list[str] = Field(
-        default_factory=lambda: [
-            r"已被(抢|领)完",
-            r"手慢",
-            r"红包已过期",
-            r"已领完",
-            r"来晚了",
-            r"已经(领取|抢)过",
-            r"重复领取",
-            r"不能领取",
-            r"无效",
-            r"感谢参与",
-            r"未抢到",
-            r"抢光了",
-        ]
+        default_factory=lambda: list(_DEFAULT_FAILURE_PATTERNS)
     )
     #: 等待后续消息判定结果的时间窗（秒）。0 表示只看 callback answer。
     wait_timeout: float = Field(default=8.0, ge=0.0, le=120.0)
     #: 判定时是否要求消息里出现自己的名字/用户名（更精确，但部分红包 bot 不提名）。
     require_self_mention: bool = False
+
+    @field_validator("failure_patterns")
+    @classmethod
+    def _upgrade_failure(cls, value: list[str]) -> list[str]:
+        """把老配置里那份「旧的默认清单」补上这次新增的特征。
+
+        判定规则（保守优先，绝不覆盖用户刻意的调整）：
+
+        * 清单里已经有新增特征 ⇒ 什么都不做（幂等，面板反复保存也不会越加越长）；
+        * 清单**缺了**旧默认里的任何一条 ⇒ 说明用户删过东西、是刻意调过的，
+          原样保留；
+        * 否则（旧默认 + 用户自己加过的几条）⇒ 只把缺的那几条补上，
+          用户加的一律保留。
+        """
+        items = [str(item) for item in value]
+        if all(pattern in items for pattern in _ADDED_FAILURE_PATTERNS):
+            return items
+        if any(pattern not in items for pattern in _LEGACY_FAILURE_PATTERNS):
+            return items
+        return items + [p for p in _ADDED_FAILURE_PATTERNS if p not in items]
 
     @model_validator(mode="after")
     def _check(self) -> "RedPacketSuccess":
@@ -738,10 +895,22 @@ class RedPacketTask(StrictModel):
     jitter: float = Field(default=0.0, ge=0.0, le=10.0)
     #: 单条红包最多点几次（首次失败可能是网络抖动）。
     max_attempts: int = Field(default=2, ge=1, le=5)
-    #: 是否推送通知。
+    #: 是否推送通知（总开关）。
     notify: bool = True
+    #: **什么结果才推送** —— 依据就是机器人的回显，见 :data:`RedPacketNotifyPolicy`。
+    #: 默认只在**确认抢到**时推：抢红包是个背景任务，每次点击都推一条只会让人
+    #: 把通知整个关掉，真正抢到的那条反而被埋掉。
+    notify_on: RedPacketNotifyPolicy = "success"
     #: 也处理消息编辑事件（有些红包 bot 通过编辑消息挂出按钮）。
     include_edited: bool = True
+    #: ``include_edited`` 的**年龄闸门**：只处理「原消息发布时间」在这个秒数以内的编辑。
+    #:
+    #: 🔴 线上实测（2026-09-29，白嫖分享社 ``message_id=352733``）：那是一**条长驻
+    #: 红包**，机器人一整天在改它的状态文本（「已领 x/200」之类），于是同一条 8 小时
+    #: 前的消息被当成新红包处理了 8 次 —— 其中 7 次点下去只换回"你已经领过"。
+    #: 编辑事件本身是需要的（有些 bot 先发消息、几秒后编辑出按钮），但**几十分钟前的
+    #: 消息再被编辑，绝不可能是新红包**。``0`` = 关掉这个闸门（不限制年龄）。
+    edit_max_age: float = Field(default=1800.0, ge=0.0)
 
     @field_validator("id")
     @classmethod
@@ -792,9 +961,10 @@ class RedPacketTask(StrictModel):
         return None
 
 
-#: 旧版（单任务）抢红包配置里的字段 —— 它们现在属于「任务」这一层。
+#: 抢红包**任务层**的字段名 —— 旧版（单任务）配置里它们是平铺的，现在归属「任务」。
 #:
-#: 见 :func:`_migrate_legacy_red_packet`。
+#: 见 :func:`_migrate_legacy_red_packet`。新加的任务级字段也要补进这里，
+#: 否则「扁平结构 + 新字段」这种手写配置会被 ``extra="forbid"`` 直接拒掉。
 _RED_PACKET_TASK_FIELDS = (
     "chats",
     "exclude_chats",
@@ -806,7 +976,9 @@ _RED_PACKET_TASK_FIELDS = (
     "jitter",
     "max_attempts",
     "notify",
+    "notify_on",
     "include_edited",
+    "edit_max_age",
 )
 
 
@@ -839,6 +1011,13 @@ class RedPacketConfig(StrictModel):
     tasks: list[RedPacketTask] = Field(default_factory=list)
     #: 同一账号并发抢包上限。这是账号级的资源限制，不属于任何单条任务。
     max_concurrency: int = Field(default=3, ge=1, le=20)
+    #: **全局动手时段**：所有任务共用一个 —— 到点才动手，其余时间只看着。
+    #:
+    #: 为什么是账号级而不是任务级：抢红包被识别成脚本的首要特征就是"半夜三点
+    #: 还在精准点按钮"，这是**账号整体的行为模式**，不该由某一条任务决定；
+    #: 用户的心智也是"这个号几点之后不抢了"。（抢注那边时段挂在任务上，
+    #: 因为每条任务的码源活跃时间差别很大。）
+    window: TimeWindow = Field(default_factory=TimeWindow)
 
     @model_validator(mode="before")
     @classmethod
@@ -853,6 +1032,11 @@ class RedPacketConfig(StrictModel):
                 raise ValueError(f"抢红包任务 id 重复: {task.id}")
             seen.add(task.id)
         return self
+
+    @property
+    def in_window(self) -> bool:
+        """当前是否落在全局动手时段内（未启用时段时恒为 True）。"""
+        return self.window.contains()
 
     @property
     def active_tasks(self) -> list[RedPacketTask]:
@@ -1024,91 +1208,6 @@ class RegGrabDetect(StrictModel):
         if self.used_pattern:
             _check_regex(self.used_pattern, "reg_grab.detect.used_pattern")
         return self
-
-
-#: ``HH:MM`` 时钟字面量（也接受 ``H:MM``、中文冒号、以及纯分钟数）。
-_CLOCK_RE = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$")
-
-
-def _parse_clock(value: Any, field: str) -> int:
-    """把 ``"HH:MM"`` 解析成「当天第几分钟」；格式不对直接报错。
-
-    🔴 **不做静默兜底**（比如解析失败就当 0 点）。时间窗这种地方，静默兜底是最危险的：
-    配错了要么整天不抢、要么半夜照抢，而两种情况都「看起来一切正常」——
-    用户只会觉得「功能没生效」，排查时毫无线索。
-    """
-    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
-        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
-    if isinstance(value, int):
-        if 0 <= value <= 1439:
-            return value
-        raise ValueError(f"{field} 的分钟数要在 0~1439 之间，当前是 {value!r}")
-    match = _CLOCK_RE.match(str(value))
-    if match is None:
-        raise ValueError(f"{field} 要写成 HH:MM（例如 08:00），当前是 {value!r}")
-    hour, minute = int(match.group(1)), int(match.group(2))
-    if hour > 23 or minute > 59:
-        raise ValueError(f"{field} 不是合法时间（00:00 ~ 23:59），当前是 {value!r}")
-    return hour * 60 + minute
-
-
-def _format_clock(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
-class RegGrabWindow(StrictModel):
-    """抢注的**监听时段**：只在这段时间里动手，其余时间看着不动。
-
-    为什么需要它：抢注是秒级响应的行为，**半夜三点还能精准抢到码**是脚本最好认的
-    特征之一。把动手时间限制在人类活动时段，能明显降低被识别的概率。
-
-    语义（``enabled=False`` 时 :meth:`contains` 恒为 ``True``，即全天可抢）：
-
-    - ``start`` / ``end`` 用 ``HH:MM``，**本地时区**（服务进程 ``TZ=Asia/Shanghai``）；
-    - ``start < end``（如 ``08:00`` ~ ``23:00``）⇒ 当天的这一段；
-    - ``start > end``（如 ``22:00`` ~ ``06:00``）⇒ **跨零点**，从 start 到次日 end；
-    - ``start == end`` 直接报错 —— 想全天就把开关关掉，不要用「相等」去猜语义。
-
-    区间**左闭右开** ``[start, end)``：``08:00~23:00`` = 08:00:00 到 22:59:59。
-    这样 ``08:00~09:00`` 和 ``09:00~10:00`` 首尾相接不会重叠。
-    """
-
-    enabled: bool = False
-    start: str = "08:00"
-    end: str = "23:00"
-
-    @field_validator("start", "end", mode="before")
-    @classmethod
-    def _normalize_clock(cls, value: Any, info: ValidationInfo) -> str:
-        return _format_clock(_parse_clock(value, f"reg_grab.window.{info.field_name}"))
-
-    @model_validator(mode="after")
-    def _check_range(self) -> RegGrabWindow:
-        if self.start == self.end:
-            raise ValueError(
-                f"reg_grab.window 的开始和结束时间不能相同（都是 {self.start}）——"
-                " 想全天可抢请把 window.enabled 关掉"
-            )
-        return self
-
-    def contains(self, moment: Optional[datetime] = None) -> bool:
-        """``moment``（默认「现在」）是否落在监听时段内。"""
-        if not self.enabled:
-            return True
-        moment = moment or datetime.now()
-        minute = moment.hour * 60 + moment.minute
-        start = _parse_clock(self.start, "reg_grab.window.start")
-        end = _parse_clock(self.end, "reg_grab.window.end")
-        if start < end:
-            return start <= minute < end
-        return minute >= start or minute < end  # 跨零点
-
-    def describe(self) -> str:
-        """给人看的一句话，用于日志 / 面板 / CLI。"""
-        if not self.enabled:
-            return "全天"
-        suffix = "（跨零点）" if self.start > self.end else ""
-        return f"{self.start}~{self.end}{suffix}"
 
 
 class RegGrabTask(StrictModel):
@@ -1678,12 +1777,15 @@ __all__ = [
     "ProxyConfig",
     "RedPacketConfig",
     "RedPacketDetect",
+    "RedPacketNotifyPolicy",
     "RedPacketReply",
     "RedPacketStrategy",
     "RedPacketTask",
     "RedPacketSuccess",
+    "RegGrabWindow",
     "Settings",
     "StrictModel",
+    "TimeWindow",
     "ValidationError",
     "expand_env",
     "load_env_file",

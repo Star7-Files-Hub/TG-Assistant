@@ -720,6 +720,32 @@ def test_red_packet_rejects_invalid_payload(client, app, account) -> None:
     assert resp.status_code == 400
 
 
+def test_red_packet_edit_max_age_round_trips(client, app, account) -> None:
+    """「编辑事件年龄上限」要能过 HTTP 一圈回来（面板按分钟填、配置存秒）。
+
+    这个字段就是用来挡住"长驻红包被机器人反复编辑"的，存不进去等于没配。
+    """
+    payload = client.get(f"/api/config/{NAME}/red_packet").json()
+    # 空配置里 tasks 是空的（没有默认任务这回事），所以显式给一条。
+    payload["tasks"] = [{"id": "default", "chats": [], "edit_max_age": 600}]
+
+    saved = client.put(f"/api/config/{NAME}/red_packet", json=payload)
+    assert saved.status_code == 200, saved.text
+
+    task = client.get(f"/api/config/{NAME}/red_packet").json()["tasks"][0]
+    assert task["edit_max_age"] == 600.0
+    assert task["id"] == "default"
+
+
+def test_red_packet_rejects_negative_edit_max_age(client, app, account) -> None:
+    payload = client.get(f"/api/config/{NAME}/red_packet").json()
+    payload["tasks"] = [{"id": "default", "edit_max_age": -1}]
+
+    resp = client.put(f"/api/config/{NAME}/red_packet", json=payload)
+
+    assert resp.status_code == 400
+
+
 # --------------------------------------------------------------------------- #
 # 抢注（多任务）
 # --------------------------------------------------------------------------- #

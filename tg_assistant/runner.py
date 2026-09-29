@@ -625,13 +625,25 @@ class AccountRunner:
             # 群组那条由账号 B 收到时，B 得知道「这条内容已经发过了」才能拦下来。
             pair_dedupe=self.pair_dedupe,
             recent_dedupe=self.recent_dedupe,
+            metrics=self.metrics,
         )
         self.forwarder.register()
 
-        self.hunter = RedPacketHunter(self.client, self.config, self.alog, self.notifier)
+        self.hunter = RedPacketHunter(
+            self.client,
+            self.config,
+            self.alog,
+            self.notifier,
+            metrics=self.metrics,
+            # 「这条红包已经点过了」必须活过重启：改配置/部署都会重启账号，
+            # 只留内存的话那条长驻红包每重启一次就被再点一次（线上实测 8 小时 8 次）。
+            settled_path=self.paths.account(self.name).red_packet_settled_file,
+        )
         await self.hunter.register()
 
-        self.reg_grab = RegGrabHunter(self.client, self.config, self.alog, self.notifier)
+        self.reg_grab = RegGrabHunter(
+            self.client, self.config, self.alog, self.notifier, metrics=self.metrics
+        )
         await self.reg_grab.register()
 
         # Cloudflare 优选 IP 实时监听
@@ -741,6 +753,18 @@ class AccountRunner:
                     "rp_failed": snapshot["failed"],
                     "rp_unknown": snapshot["unknown"],
                     "rp_replied": snapshot["replied"],
+                    # 「时段外看见红包但没动手」的次数 + 当前是否在时段内。
+                    # 半夜照样有红包，这个数字 >0 才说明全局时段真的在起作用；
+                    # ``rp_in_window=False`` 能直接回答「为什么一晚上没动静」。
+                    "rp_window_skip": snapshot["outside_window"],
+                    "rp_in_window": snapshot["in_window"],
+                    # 「老消息被编辑」挡下来的次数（``edit_max_age``）—— 这个数字在涨，
+                    # 说明那条长驻红包的反复编辑确实没再进流程。
+                    "rp_stale_edit_skip": snapshot["stale_edits"],
+                    # 重启后从磁盘读回了几条"已经点过了"。刚重启时它是 0，
+                    # 就说明落盘没生效 —— 那条长驻红包又要被点一遍。
+                    "rp_settled": snapshot["settled"],
+                    "rp_settled_restored": snapshot["settled_restored"],
                 }
             )
         if self.reg_grab is not None:

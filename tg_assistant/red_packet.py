@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import random
 import time
 from collections.abc import AsyncIterator
@@ -252,6 +254,26 @@ class RedPacketHunter:
         self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
         self._seen: dict[tuple[int, int], float] = {}
+        #: 已得出**确定结论**的红包消息 → ``(记录时间, 结论)``。一旦某条消息判出
+        #: 抢到 / 没抢到，就**再也不点它**。
+        #:
+        #: 🔴 为什么必须单独记一张表（``_seen`` 的 60 秒窗口不够）：
+        #: 红包 bot 会**反复编辑同一条消息**（更新"已领 19/200 份"），每次编辑都是一次
+        #: EditedMessage 事件。线上实测同一条 ``message_id`` 在 4 分钟、8 分钟后又被
+        #: 编辑，于是又点一次、又白等 10 秒判定，机器人回「你已经领过这个红包啦」。
+        #: 既浪费时机又像在刷按钮（风控最讨厌的行为）。
+        #:
+        #: 🔴 又为什么必须**落盘**：这张表原本只在内存里，而服务经常重启（每次改配置、
+        #: 每次部署）。线上实测 2026-09-29 那条长驻红包：11:16 判出「你已经领过」并进了
+        #: 这张表，13:50 一次重启就忘光，14:23 它又被编辑 → 又点一次；16:38~17:46 又重启
+        #: 6 次，18:07 再点一次。重启是常态，所以「已经点过了」必须活过重启。
+        #:
+        #: 时间戳用 ``time.time()``（而不是 ``time.monotonic()``）：要跨进程比较、
+        #: 落盘后再读回来，单调时钟没有跨进程意义。
+        self._settled: dict[tuple[int, int], tuple[float, str]] = {}
+        #: 从磁盘读回了多少条（心跳/排查用：重启后这个数字不为 0 才说明落盘生效了）。
+        self.restored_settled = 0
+        self._load_settled()
         self._reply_cooldown: dict[int, float] = {}
         self._me_id: Optional[int] = None
         self._me_names: list[str] = []
@@ -263,6 +285,13 @@ class RedPacketHunter:
             "unknown": 0,
             "error": 0,
             "replied": 0,
+            #: 发现了红包但**不在全局动手时段**内、于是没动手的次数。
+            #: 「时段外发现红包」本该是常态（半夜照样有包，只是我们不抢），
+            #: 这个数字 >0 才说明时段真的在起作用。
+            "outside_window": 0,
+            #: 因为"原消息太老"而被丢掉的编辑事件次数（``edit_max_age`` 挡下来的）。
+            #: 线上那条长驻红包被反复编辑时，这个数字会涨 —— 它涨说明闸门在干活。
+            "stale_edits": 0,
         }
         #: 每条任务各自的计数。多任务之后「一共抢到 3 个」说明不了是谁干的。
         self.task_stats: dict[str, dict[str, int]] = {
@@ -350,6 +379,27 @@ class RedPacketHunter:
         del client
         self._dispatch(message, edited=True)
 
+    def _edit_age(self, task: PreparedTask, message: Any) -> Optional[float]:
+        """这条编辑事件对应的消息有多老（秒）；**不该处理**就返回年龄，否则 ``None``。
+
+        ``message.date`` 是**原消息的发布时间**（pyrogram 对编辑事件同样给原始时间，
+        本次编辑的时间在 ``edit_date``）—— 正是我们要判的"老不老"。
+
+        拿不到时间（测试替身、字段缺失、时钟异常）时**放行**：宁可多看一眼，
+        也不要因为读不到时间就把真红包漏掉。``edit_max_age <= 0`` = 关掉闸门。
+        """
+        limit = task.config.edit_max_age
+        if limit <= 0:
+            return None
+        date = getattr(message, "date", None)
+        if date is None:
+            return None
+        try:
+            age = time.time() - date.timestamp()
+        except (AttributeError, OverflowError, OSError, ValueError):
+            return None
+        return age if age > limit else None
+
     def _dispatch(self, message: Any, *, edited: bool) -> None:
         chat_id, _, _ = chat_identity(message)
         if chat_id is None:
@@ -366,6 +416,43 @@ class RedPacketHunter:
         message_id = getattr(message, "id", None)
         key = (chat_id, message_id or 0)
         now = time.monotonic()
+
+        # 🔴 编辑事件的**年龄闸门**：一条几十分钟前的消息又被编辑，绝不可能是新红包。
+        # 线上实测（2026-09-29，白嫖分享社 352733）：那是一条**长驻红包**，机器人一整天
+        # 在改它的状态文本，于是同一条 8 小时前的消息被处理了 8 次，其中 7 次只换回
+        # 「你已经领过这个红包啦」——每次都要白等一个 wait_timeout，还像在刷按钮。
+        # ``include_edited`` 本身要保留（有些 bot 先发消息、随后编辑出按钮），
+        # 所以闸门只针对**老消息**，不针对"编辑"这个动作。
+        if edited:
+            age = self._edit_age(task, message)
+            if age is not None:
+                self.stats["stale_edits"] += 1
+                per_task = self.task_stats.get(task.id)
+                if per_task is not None:
+                    per_task["stale_edits"] += 1
+                self.alog.debug(
+                    "红包消息太老（编辑事件），跳过",
+                    task=task.label,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    age_s=round(age, 1),
+                    max_age_s=task.config.edit_max_age,
+                    stale_edits=self.stats["stale_edits"],
+                )
+                return
+
+        # 🔴 已经判出确定结论的红包消息**再也不点**：bot 会反复编辑同一条消息
+        # （更新"已领 19/200 份"），每次编辑都是一次事件。见 ``_settled`` 的注释。
+        settled = self._settled.get(key)
+        if settled is not None:
+            self.alog.debug(
+                "该红包已得出确定结论，不再重复点击",
+                chat_id=chat_id,
+                message_id=message_id,
+                result=settled[1],
+            )
+            return
+
         last = self._seen.get(key)
         if last is not None and now - last < 60.0:
             self.alog.debug("红包消息已处理过，跳过", chat_id=chat_id, message_id=message_id)
@@ -375,9 +462,29 @@ class RedPacketHunter:
             cutoff = now - 300
             self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
 
+        _, _, chat_title = chat_identity(message)
+
+        if not self.config.in_window:
+            # 时段外：看得见，但不动手。
+            # **不**计入 ``detected`` —— 那个数字的含义是"真正要抢的红包有几个"，
+            # 把夜里的包混进去它就失去意义了（这也是抢注那边的口径）。
+            self.stats["outside_window"] += 1
+            per_task = self.task_stats.get(task.id)
+            if per_task is not None:
+                per_task["outside_window"] += 1
+            self.alog.info(
+                "发现红包但不在动手时段内，跳过",
+                task=task.label,
+                chat=chat_title or chat_id,
+                message_id=message_id,
+                button=button.get("text") if button else "-",
+                window=self.config.window.describe(),
+                outside_window=self.stats["outside_window"],
+            )
+            return
+
         self.stats["detected"] += 1
         self.task_stats[task.id]["detected"] += 1
-        _, _, chat_title = chat_identity(message)
         self.alog.info(
             "发现红包",
             task=task.label,
@@ -553,14 +660,119 @@ class RedPacketHunter:
         outcome = await self._execute(task, message, button, code, strategy, started)
 
         self._record(task, outcome)
+        self._settle(outcome)
         if self._should_reply(task, outcome.result):
             replied = await self._maybe_reply(task, message, outcome)
             if replied:
                 outcome.replied = replied
 
         self._log_outcome(outcome, chat_title, message_id)
-        if config.notify and self.notifier is not None:
+        if (
+            config.notify
+            and self.notifier is not None
+            and self._should_notify(task, outcome.result)
+        ):
             self._submit_notify(task, message, outcome)
+
+    def _settle(self, outcome: GrabOutcome) -> None:
+        """把**确定结论**记进 ``_settled``，之后同一条消息不再点。
+
+        只有抢到 / 明确没抢到才算定论。``unknown``（机器人没回显、或回显看不懂）
+        与 ``error`` 刻意**不**记 —— 那两种情况重试是有意义的（可能只是网络抖动），
+        交给 ``_seen`` 的 60 秒窗口去挡短时间内的重复即可。
+        """
+        if outcome.result not in {GrabResult.SUCCESS, GrabResult.FAILED}:
+            return
+        if outcome.chat_id is None or outcome.message_id is None:
+            return
+        key = (outcome.chat_id, outcome.message_id)
+        self._settled[key] = (time.time(), outcome.result.value)
+        # 兜底裁剪：消息 id 不会复用，所以不需要 TTL，只防这张表无限长大。
+        if len(self._settled) > self.SETTLED_MAX:
+            newest = sorted(self._settled.items(), key=lambda kv: kv[1][0], reverse=True)
+            self._settled = dict(newest[: self.SETTLED_MAX // 2])
+        self._save_settled()
+
+    # ------------------------------------------------------------------ #
+    def _load_settled(self) -> None:
+        """读回「已得出定论的红包消息」。任何异常都只当没有记录，绝不阻塞启动。
+
+        读回来的表**也受** ``SETTLED_MAX`` 约束：磁盘上的文件可能是老版本（或手工编辑过）
+        留下的超大表，直接全塞进内存就白瞎了这个上限。
+        """
+        if self.settled_path is None:
+            return
+        try:
+            raw = json.loads(self.settled_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception:
+            # 文件被写坏（断电 / 手工编辑）不能让账号起不来：最坏只是同一条红包
+            # 消息可能被多点一次，比整个引擎拒绝启动轻得多。
+            return
+        if not isinstance(raw, dict):
+            return
+        entries = raw.get("settled")
+        if not isinstance(entries, dict):
+            return
+        for raw_key, entry in entries.items():
+            key = _settled_key(raw_key)
+            if key is None:
+                continue
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                result, when = str(entry[0]), entry[1]
+            elif isinstance(entry, str):
+                # 只写了结论（没有时间）的老格式：当作"很久以前"，裁剪时优先丢。
+                result, when = entry, 0.0
+            else:
+                # 形状不对（``[]`` / 数字 / 嵌套对象）→ 跳过这一条，**不要**把
+                # ``str(entry)`` 当成结论塞进去。
+                continue
+            try:
+                stamp = float(when)
+            except (TypeError, ValueError):
+                stamp = 0.0
+            self._settled[key] = (stamp, result)
+        self.restored_settled = len(self._settled)
+        if len(self._settled) > self.SETTLED_MAX:
+            newest = sorted(self._settled.items(), key=lambda kv: kv[1][0], reverse=True)
+            self._settled = dict(newest[: self.SETTLED_MAX // 2])
+
+    def _save_settled(self) -> None:
+        """原子写回。失败只吞掉 —— 抢红包永远不能被状态文件拖垮。"""
+        if self.settled_path is None:
+            return
+        try:
+            payload = {
+                "version": 1,
+                "settled": {
+                    f"{chat_id}:{message_id}": [result, when]
+                    for (chat_id, message_id), (when, result) in self._settled.items()
+                },
+            }
+            self.settled_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.settled_path.with_name(self.settled_path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.settled_path)
+        except Exception:
+            return
+
+    def _should_notify(self, task: PreparedTask, result: GrabResult) -> bool:
+        """要不要把这次结果推给用户 —— **依据就是机器人的回显**。
+
+        回显已经被判定吃掉了（callback answer / 随后的消息变成 :class:`GrabResult`），
+        所以策略直接按结果筛，不必再解析一遍文本。见 :data:`RedPacketNotifyPolicy`。
+        """
+        policy = task.config.notify_on
+        if policy == "always":
+            return True
+        if policy == "success":
+            return result is GrabResult.SUCCESS
+        # attention：抢到 + 出错都值得看一眼，跳过"没抢到/已经领过/未知"的噪音。
+        return result in {GrabResult.SUCCESS, GrabResult.ERROR}
 
     def _should_reply(self, task: PreparedTask, result: GrabResult) -> bool:
         """是否该发随机回复。
@@ -990,10 +1202,20 @@ class RedPacketHunter:
             "pending_tasks": len(self._tasks),
             "watching_chats": self._bus.watching,
             "seen_cache": len(self._seen),
+            #: 已定论、不再重复点的红包消息条数 —— 这个数字在涨，就说明
+            #: 「同一红包被反复编辑」的浪费确实被挡住了。
+            "settled": len(self._settled),
+            #: 重启后从磁盘读回了几条已定论记录。刚重启时它不为 0，才说明落盘真的生效了
+            #: （否则重启等于把"已经点过了"全忘掉，那条长驻红包又要被点一遍）。
+            "settled_restored": self.restored_settled,
             # 任务维度的信息：面板/CLI 靠它显示"几条任务、哪条在干活"。
             "tasks": len(self.config.tasks),
             "active_tasks": len(self.prepared),
             "per_task": {k: dict(v) for k, v in self.task_stats.items()},
+            # 全局动手时段：``in_window`` 是"现在动不动手"，面板与心跳都靠它回答
+            # 「为什么没动静」。
+            "window": self.config.window.describe(),
+            "in_window": self.config.in_window,
         }
 
 

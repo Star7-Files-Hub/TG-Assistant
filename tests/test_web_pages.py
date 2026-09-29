@@ -1202,3 +1202,21 @@ def test_reg_grab_page_saves_the_whole_task_list() -> None:
     collect = _js_function_body(html, "collectTask")
     for key in ("id:", "name:", "enabled:", "chats:", "detect:", "steps:", "window:"):
         assert key in collect, f"collectTask() 没提交 {key}"
+
+
+def test_red_packet_page_edit_age_is_filled_in_minutes_stored_in_seconds() -> None:
+    """面板按**分钟**填、配置存**秒** —— 换算写错就会静默把闸门改成 30 倍或 1/30。
+
+    这个闸门就是用来挡住"长驻红包被反复编辑"的（线上 8 小时被点 8 次），
+    阈值静默错掉等于没修，所以把两个方向的换算都钉住。
+    """
+    html = (_WEB_DIR / "templates" / "red_packet.html").read_text(encoding="utf-8")
+
+    assert 'id="rp-edit-max-age"' in html
+    assert "编辑事件年龄上限（分钟）" in html
+    # 载入：秒 → 分钟
+    assert "document.getElementById('rp-edit-max-age').value = Math.round(editMaxAge / 60)" in html
+    # 提交：分钟 → 秒
+    collect = _js_function_body(html, "collectTask")
+    assert "edit_max_age" in collect
+    assert "* 60" in collect

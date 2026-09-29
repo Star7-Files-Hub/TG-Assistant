@@ -958,6 +958,13 @@ async def api_rules_test_global(payload: dict[str, Any]) -> dict[str, Any]:
 #: PUT 回来会 400「Extra inputs are not permitted」，用户只看到"保存失败"。
 _RED_PACKET_TASK_READONLY = ("ready", "problem")
 
+#: GET 会在**顶层**多塞的只读字段：PUT 时丢掉。
+#:
+#: ``in_window`` 是「此刻在不在全局动手时段内」，``server_now`` 是「服务端现在几点」
+#: —— 两者都随时间跳变，每次 GET 现算、不落盘；``RedPacketConfig`` 是
+#: ``extra="forbid"`` 的，不丢就 400。
+_RED_PACKET_READONLY = ("in_window", "server_now")
+
 
 @router.get("/config/{name}/red_packet")
 async def api_red_packet_get(name: str, store=Depends(get_store)) -> dict[str, Any]:
@@ -968,6 +975,10 @@ async def api_red_packet_get(name: str, store=Depends(get_store)) -> dict[str, A
     for item, task in zip(data["tasks"], config.tasks):
         item["ready"] = task.ready
         item["problem"] = task.problem
+    # 全局时段：面板要能直接回答「为什么一晚上没动静」，以及给时间框一个
+    # 「服务端现在几点」的对照（面板填的是服务端时区 Asia/Shanghai）。
+    data["in_window"] = config.in_window
+    data["server_now"] = datetime.now().strftime("%H:%M")
     return data
 
 
@@ -981,7 +992,8 @@ async def api_red_packet_put(
 
     _require_account(store, name)
     config = store.load_account_config(name, create=False)
-    body = dict(payload)
+    # 只读字段直接丢掉，让「GET 回来改一改再 PUT 回去」这种用法也能 work。
+    body = {key: value for key, value in payload.items() if key not in _RED_PACKET_READONLY}
     body["tasks"] = [
         {key: value for key, value in task.items() if key not in _RED_PACKET_TASK_READONLY}
         for task in body.get("tasks", [])
