@@ -1630,11 +1630,11 @@
     // ==================== 正则测试器 ====================
     async function testRegex() {
         // 测的是**整条规则的文本级判定**：主条件 + 排除规则一起算。
-        // 曾经只发 patterns.join('|')、完全不带 exclude_patterns —— 用户在
-        // 「排除规则」里加了 21点，测试按钮照样显示"匹配成功"，于是被理解成
+        // 曾经只把主正则拼成一个字符串发给服务端、完全不带 exclude_patterns ——
+        // 用户在「排除规则」里加了 21点，测试按钮照样显示"匹配成功"，于是被理解成
         // "排除没用"（其实引擎那边是生效的，只是测试器没把它算进去）。
-        // 也不再自己用 '|' 拼主正则：那样捕获组编号和引擎（逐条模式、取命中那条
-        // 的组）对不上，模板里的 {g1} 会对错。
+        // 现在两个列表都原样发：自己用竖线拼主正则会让捕获组编号和引擎（逐条模式、
+        // 取命中那条的组）对不上，模板里的 {g1} 会对错。
         const text = document.getElementById('test-text').value;
         const mode = document.getElementById('match-mode').value;
         const ignoreCase = document.getElementById('ignore-case').checked;
@@ -1664,7 +1664,8 @@
         // 注册码已用过、被去重挡掉，全都不在这里）。
         const scopeHint = `<p class="form-hint">只看文本级判定：匹配模式 + 排除规则。`
             + `频道来源/排除、发送者白名单/黑名单、已使用注册码拦截、去重与频率限制，`
-            + `都不在这里判断（它们需要真实会话上下文）。</p>`;
+            + `都不在这里判断（它们需要真实会话上下文）；粘进来的文本按整段消息文本处理，`
+            + `不区分「匹配字段」选的是正文还是标题。</p>`;
         if (data.error) {
             resultEl.innerHTML = `<div class="test-result-error">${escapeHtml(data.error)}</div>`;
         } else if (data.excluded) {
@@ -1675,6 +1676,11 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
                 被排除规则拦下 ⇒ 不会转发`;
             if (by) html += `<span class="test-groups">拦下它的是: ${by}</span>`;
+            else if (data.message) {
+                // 定位不到具体哪一条（比如同一条排除规则写了两遍）时退回服务端那句话，
+                // 总之不能只给个"被拦下"却不说是谁。
+                html += `<span class="test-groups">${escapeHtml(data.message)}</span>`;
+            }
             const primary = data.primary || {};
             if (primary.full_match) {
                 html += `<span class="test-groups">主条件本来匹配到: <code>${escapeHtml(primary.full_match)}</code></span>`;

@@ -646,6 +646,157 @@ def test_rules_test_contains_and_exact_modes(client, app, account) -> None:
     assert exact.json()["match"] is True
 
 
+def test_rules_test_reports_the_exclude_rule_that_blocked_it(client, app, account) -> None:
+    """主条件命中了，但被排除规则拦下 —— 必须返回「没命中/被拦」并点名是哪条排除规则。
+
+    🔴 用户反馈「为什么21点一直命中，我已经加了排除」：面板「测试」按钮原来只把主正则
+    发给服务端，``exclude_patterns`` 一个字都没发，于是往「排除规则」里加了 21点
+    之后测试按钮照样显示「匹配成功」—— 用户就认定"排除没生效"（引擎那边其实生效了）。
+    """
+    body = client.post(
+        "/api/rules/test",
+        json={
+            "patterns": ["21点"],
+            "exclude_patterns": ["21点"],
+            "text": "今晚21点开抢",
+            "mode": "regex",
+        },
+    ).json()
+
+    assert body["match"] is False, "被排除规则命中的消息不能算命中（引擎不会转发）"
+    assert body["excluded"] is True
+    assert body["excluded_by"] == ["21点"], "必须点名是哪条排除规则拦下的"
+    assert "21点" in body["message"]
+    # 还要告诉用户"主条件本来匹配到了什么"，否则他只会觉得莫名其妙
+    assert body["primary"]["full_match"] == "21点"
+    assert body["primary"]["pattern"] == "21点"
+
+
+def test_rules_test_does_not_blame_excludes_when_the_main_pattern_misses(
+    client, app, account
+) -> None:
+    """主条件不命中时**不能**说"被排除" —— 那是误报，用户会去查一条无辜的排除规则。"""
+    body = client.post(
+        "/api/rules/test",
+        json={
+            "patterns": ["抢购"],
+            "exclude_patterns": ["21点"],
+            "text": "今晚21点开抢",
+            "mode": "regex",
+        },
+    ).json()
+
+    assert body["match"] is False
+    assert "excluded" not in body
+    assert body["reason"]
+
+
+@pytest.mark.parametrize(
+    ("patterns", "excludes", "text", "mode"),
+    [
+        (["21点"], ["21点"], "今晚21点开抢", "regex"),
+        (["21点"], ["20点"], "今晚21点开抢", "regex"),
+        (["21点"], [], "今晚21点开抢", "regex"),
+        (["抢购"], ["21点"], "今晚21点开抢", "regex"),
+        (["21点"], ["21点"], "今晚21点开抢", "contains"),
+        (["21点"], ["21点"], "今晚21点开抢", "exact"),
+        (["今晚21点开抢"], ["21点"], "今晚21点开抢", "exact"),
+        (["(21)点"], ["21点"], "今晚21点开抢", "regex"),
+        ([], ["21点"], "今晚21点开抢", "all"),
+        ([], [], "今晚21点开抢", "all"),
+    ],
+)
+def test_rules_tester_agrees_with_the_engine_including_excludes(
+    client, app, account, patterns, excludes, text, mode
+) -> None:
+    """测试器的判定（含排除规则）必须和引擎**逐字一致** —— 包括"是谁排除的"。
+
+    这条比 :func:`test_rules_tester_agrees_with_the_forward_engine` 更进一步：
+    后者只比 ``match``，这里把 ``exclude_patterns`` 也压进来，并且断言"被拦下"这个
+    结论和引擎的 ``reason`` 完全对应（引擎说不是排除导致的，测试器就不许说被排除）。
+    """
+    from tg_assistant.config import MatchConfig
+    from tg_assistant.matching import CompiledMatcher
+
+    tested = client.post(
+        "/api/rules/test",
+        json={"patterns": patterns, "exclude_patterns": excludes, "text": text, "mode": mode},
+    ).json()
+    engine = CompiledMatcher(
+        MatchConfig(mode=mode, patterns=patterns, exclude_patterns=excludes, ignore_case=True)
+    ).match_text(text)
+
+    assert tested["match"] is engine.matched
+    assert bool(tested.get("excluded")) is (engine.reason == "命中排除规则")
+    assert tested.get("groups", []) == [group for group in engine.groups if group]
+    if tested.get("excluded"):
+        assert set(tested["excluded_by"]) <= set(excludes)
+        assert tested["excluded_by"], "说了被排除，却没说清是哪一条"
+    else:
+        assert tested.get("reason", "") == engine.reason
+
+
+def test_rules_test_keeps_the_legacy_pattern_argument_working(client, app, account) -> None:
+    """老入参 ``pattern``（单个字符串）必须继续可用 —— 别的调用方还在用它。"""
+    legacy = client.post(
+        "/api/rules/test", json={"pattern": "21点", "text": "今晚21点开抢", "mode": "regex"}
+    ).json()
+    assert legacy["match"] is True
+
+    # 老的 pattern + 新的 exclude_patterns 可以混用
+    mixed = client.post(
+        "/api/rules/test",
+        json={
+            "pattern": "21点",
+            "exclude_patterns": ["21点"],
+            "text": "今晚21点开抢",
+            "mode": "regex",
+        },
+    ).json()
+    assert mixed["match"] is False and mixed["excluded_by"] == ["21点"]
+
+    # 列表入参写成字符串也认（老调用方可能顺手塞一个字符串）
+    as_string = client.post(
+        "/api/rules/test", json={"patterns": "21点", "text": "今晚21点开抢", "mode": "regex"}
+    ).json()
+    assert as_string["match"] is True
+
+    # 空主正则（非 all 模式）仍然是那句"正则表达式为空"
+    empty = client.post(
+        "/api/rules/test", json={"pattern": "", "text": "x", "mode": "regex"}
+    ).json()
+    assert empty["match"] is False and "正则表达式为空" in empty["error"]
+
+
+def test_rules_test_reports_a_broken_exclude_pattern(client, app, account) -> None:
+    """排除规则也是用户手写的正则 —— 写错了要说清楚，不能悄悄当成"没命中"。"""
+    body = client.post(
+        "/api/rules/test",
+        json={
+            "patterns": ["21点"],
+            "exclude_patterns": ["(["],
+            "text": "今晚21点开抢",
+            "mode": "regex",
+        },
+    ).json()
+    assert body["match"] is False
+    assert "无效" in body["error"]
+
+
+def test_rules_test_global_and_scoped_agree_about_excludes(client, app, account) -> None:
+    """两个入口共用 ``_run_match_test``，排除规则的判定也必须一模一样。"""
+    payload = {
+        "patterns": ["21点"],
+        "exclude_patterns": ["21点"],
+        "text": "今晚21点开抢",
+        "mode": "regex",
+    }
+    global_body = client.post("/api/rules/test", json=payload).json()
+    scoped_body = client.post(f"/api/config/{NAME}/rules/test", json=payload).json()
+    assert global_body == scoped_body
+    assert global_body["excluded_by"] == ["21点"]
+
+
 def test_rules_test_requires_pattern_and_text(client, app, account) -> None:
     assert (
         client.post(f"/api/config/{NAME}/rules/test", json={"pattern": "", "text": "x"}).json()["match"]

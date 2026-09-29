@@ -1693,3 +1693,33 @@ def test_rules_page_edit_modal_can_change_listening_accounts() -> None:
     # 编辑分支里不能再出现"全部账号"的说法（那个框是既有监听账号的勾选状态）
     edit_branch = summary[summary.index("if (editingRuleId)"):summary.index("return;")]
     assert "全部账号" not in edit_branch, "编辑分支还在说「全部账号」—— 与实际做的事对不上"
+
+
+def test_rules_page_tester_counts_exclude_patterns() -> None:
+    """「测试」按钮必须把排除规则一起算 —— 这是"排除没用"误判的来源。
+
+    🔴 用户反馈「为什么21点一直命中，我已经加了排除」。根因是 ``testRegex()`` 只发
+    ``tagInputs.patterns.join('|')``：``exclude_patterns`` 一个字都没发给服务端，
+    所以加了排除规则之后测试结果照样显示「匹配成功」。
+
+    判定本身（谁排除了谁）由远端的 pytest 钉住；这里钉页面这一半：请求要带两个列表、
+    结果要分「被拦下 / 匹配成功 / 不匹配」三种，并说明这个测试只覆盖文本级。
+    """
+    html = _rules_html()
+    body = _js_function_body(html, "testRegex")
+
+    assert "patterns: tagInputs.patterns" in body, "主正则没有发列表"
+    assert "exclude_patterns: tagInputs.exclude_patterns" in body, (
+        "排除规则没发给服务端 —— 用户会再次误判成「排除没用」"
+    )
+    assert "join('|')" not in body, "又在页面里自己拼主正则（捕获组编号会和引擎对不上）"
+
+    # 三种结果都要处理，且"被拦下"不能被渲染成"匹配成功"
+    assert "data.excluded" in body, "没有处理「被排除规则拦下」的返回"
+    assert "excluded_by" in body and "拦下它的是" in body, "没把肇事的那条排除规则打出来"
+    assert body.index("data.excluded") < body.index("data.match"), (
+        "要先判 excluded 再判 match（excluded 时 match 也是 false，顺序反了就只剩「不匹配」）"
+    )
+    # 只覆盖文本级的说明（来源/发送者/注册码/去重都要点名）
+    for word in ("只看文本级判定", "已使用注册码拦截", "去重与频率限制", "真实会话上下文"):
+        assert word in body, f"测试结果区没有说明「{word}」不参与判定"
