@@ -2469,7 +2469,7 @@ class TestRecentContentDedupe:
     def test_recent_hit(self):
         dedupe = RecentContentDedupe(limit=5, ttl=3600)
         dedupe.add("fp1", DST)
-        assert dedupe.contains("fp1", DST) is True
+        assert dedupe.contains("fp1", DST) == "same"
         assert dedupe.hits == 1
 
     def test_beyond_limit_but_within_ttl_still_counts(self):
@@ -2477,7 +2477,7 @@ class TestRecentContentDedupe:
         dedupe = RecentContentDedupe(limit=2, ttl=3600)
         for i in range(5):
             dedupe.add(f"fp{i}", DST)
-        assert dedupe.contains("fp0", DST) is True, "时间窗内 ⇒ 即便超出条数上限也要拦住"
+        assert dedupe.contains("fp0", DST) == "same", "时间窗内 ⇒ 即便超出条数上限也要拦住"
 
     def test_beyond_limit_and_expired_is_dropped(self):
         """既超出条数上限、又过了时间窗 ⇒ 不再算最近。"""
@@ -2486,26 +2486,26 @@ class TestRecentContentDedupe:
         dedupe.add("new1", DST)
         time.sleep(0.02)
         dedupe.add("new2", DST)
-        assert dedupe.contains("old", DST) is False
+        assert dedupe.contains("old", DST) is None
 
     def test_limit_zero_means_time_window_only(self):
         dedupe = RecentContentDedupe(limit=0, ttl=3600)
         for i in range(10):
             dedupe.add(f"fp{i}", DST)
-        assert dedupe.contains("fp0", DST) is True, "limit=0 ⇒ 只看时间窗，条数不限"
+        assert dedupe.contains("fp0", DST) == "same", "limit=0 ⇒ 只看时间窗，条数不限"
 
     def test_ttl_zero_means_count_only(self):
         dedupe = RecentContentDedupe(limit=3, ttl=0)
         for i in range(5):
             dedupe.add(f"fp{i}", DST)
-        assert dedupe.contains("fp0", DST) is False, "ttl=0 ⇒ 只看最近 3 条"
-        assert dedupe.contains("fp4", DST) is True
+        assert dedupe.contains("fp0", DST) is None, "ttl=0 ⇒ 只看最近 3 条"
+        assert dedupe.contains("fp4", DST) == "same"
 
     def test_both_zero_means_disabled(self):
         dedupe = RecentContentDedupe(0, 0)
         dedupe.add("fp", DST)
         assert dedupe.enabled is False
-        assert dedupe.contains("fp", DST) is False
+        assert dedupe.contains("fp", DST) is None
         assert len(dedupe) == 0
 
     def test_same_fingerprint_keeps_only_latest(self):
@@ -2517,14 +2517,81 @@ class TestRecentContentDedupe:
     def test_targets_are_isolated(self):
         dedupe = RecentContentDedupe(limit=5, ttl=3600)
         dedupe.add("fp", DST)
-        assert dedupe.contains("fp", DST) is True
-        assert dedupe.contains("fp", SRC) is False, "同内容发到不同目标互不影响"
+        assert dedupe.contains("fp", DST) == "same"
+        assert dedupe.contains("fp", SRC) is None, "同内容发到不同目标互不影响"
 
     def test_none_fingerprint_never_hits(self):
         dedupe = RecentContentDedupe(limit=5, ttl=3600)
-        assert dedupe.contains(None, DST) is False
+        assert dedupe.contains(None, DST) is None
         dedupe.add(None, DST)
         assert len(dedupe) == 0, "没有指纹（既无正文也无媒体）不参与这一层"
+
+    # ------------------------------------------------------------------ #
+    # 「同一条内容又加了些文字」
+    # ------------------------------------------------------------------ #
+    #: 线上原文（2026-09-29 茶包影视 msg 12540 / 12544）。
+    CODE = "茶包影视-30-Register_UDMlfejslD"
+    CODE_WITH_NAME = "茶包影视-30-Register_UDMlfejslD yanpeihao816"
+
+    def test_added_text_is_the_same_content(self):
+        """线上那条重复转发就是这种：同一个码，后面多了个用户名。"""
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:clean", DST, self.CODE)
+        assert d.contains("fp:withname", DST, self.CODE_WITH_NAME) == "added"
+        assert d.hits_added == 1
+
+    def test_added_text_works_in_the_other_order(self):
+        """谁先到是随机的（频道/群组那两层的先后顺序线上实测就是随机的）。"""
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:withname", DST, self.CODE_WITH_NAME)
+        assert d.contains("fp:clean", DST, self.CODE) == "added"
+
+    def test_quoted_snippet_in_a_long_post_is_not_the_same_content(self):
+        """长帖里引用一小段**不算**同一条 —— 少转发一条开奖公告是静默丢消息。"""
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:code", DST, self.CODE)
+        long_post = "🎉 开奖公告\n本次中奖的注册码是 " + self.CODE + "，请尽快兑换。" + "详情见群公告。" * 30
+        assert d.contains("fp:post", DST, long_post) is None
+
+    def test_tiny_overlap_is_not_the_same_content(self):
+        """太短的重合不比 —— 『已为您生成了』这种几个字到处都是。"""
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:a", DST, "已为您生成了")
+        assert d.contains("fp:b", DST, "已为您生成了 EMBY-ABCDEF") is None
+
+    def test_different_code_is_not_the_same_content(self):
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:a", DST, self.CODE)
+        assert d.contains("fp:b", DST, "茶包影视-30-Register_ZZZZZZZZZZ yanpeihao816") is None
+
+    def test_added_text_needs_the_stored_text(self):
+        """老记录（没有原文）只能按指纹比 —— 不能因为缺原文就乱判。"""
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:clean", DST)  # 没传 text
+        assert d.contains("fp:withname", DST, self.CODE_WITH_NAME) is None
+
+    def test_added_text_respects_target_isolation(self):
+        d = RecentContentDedupe(limit=5, ttl=3600)
+        d.add("fp:clean", DST, self.CODE)
+        assert d.contains("fp:withname", SRC, self.CODE_WITH_NAME) is None
+
+    def test_added_text_survives_a_restart(self, tmp_path):
+        """原文要一起落盘，否则重启后那条判据就废了。"""
+        path = tmp_path / "dedupe.json"
+        first = RecentContentDedupe(limit=5, ttl=3600, state_path=path)
+        first.add("fp:clean", DST, self.CODE)
+        reborn = RecentContentDedupe(limit=5, ttl=3600, state_path=path)
+        assert reborn.contains("fp:withname", DST, self.CODE_WITH_NAME) == "added"
+
+    def test_old_state_file_without_text_still_loads(self, tmp_path):
+        """老文件是两项的，读回来要补空串而不是崩掉。"""
+        path = tmp_path / "dedupe.json"
+        path.write_text(
+            '{"version":1,"buckets":{"%s":[[%f,"fp:clean"]]}}' % (DST, time.time()),
+            encoding="utf-8",
+        )
+        d = RecentContentDedupe(limit=5, ttl=3600, state_path=path)
+        assert d.contains("fp:clean", DST) == "same"
 
     def test_snapshot(self):
         dedupe = RecentContentDedupe(limit=5, ttl=3600)
@@ -2549,7 +2616,7 @@ class TestRecentContentDedupePersists:
 
         # 模拟进程重启：换一个对象、读同一个文件。
         after = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
-        assert after.contains("text:abc", DST) is True
+        assert after.contains("text:abc", DST) == "same"
         assert after.restored == 1, "恢复条数要能自证「记性」真的接上了"
 
     def test_restart_does_not_leak_across_targets(self, tmp_path):
@@ -2558,7 +2625,7 @@ class TestRecentContentDedupePersists:
         before.add("text:abc", DST)
 
         after = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
-        assert after.contains("text:abc", SRC) is False, "同内容发到不同目标互不影响"
+        assert after.contains("text:abc", SRC) is None, "同内容发到不同目标互不影响"
 
     def test_without_state_path_it_stays_in_memory(self, tmp_path):
         """不传 state_path 时行为必须和从前**完全一致**（单测 / 离线场景）。"""
@@ -2567,7 +2634,7 @@ class TestRecentContentDedupePersists:
         # 只看这个文件：tmp_path 里可能有 conftest 建出来的 data/ 目录，别误判。
         assert not (tmp_path / "dedupe.json").exists()
         assert dedupe.snapshot()["persisted"] is False
-        assert dedupe.contains("text:abc", DST) is True
+        assert dedupe.contains("text:abc", DST) == "same"
 
     def test_expired_entries_are_not_restored(self, tmp_path):
         path = tmp_path / "dedupe.json"
@@ -2578,7 +2645,7 @@ class TestRecentContentDedupePersists:
             encoding="utf-8",
         )
         dedupe = RecentContentDedupe(limit=5, ttl=5, state_path=path)
-        assert dedupe.contains("text:old", DST) is False, "过了 TTL 的不该读回来"
+        assert dedupe.contains("text:old", DST) is None, "过了 TTL 的不该读回来"
         assert dedupe.restored == 0
 
     def test_corrupt_file_does_not_block_startup(self, tmp_path):
@@ -2607,8 +2674,8 @@ class TestRecentContentDedupePersists:
             encoding="utf-8",
         )
         dedupe = RecentContentDedupe(limit=5, ttl=86400, state_path=path)
-        assert dedupe.contains("text:ok", DST) is True
-        assert dedupe.contains("text:x", DST) is False
+        assert dedupe.contains("text:ok", DST) == "same"
+        assert dedupe.contains("text:x", DST) is None
 
     @pytest.mark.asyncio
     async def test_engine_records_after_a_real_forward(self, tmp_path, alog):
@@ -2631,7 +2698,7 @@ class TestRecentContentDedupePersists:
         assert path.exists(), "转发成功就该落盘"
 
         reborn = RecentContentDedupe(limit=5, ttl=3600, state_path=path)
-        assert reborn.contains(content_fingerprint(message), DST) is True
+        assert reborn.contains(content_fingerprint(message), DST) == "same"
 
 
 class TestRecentContentDedupeInEngine:
@@ -2656,6 +2723,54 @@ class TestRecentContentDedupeInEngine:
 
         assert len(client.forwarded) == 1, "同样的内容不该在目标里出现两遍"
         assert engine.stats["recent_deduped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_same_content_plus_added_text_only_sends_once(self, alog):
+        """同一条内容后面**又加了点字** ⇒ 也算重复（2026-09-29 线上取证）。
+
+        线上：``茶包影视-30-Register_UDMlfejslD`` 转发过，2 分钟后
+        ``…UDMlfejslD yanpeihao816`` 又发了一遍，指纹不同就漏了过去。
+        这条测的是**接线**：原文有没有真的传进「最近已转发的内容」那一层。
+        """
+        client = FakeClient()
+        engine = ForwardEngine(
+            client,
+            build_config(sources=[]),
+            alog,
+            recent_dedupe=RecentContentDedupe(limit=5, ttl=3600),
+        )
+        other_group = FakeChat(-1007777777777, title="另一个群", chat_type="supergroup")
+
+        engine._handle(group_message("关键词123 茶包影视-30-Register_UDMlfejslD"), edited=False)
+        await drain(engine)
+        engine._handle(
+            make_message(
+                "关键词123 茶包影视-30-Register_UDMlfejslD yanpeihao816",
+                message_id=200,
+                chat=other_group,
+            ),
+            edited=False,
+        )
+        await drain(engine)
+
+        assert len(client.forwarded) == 1, "加了点字的同一条内容也不该发第二遍"
+        assert engine.stats["recent_deduped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_success_is_counted_in_metrics(self, alog):
+        """数据大盘只记**成功**的转发（用户原话：「只记录成功的」）。"""
+        metrics = MetricsStore()
+        client = FakeClient()
+        engine = ForwardEngine(client, build_config(sources=[]), alog, metrics=metrics)
+
+        engine._handle(group_message("关键词123"), edited=False)
+        await drain(engine)
+        assert client.forwarded, "先确认这条真的发出去了，否则下面那个 1 说明不了问题"
+        assert metrics.totals()["total"]["forward"] == 1
+
+        engine._handle(group_message("这条不命中任何规则"), edited=False)
+        await drain(engine)
+        assert metrics.totals()["total"]["forward"] == 1, "没命中的不该计数"
 
     @pytest.mark.asyncio
     async def test_different_content_still_goes_through(self, alog):

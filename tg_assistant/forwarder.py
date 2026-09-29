@@ -263,6 +263,36 @@ def content_fingerprint(message: Any) -> Optional[str]:
     return f"media:{media}" if media else None
 
 
+def content_text(message: Any) -> str:
+    """正文归一化后的样子（:func:`content_fingerprint` 用的就是它）。
+
+    为什么要单独拿出来：比「是不是同一条内容」时**光有哈希比不出来** —— 哈希多一个
+    字就完全不同，而线上真实情况恰恰是「同一条内容后面多了一截」。那种情况必须拿
+    原文做包含比对，见 :meth:`RecentContentDedupe._same_with_additions`。
+
+    没有正文（纯媒体）时返回空串 —— 那种只有指纹能判。
+    """
+    return message_text(message).strip()
+
+
+#: 「同一条内容又加了点字」的判据：短的那条至少要**这么长**，并且占长的那条
+#: 至少**这么大比例**。
+#:
+#: 🔴 线上取证（2026-09-29，茶包影视）：
+#:
+#: * ``15:54:49`` msg **12540** ``茶包影视-30-Register_UDMlfejslD`` → 转发
+#: * ``15:57:06`` msg **12544** ``茶包影视-30-Register_UDMlfejslD yanpeihao816``
+#:   → **又转发了一次**（指纹不同，去重没拦住）
+#: * ``16:00:43`` msg **12561**（同 12540）→ 被「最近已转发过相同内容」挡住 ✓
+#:
+#: 用户原话：「刚刚有一条一样的但是加了些文字，没有被去重去掉」。
+#:
+#: 为什么不能只看「包含」：长帖里被**引用**一小段（比如开奖公告里带上那个码）也算
+#: 包含，但那不是同一条内容 —— 少转发一条开奖公告是**静默丢消息**，比多转一条重得多。
+#: 加个占比要求就把「引用」挡在外面了：码 30 字 / 长帖 500 字 = 6%，远低于 60%。
+_ADDED_TEXT_MIN_CHARS = 12
+_ADDED_TEXT_MIN_RATIO = 0.6
+
 def _is_channel_group_pair(kind_a: Optional[str], kind_b: Optional[str]) -> bool:
     """是不是「一边频道、一边群组」这一对。
 
@@ -414,6 +444,19 @@ class RecentContentDedupe:
     （哪个更宽算哪个）。``limit=0`` ⇒ 只看时间窗；``ttl=0`` ⇒ 只看条数；
     两个都是 0 ⇒ 关掉这一层。
 
+    ⚠️ 「同一条内容」有两种情形，**都要认**（2026-09-29 取证）：
+
+    1. 一模一样 —— 比指纹；
+    2. **同一条内容又加了些文字** —— 比原文，见 :meth:`_same_with_additions`。
+       线上 ``茶包影视`` 15:54 发了 ``…Register_UDMlfejslD``、15:57 又发了
+       ``…Register_UDMlfejslD yanpeihao816``，第二条因为指纹不同漏了过去。
+
+    ⚠️ 第 2 种**没有闸门保护**：:meth:`gate` 是按**指纹**分锁的，而这两种写法的指纹
+    不同，并发到达时（间隔小于一次发送的耗时）仍可能都通过判断。线上真实场景不受影响 ——
+    那两条相隔 2.5 分钟；频道↔群组那一对正文**完全相同**，指纹相同、照旧被闸门串起来。
+    真要把这也罩住得给闸门换一套「同内容不同写法」的键，而那需要另一个判据：
+    试过「正文前 N 字」，对短正文会把同一个频道的**不同**码全挤进一把锁，反而更差。
+
     ⚠️ 分桶键是**目标**：同一个内容发到不同目标互不影响，不会互相吃掉。
 
     ⚠️ **这张表必须落盘**（``state_path``）：它的窗口是 24 小时，但内存表一重启就清零，
@@ -432,6 +475,9 @@ class RecentContentDedupe:
         #: 目标 -> deque[(时间戳, 指纹)]，左旧右新。
         self._by_target: dict[str, deque] = {}
         self.hits = 0
+        #: 其中有多少次是靠「加了些文字」那条新判据拦下的（诊断用：一直是 0 说明
+        #: 判据没生效，占比过高则要怀疑误杀）。
+        self.hits_added = 0
         #: 串行闸门：``(指纹, 目标)`` -> ``[asyncio.Lock, 待用计数]``。见 :meth:`gate`。
         self._gates: dict[tuple[str, str], list] = {}
         #: 因为闸门串行而**省下来**的重复发送次数（诊断用）。
@@ -474,17 +520,20 @@ class RecentContentDedupe:
         for target, items in buckets.items():
             if not isinstance(items, list):
                 continue
-            restored: list[tuple[float, str]] = []
+            restored: list[tuple[float, str, str]] = []
             for item in items:
                 try:
                     ts = float(item[0])
                     fingerprint = str(item[1])
                 except (TypeError, ValueError, IndexError):
                     continue
+                # 第三项是正文原文（「加了些文字」那条判据要用）。老文件只有两项，
+                # 读回来时补空串 —— 那只是这条判不了，指纹比对照常。
+                text = str(item[2]) if len(item) > 2 and item[2] is not None else ""
                 # 已经超出 TTL 的直接不读回来 —— 留着只会白占内存。
                 if self.ttl > 0 and (now - ts) > self.ttl:
                     continue
-                restored.append((ts, fingerprint))
+                restored.append((ts, fingerprint, text))
             if not restored:
                 continue
             restored.sort(key=lambda pair: pair[0])
@@ -500,7 +549,7 @@ class RecentContentDedupe:
             payload = {
                 "version": 1,
                 "buckets": {
-                    target: [[ts, fp] for ts, fp in bucket]
+                    target: [[ts, fp, text] for ts, fp, text in bucket]
                     for target, bucket in self._by_target.items()
                     if bucket
                 },
@@ -587,28 +636,65 @@ class RecentContentDedupe:
         while bucket and len(bucket) > self.limit and (now - bucket[0][0]) > self.ttl:
             bucket.popleft()
 
-    def contains(self, fingerprint: Optional[str], target: Any) -> bool:
-        """这条内容是不是**刚刚**就往这个目标发过。"""
+    def contains(
+        self, fingerprint: Optional[str], target: Any, text: str = ""
+    ) -> Optional[str]:
+        """这条内容是不是**刚刚**就往这个目标发过？是的话返回**命中的原因**。
+
+        * ``None`` —— 没发过，可以发；
+        * ``"same"`` —— 一模一样（原来的行为，比指纹）；
+        * ``"added"`` —— 同一条内容，只是多/少了一截（比原文，见
+          :meth:`_same_with_additions`）。
+
+        返回原因而不是 ``True`` 是为了日志：出问题时能一眼看出是哪种命中的
+        （``"same"`` 是既有逻辑，``"added"`` 是新判据 —— 后者万一误杀，
+        看日志就知道该调哪两个阈值）。
+        """
         if fingerprint is None or not self.enabled:
-            return False
+            return None
         bucket = self._by_target.get(str(target))
         if not bucket:
-            return False
+            return None
         self._prune(bucket)
-        hit = any(fp == fingerprint for _, fp in bucket)
-        if hit:
+        if any(fp == fingerprint for _, fp, _ in bucket):
             self.hits += 1
-        return hit
+            return "same"
+        if text and any(self._same_with_additions(text, old) for _, _, old in bucket):
+            self.hits += 1
+            self.hits_added += 1
+            return "added"
+        return None
 
-    def add(self, fingerprint: Optional[str], target: Any) -> None:
-        """记下「这条内容刚发到这个目标」。同一个指纹只留最新一条。"""
+    @staticmethod
+    def _same_with_additions(one: str, other: str) -> bool:
+        """这两条是「同一条内容，只是多了一截」吗？
+
+        判据 = **短的被长的整个包含** + **短的够长** + **短的占得了长的六成**，
+        三个都要满足。前两条看 :data:`_ADDED_TEXT_MIN_CHARS`，
+        第三条看 :data:`_ADDED_TEXT_MIN_RATIO`（挡掉"长帖里引用了一小段"）。
+
+        两个方向都算（谁长谁短不重要）：线上同一个码既可能先来带用户名的、也可能先来
+        干净的，而两层的到达顺序是随机的。
+        """
+        short, long = (one, other) if len(one) <= len(other) else (other, one)
+        if len(short) < _ADDED_TEXT_MIN_CHARS:
+            return False
+        if short not in long:
+            return False
+        return len(short) >= len(long) * _ADDED_TEXT_MIN_RATIO
+
+    def add(self, fingerprint: Optional[str], target: Any, text: str = "") -> None:
+        """记下「这条内容刚发到这个目标」。同一个指纹只留最新一条。
+
+        ``text`` 是**原文**（:func:`content_text`），存下来供「加了些文字」的比对。
+        """
         if fingerprint is None or not self.enabled:
             return
         bucket = self._bucket(target)
         for item in list(bucket):
             if item[1] == fingerprint:
                 bucket.remove(item)
-        bucket.append((time.time(), fingerprint))
+        bucket.append((time.time(), fingerprint, text))
         self._prune(bucket)
         # 落盘：**记完就写**。写在发送成功之后（调用点保证），所以重启丢掉的最多是
         # "最后一条还没记完的"，不会出现"发过了却没记住"。
@@ -625,6 +711,8 @@ class RecentContentDedupe:
             "size": len(self),
             "targets": len(self._by_target),
             "hits": self.hits,
+            #: 其中靠「同一条内容又加了些文字」拦下的次数。
+            "hits_added": self.hits_added,
             "limit": self.limit,
             "ttl": self.ttl,
             #: 曾因闸门排队等待的条数（≈ 本来会重复发送的条数）。
@@ -1384,6 +1472,9 @@ class ForwardEngine:
         #: 去重判断用。指纹为 ``None``（既没正文也没媒体）时这一层直接放行。
         kind = chat_kind(message)
         fingerprint = content_fingerprint(message)
+        #: 正文原文 —— 「同一条内容又加了点字」那条判据要用（光有哈希比不出来），
+        #: 也用来算闸门键。纯媒体消息为空串，那种情况只有指纹能判。
+        text = content_text(message)
         #: 相册 id。非空表示这条属于某个相册（一组消息是一个整体）。
         album_id = getattr(message, "media_group_id", None)
 
@@ -1453,10 +1544,8 @@ class ForwardEngine:
                 # 「最近已转发过的内容」。
                 # ⚠️ 例外：**相册**。同一组里的多条本来就是一个整体，caption 常常一模一样，
                 #    按内容比会把整组砍成一条（剩下的图全丢）。整组只在发送后记一次。
-                if (
-                    album_id is None
-                    and self._recent.contains(fingerprint, target)
-                ):
+                hit = None if album_id is not None else self._recent.contains(fingerprint, target, text)
+                if hit:
                     self.stats["recent_deduped"] += 1
                     # ⚠️ 两层名额都要退，否则这条在该目标上会被占死一整个 TTL。
                     self._release_pair(fingerprint, target)
@@ -1468,6 +1557,9 @@ class ForwardEngine:
                         message_id=ids[0],
                         target=target,
                         fingerprint=fingerprint,
+                        # 为什么拦下的：一样 / 只是多了一截。后一种是新判据，
+                        # 万一误杀，看这里就知道该动哪两个阈值。
+                        via="完全相同" if hit == "same" else "加了些文字",
                     )
                     continue
                 try:
@@ -1501,8 +1593,13 @@ class ForwardEngine:
 
                 prepared.stats["sent"] += 1
                 self.stats["forwarded"] += 1
+                # 大盘**只记成功** —— 走到这里说明客户端确实返回了消息 id。
+                # ⚠️ 放在 ``_recent.add`` 之前：两句都是同步的，顺序不影响正确性，
+                #    但这个计数器的语义是「发出去了」，越贴近发送点越不容易被后人挪坏。
+                self.metrics.record("forward")
                 # 记进「最近已转发的内容」—— 之后同样内容的消息直接跳过。
-                self._recent.add(fingerprint, target)
+                # 连**原文**一起记，才能认出「同一条内容又加了些文字」的那种重复。
+                self._recent.add(fingerprint, target, text)
                 for sent_id in sent_ids:
                     delivered.append((target, sent_id))
 
@@ -1982,5 +2079,6 @@ __all__ = [
     "PreparedRule",
     "RecentContentDedupe",
     "content_fingerprint",
+    "content_text",
     "random_jitter",
 ]
