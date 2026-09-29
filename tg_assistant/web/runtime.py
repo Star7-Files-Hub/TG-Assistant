@@ -89,6 +89,9 @@ class RuntimeManager:
         self._pair_dedupe: Any = None
         #: 「最近已转发的内容」去重表 —— 同上，跨面板重建复用。
         self._recent_dedupe: Any = None
+        #: 数据大盘 —— 同上。它比去重表更**必须**复用：去重窗口重置只影响一小会儿，
+        #: 大盘一旦换成新的内存实例，「总计」立刻归零，而那是用户要看的历史。
+        self._metrics: Any = None
         #: 透传给 ``MultiRunner.run()`` 的参数（heartbeat / restart_delay / max_restarts）。
         #: 刻意**不**在这里补 heartbeat：``cli.py`` 是在 ``create_app()`` 返回之后
         #: 才把真正的 WebSettings 换进 ``app.state`` 的，此刻读会拿到默认值。
@@ -135,6 +138,8 @@ class RuntimeManager:
         self._pair_dedupe = getattr(runner, "pair_dedupe", None)
         # 「最近已转发的内容」去重表同理 —— 换表 = 刚发过的内容又能重发一遍。
         self._recent_dedupe = getattr(runner, "recent_dedupe", None)
+        # 数据大盘同理 —— 换实例 = 「总计」归零。
+        self._metrics = getattr(runner, "metrics", None)
 
         names = self._adopted_accounts
         if not names:
@@ -444,6 +449,9 @@ class RuntimeManager:
                 self._recent_dedupe = RecentContentDedupe(
                     state_path=getattr(getattr(self.store, "paths", None), "dedupe_file", None)
                 )
+            # 数据大盘同理必须落盘：进程重启（systemctl restart / 崩溃自愈）
+            # 也要把历史留下来，否则「总计」永远只等于这次运行以来的数。
+            self.metrics()
             await self._launch(
                 MultiRunner(
                     self.store,
@@ -451,10 +459,29 @@ class RuntimeManager:
                     dedupe=self._dedupe,
                     pair_dedupe=self._pair_dedupe,
                     recent_dedupe=self._recent_dedupe,
+                    metrics=self._metrics,
                 ),
                 names,
             )
             return {"ok": True, "accounts": names}
+
+    def metrics(self) -> Any:
+        """数据大盘的共享实例 —— 没有就按 ``data/metrics.json`` 现场建一个。
+
+        🔴 **为什么是惰性创建而不是直接返回 ``None``**：面板「还没点启动」时用户也会
+        打开仪表盘，而这些数是**从磁盘读出来的历史**，照样该显示。返回 ``None``
+        的话面板只能在没启动时显示 0 —— 那是在骗人。
+
+        实例一旦建好就留着：启动账号时传给 ``MultiRunner``，
+        这样「引擎记的」和「接口读的」确定是同一个对象。
+        """
+        if self._metrics is None:
+            from tg_assistant.metrics import MetricsStore
+
+            self._metrics = MetricsStore(
+                state_path=getattr(getattr(self.store, "paths", None), "metrics_file", None)
+            )
+        return self._metrics
 
     async def stop(self) -> dict[str, Any]:
         """停止全部账号。

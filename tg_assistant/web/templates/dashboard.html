@@ -14,6 +14,34 @@
 </section>
 
 <section class="card">
+    <h2>数据大盘 <span id="metrics-error" class="badge badge-red" style="display:none;">读取失败</span></h2>
+    <div class="row" id="metrics-range-switch">
+        <!-- 口径文案在首次拿到 /api/metrics 后由后端覆盖（「今天」「本月」「总计」）；
+             这里的「天 / 月 / 总」是首个请求回来之前的占位，避免按钮空着。
+             「这个'天'从几点起算」由右边那行常驻小字承担，不塞进按钮里。 -->
+        <button type="button" class="btn btn-sm btn-primary" data-range="day" onclick="setMetricsRange('day')">天</button>
+        <button type="button" class="btn btn-sm" data-range="month" onclick="setMetricsRange('month')">月</button>
+        <button type="button" class="btn btn-sm" data-range="total" onclick="setMetricsRange('total')">总</button>
+        <span class="muted" id="metrics-hint">天：北京时间 00:00 起</span>
+    </div>
+    <div class="row" style="margin-top: 16px; gap: 32px; align-items: flex-start;">
+        <div style="min-width: 120px;">
+            <div class="muted">总转发次数</div>
+            <div id="metric-forward" style="font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums;">—</div>
+        </div>
+        <div style="min-width: 120px;">
+            <div class="muted">总抢包次数</div>
+            <div id="metric-red_packet" style="font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums;">—</div>
+        </div>
+        <div style="min-width: 120px;">
+            <div class="muted">总抢注次数</div>
+            <div id="metric-reg_grab" style="font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums;">—</div>
+        </div>
+    </div>
+    <div class="muted" style="margin-top: 12px;">只统计成功的：转发已发出 / 红包已抢到 / 注册已成功。</div>
+</section>
+
+<section class="card">
     <h2>账号状态</h2>
     <table id="account-table">
         <thead>
@@ -44,6 +72,10 @@
 {% block scripts %}
 <script>
     async function refreshStatus() {
+        // 数据大盘跟着这个 5 秒轮询一起刷（同一个定时器，见文件末尾），
+        // 不另开 setInterval，也**不 await**：它自己兜住了所有异常，
+        // 而 /api/status 失败不该连带让大盘数字停更。
+        refreshMetrics();
         const res = await fetch('/api/status');
         const data = await res.json();
         document.getElementById('btn-start').disabled = data.running;
@@ -78,6 +110,88 @@
         `;
         }).join('');
     }
+    /* ---- 数据大盘：三个「成功」累计数，天 / 月 / 总 三个口径 ----
+       ⚠️ 三个口径是**一次请求全拿回来**的（/api/metrics 的 ranges），切换只重渲染、
+       不再发请求 —— 否则天 / 月 / 总 各发各的请求，切快了会出现「月比总还大」这种
+       自相矛盾的画面。
+       ⚠️ 请求失败时把数字清成「—」并亮出「读取失败」，**绝不**留着上一轮的数字冒充
+       新数据：数据面板最不该做的事就是让旧数字看着像新数字。 */
+    const METRIC_KINDS = ['forward', 'red_packet', 'reg_grab'];
+    const METRIC_RANGES = ['day', 'month', 'total'];
+    //: 「天」的起算点必须写在面板上 —— 用户可以点 天 / 月 / 总，但没法从数字看出
+    //: 这个「天」是北京时间 00:00 换日（不是进程本地时间，也不是 UTC）。
+    const METRIC_HINT = '天：北京时间 00:00 起';
+    let metricsRanges = null;   //: 后端给的三个口径；null = 没有数据（全部显示「—」）
+    let metricsRange = 'day';   //: 当前口径，默认「天」
+
+    function metricCount(value) {
+        // 接口约定是非负整数；不是就当没有，别把 NaN / null 渲染到面板上
+        // （注意 Number(null) === 0，所以 null 必须单独挡掉，否则会显示成「0 次」）。
+        if (value === null || value === undefined || value === '' || typeof value === 'boolean') return '—';
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0) return '—';
+        return String(Math.trunc(n));
+    }
+
+    function renderMetrics() {
+        const bucket = metricsRanges ? metricsRanges[metricsRange] : null;
+        METRIC_KINDS.forEach(function (kind) {
+            const el = document.getElementById('metric-' + kind);
+            if (el) el.textContent = bucket ? metricCount(bucket[kind]) : '—';
+        });
+        METRIC_RANGES.forEach(function (key) {
+            const btn = document.querySelector('#metrics-range-switch [data-range="' + key + '"]');
+            if (!btn) return;
+            const item = metricsRanges ? metricsRanges[key] : null;
+            // 口径文案由后端给（今天 / 本月 / 总计），面板不自己拼中文，免得两边不一致。
+            if (item && item.label) btn.textContent = item.label;
+            btn.className = key === metricsRange ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+        });
+    }
+
+    function setMetricsRange(range) {
+        if (METRIC_RANGES.indexOf(range) < 0) return;
+        metricsRange = range;
+        renderMetrics();   // 纯前端切换：三个口径的数据早就在手上了，不再请求接口
+    }
+
+    function setMetricsHint(data) {
+        const el = document.getElementById('metrics-hint');
+        if (!el) return;
+        const today = data && typeof data.today === 'string' ? data.today : '';
+        el.textContent = today ? METRIC_HINT + '（今天 ' + today + '）' : METRIC_HINT;
+        if (data && typeof data.timezone === 'string') el.title = '接口时区：' + data.timezone;
+    }
+
+    function setMetricsFailed(failed, data) {
+        const badge = document.getElementById('metrics-error');
+        if (badge) badge.style.display = failed ? '' : 'none';
+        if (failed) {
+            metricsRanges = null;
+            setMetricsHint(null);   // 连「今天」的日期也是数据，失败时一起撤掉
+        } else {
+            setMetricsHint(data);
+        }
+        renderMetrics();
+    }
+
+    async function refreshMetrics() {
+        try {
+            const res = await fetch('/api/metrics');
+            const data = await res.json();
+            // res.ok 兜住 401（未授权时后端回的是 JSON 错误体，json() 照样解析成功）；
+            // data.ok === false 兜住接口自己报的失败。两者都不能当成功。
+            if (!res.ok || !data || data.ok === false || !data.ranges) {
+                setMetricsFailed(true, null);
+                return;
+            }
+            metricsRanges = data.ranges;
+            setMetricsFailed(false, data);
+        } catch (err) {
+            setMetricsFailed(true, null);   // 断网 / 返回的不是 JSON
+        }
+    }
+
     async function startRun() {
         const res = await fetch('/api/run/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})});
         const data = await res.json();

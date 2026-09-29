@@ -38,6 +38,7 @@ from pyrogram.errors import (
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 
 from .client import SessionInvalid, with_flood_retry
+from .metrics import MetricsStore
 from .config import AccountConfig, RedPacketConfig, RedPacketTask
 from .logging_setup import AccountLogger
 from .matching import (
@@ -192,11 +193,32 @@ class ChatEventBus:
 # --------------------------------------------------------------------------- #
 # 引擎
 # --------------------------------------------------------------------------- #
+def _settled_key(raw: Any) -> Optional[tuple[int, int]]:
+    """把落盘的 ``"<chat_id>:<message_id>"`` 解析回 ``(chat_id, message_id)``。
+
+    看不懂就返回 ``None``（调用方跳过）—— 状态文件是数据，不是信任边界。
+    """
+    if isinstance(raw, str) and ":" in raw:
+        chat, _, message = raw.partition(":")
+    elif isinstance(raw, (list, tuple)) and len(raw) == 2:
+        chat, message = raw
+    else:
+        return None
+    try:
+        return int(chat), int(message)
+    except (TypeError, ValueError):
+        return None
+
+
 class RedPacketHunter:
     """抢红包引擎。"""
 
     #: 与转发引擎分开的 handler group，互不阻塞。
     HANDLER_GROUP = 1
+
+    #: ``_settled`` 的容量上限。消息 id 不会复用，所以不需要过期时间，
+    #: 这里只是防止一张长期运行的表无限长大（超了就留最近的一半）。
+    SETTLED_MAX = 2048
 
     def __init__(
         self,
@@ -204,12 +226,21 @@ class RedPacketHunter:
         config: AccountConfig,
         alog: AccountLogger,
         notifier: Optional[BotNotifier] = None,
+        metrics: Optional[Any] = None,
+        settled_path: Optional[Any] = None,
     ) -> None:
         self.client = client
         self.config: RedPacketConfig = config.red_packet
         self.notify_config = config.notify
         self.alog = alog.bind("redpacket")
         self.notifier = notifier
+        #: 数据大盘（多账号共享同一个实例）。不传就自己建个纯内存的 ——
+        #: 这样调用处不必到处判空，单测 / 离线场景也不会因为没接线就崩。
+        self.metrics = metrics if metrics is not None else MetricsStore()
+        #: ``_settled`` 的落盘路径（账号级）。``None`` = 只留内存（单测 / 离线用）。
+        self.settled_path = settled_path
+        #: 热重载指纹：记下「当前生效的是哪一份配置」。mtime 变了但内容没变
+        #: （面板原样保存一次）时据此跳过重建。
 
         # 只编译**启用**的任务：停用的任务连正则都不该编译。
         self.prepared: list[PreparedTask] = [
@@ -879,6 +910,9 @@ class RedPacketHunter:
         if bucket is None:
             return
         self.stats[bucket] += 1
+        # 大盘**只记成功**：用户要的是「今天抢到了几个」，不是「今天点了几个」。
+        if bucket == "success":
+            self.metrics.record("red_packet")
         per_task = self.task_stats.get(task.id)
         if per_task is not None:
             per_task[bucket] += 1

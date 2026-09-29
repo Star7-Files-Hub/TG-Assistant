@@ -35,6 +35,7 @@ from .config import (
     utc_now_iso,
 )
 from .logging_setup import configure_logging, get_logger
+from .metrics import MetricsStore
 from .paths import InvalidAccountName, Paths, validate_account_name
 from .proxy import probe_proxy, resolve_proxy, summarize
 from .qr_login import DEFAULT_LOGIN_TIMEOUT, QrLoginError, terminal_renderer
@@ -470,6 +471,8 @@ def run_cmd(
         # 「最近已转发的内容」必须**落盘**：它的窗口是 24 小时，纯内存的话进程一重启
         # 就清零，「一天内不重复」被一次重启作废（见 RecentContentDedupe._load 的取证）。
         recent_dedupe=RecentContentDedupe(state_path=ctx.store.paths.dedupe_file),
+        # 数据大盘同理必须落盘：它是**历史累计**，纯内存的话进程一重启「总计」就归零。
+        metrics=MetricsStore(state_path=ctx.store.paths.metrics_file),
     )
     run_options = {
         "heartbeat": heartbeat,

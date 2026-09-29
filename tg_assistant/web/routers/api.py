@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query
 from tg_assistant.config import ProxyConfig
 from tg_assistant.logging_setup import get_logger
 from tg_assistant.paths import InvalidAccountName, validate_account_name
+from tg_assistant.metrics import RANGES, beijing_day
 from tg_assistant.proxy import probe_proxy, summarize
 
 from ..deps import get_runtime, get_settings, get_store
@@ -42,6 +43,30 @@ async def api_status(runtime=Depends(get_runtime)) -> dict[str, Any]:
     return {
         "running": runtime.is_running,
         "accounts": runtime.account_status(),
+    }
+
+
+#: 数据大盘三个口径的按钮文案。**故意只写「今天 / 本月 / 总计」**：
+#: 「按北京时间 0 点起算」这层信息由同一张卡片上常驻的那行小字承担
+#: （见 ``dashboard.html`` 的 ``metrics-hint``），塞进按钮里会在窄屏折行、
+#: 而且和那行小字说的是同一件事。
+_METRICS_LABELS = {"day": "今天", "month": "本月", "total": "总计"}
+
+
+@router.get("/metrics")
+async def api_metrics(runtime=Depends(get_runtime)) -> dict[str, Any]:
+    """数据大盘：转发 / 抢红包 / 抢注的**成功**次数，天 / 月 / 总三个口径。
+
+    一次把三个口径都返回，面板切换口径时不必再请求一遍，也就不会出现
+    「切到月，数字比总还大」这种自相矛盾。
+    """
+    totals = runtime.metrics().totals()
+    return {
+        "timezone": "北京时间 (UTC+8)",
+        "today": beijing_day(),
+        "ranges": {
+            name: {"label": _METRICS_LABELS[name], **totals[name]} for name in RANGES
+        },
     }
 
 

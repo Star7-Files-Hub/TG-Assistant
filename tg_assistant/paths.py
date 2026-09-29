@@ -135,6 +135,18 @@ class Paths:
         """
         return self.data_dir / "dedupe.json"
 
+    @property
+    def metrics_file(self) -> Path:
+        """数据大盘（按北京时间自然日累计的「成功」次数）的落盘位置。
+
+        同样放在 ``data/`` 根下、同样**多账号共享** —— 用户要的是「总转发次数」，
+        按账号拆开就得在面板上再加一层求和，而且「总计」这个口径也会跟着变形。
+
+        累计值必须落盘：它是**历史**，进程重启（面板点一次「启动」也会重建
+        MultiRunner）就清零的话，「总计」永远只等于这次运行以来的数。
+        """
+        return self.data_dir / "metrics.json"
+
     def account(self, name: str) -> AccountPaths:
         safe = validate_account_name(name)
         return AccountPaths(name=safe, root=self.accounts_dir / safe)

@@ -41,6 +41,7 @@ class _FakeMultiRunner:
         dedupe: Any = None,
         pair_dedupe: Any = None,
         recent_dedupe: Any = None,
+        metrics: Any = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -51,6 +52,7 @@ class _FakeMultiRunner:
         self.pair_dedupe = pair_dedupe
         #: 「最近已转发的内容」去重表，同样要跨面板重建延续（换表 = 记录全清空）。
         self.recent_dedupe = recent_dedupe
+        self.metrics = metrics
         self.names: list[str] = []
         self.run_kwargs: dict[str, Any] = {}
         self.started = asyncio.Event()
@@ -115,6 +117,19 @@ async def test_restart_reuses_the_same_dedupe_table(manager: RuntimeManager) -> 
     assert first is not second, "这个用例的前提就是 runner 确实被重建了"
     assert first.dedupe is not None
     assert second.dedupe is first.dedupe, "重建 runner 时去重表必须复用同一个实例"
+
+
+async def test_restart_reuses_the_same_metrics_store(manager: RuntimeManager) -> None:
+    """数据大盘比去重表更**必须**复用：去重窗口重置只影响一小会儿，
+    大盘一旦换成新的内存实例，「总计」立刻归零 —— 而那是用户要看的历史。"""
+    first = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    second = await _started(manager, ["a"])
+    await asyncio.wait_for(manager.stop(), DEADLOCK_GUARD)
+
+    assert first.metrics is not None, "启动时必须把大盘传下去，否则引擎各记各的（谁也看不到）"
+    assert second.metrics is first.metrics, "重建 runner 时大盘必须复用同一个实例"
 
 
 async def test_restart_reuses_the_same_pair_dedupe_table(manager: RuntimeManager) -> None:

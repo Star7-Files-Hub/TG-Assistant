@@ -530,6 +530,7 @@ class AccountRunner:
         shared_dedupe: Optional[Any] = None,
         pair_dedupe: Optional[Any] = None,
         recent_dedupe: Optional[Any] = None,
+        metrics: Optional[Any] = None,
     ) -> None:
         self.record = record
         self.config = config
@@ -542,6 +543,9 @@ class AccountRunner:
         self.pair_dedupe = pair_dedupe
         #: 「最近已转发的内容」去重表（同样多账号共享）。``None`` = 引擎按账号配置自建。
         self.recent_dedupe = recent_dedupe
+        #: 数据大盘（同样多账号共享同一个实例）。``None`` = 各引擎自建纯内存的，
+        #: 那种情况下计数不会汇总到面板上 —— 正常路径（CLI / 面板）一定会传。
+        self.metrics = metrics
         self.alog = make_account_logger(record.name, "runner")
         self.client: Optional[Client] = None
         self.notifier: Optional[BotNotifier] = None
@@ -784,6 +788,7 @@ class MultiRunner:
         dedupe: Optional[CrossAccountDedupe] = None,
         pair_dedupe: Optional[Any] = None,
         recent_dedupe: Optional[Any] = None,
+        metrics: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.settings = settings
@@ -795,6 +800,9 @@ class MultiRunner:
         self.pair_dedupe = pair_dedupe
         #: 「最近已转发的内容」去重表，同样是所有账号共享同一个实例。
         self.recent_dedupe = recent_dedupe
+        #: 数据大盘，同样是所有账号共享同一个实例（用户要的是「总」次数）。
+        #: 允许外部传入的理由和上面两张表一样：面板点「启动」会重建 MultiRunner。
+        self.metrics = metrics
         self.runners: dict[str, AccountRunner] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._shutdown = asyncio.Event()
@@ -886,6 +894,7 @@ class MultiRunner:
                     shared_dedupe=self.dedupe,
                     pair_dedupe=self.pair_dedupe,
                     recent_dedupe=self.recent_dedupe,
+                    metrics=self.metrics,
                 )
                 self.runners[name] = runner
                 await runner.start()

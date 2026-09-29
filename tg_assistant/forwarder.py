@@ -59,6 +59,7 @@ from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from pyrogram.types import LinkPreviewOptions
 
 from .client import SessionInvalid, with_flood_retry
+from .metrics import MetricsStore
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
@@ -779,11 +780,14 @@ class ForwardEngine:
         shared_dedupe: Optional[CrossAccountDedupe] = None,
         pair_dedupe: Optional[ChannelGroupDedupe] = None,
         recent_dedupe: Optional[RecentContentDedupe] = None,
+        metrics: Optional[Any] = None,
     ) -> None:
         self.client = client
         self.config = config
         self.alog = alog.bind("forward")
         self.notifier = notifier
+        #: 数据大盘（多账号共享同一个实例）。不传就自己建个纯内存的，理由同去重表。
+        self.metrics = metrics if metrics is not None else MetricsStore()
         self.rules: list[PreparedRule] = [
             PreparedRule.build(rule) for rule in config.forward.active_rules
         ]

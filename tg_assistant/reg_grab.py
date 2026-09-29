@@ -47,6 +47,7 @@ from pyrogram.errors import (
 from pyrogram.handlers import EditedMessageHandler, MessageHandler
 
 from .client import with_flood_retry
+from .metrics import MetricsStore
 from .config import (
     REG_GRAB_STEP_LABELS,
     AccountConfig,
@@ -274,12 +275,17 @@ class RegGrabHunter:
         config: AccountConfig,
         alog: AccountLogger,
         notifier: Optional[BotNotifier] = None,
+        metrics: Optional[Any] = None,
     ) -> None:
         self.client = client
         self.config: RegGrabConfig = config.reg_grab
         self.notify_config = config.notify
         self.alog = alog.bind("reggrab")
         self.notifier = notifier
+        #: 数据大盘（多账号共享同一个实例）。不传就自己建个纯内存的，理由同上。
+        self.metrics = metrics if metrics is not None else MetricsStore()
+        #: 热重载指纹：记下「当前生效的是哪一份配置」。mtime 变了但内容没变
+        #: （面板原样保存一次）时据此跳过重建。
 
         # 只编译**启用**的任务：停用的任务连正则都不该编译。
         self.prepared: list[PreparedTask] = [
@@ -1135,6 +1141,9 @@ class RegGrabHunter:
             ChainResult.SKIPPED: "skipped",
         }[outcome.result]
         self.stats[key] += 1
+        # 大盘**只记成功**：部分成功（PARTIAL）不算 —— 注册没成就是没成。
+        if key == "success":
+            self.metrics.record("reg_grab")
         self.task_stats[task.id][key] += 1
 
     def _log_outcome(self, outcome: ChainOutcome) -> None:

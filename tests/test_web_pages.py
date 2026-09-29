@@ -670,12 +670,47 @@ def test_every_get_element_by_id_target_exists() -> None:
         dynamic |= set(
             re.findall(r"setAttribute\(\s*['\"]id['\"]\s*,\s*['\"]([^'\"]+)['\"]", html)
         )
-        used = set(re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]", html))
+        used = set(re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]\s*\)", html))
         gap = sorted(used - declared - dynamic - base_ids)
         if gap:
             missing[tpl.name] = gap
+        # 拼接式查找（``getElementById('metric-' + kind)``）静态判不出完整 id，
+        # 但**能**判前缀：至少要有一个已声明的 id 以它开头。
+        # 只放过这一种写法，不是"看不懂就跳过" —— 前缀根本不存在同样是错的。
+        for prefix in re.findall(r"getElementById\(\s*['\"]([^'\"]+)['\"]\s*\+", html):
+            if not any(each.startswith(prefix) for each in declared | dynamic):
+                missing.setdefault(tpl.name, []).append(f"{prefix}*（拼接式，没有任何 id 以此开头）")
 
     assert not missing, f"这些模板引用了不存在的元素 id（JS 会抛 null）: {missing}"
+
+
+def test_dashboard_shows_the_metrics_board() -> None:
+    """仪表盘上的「数据大盘」：三个成功计数 + 天/月/总 + **北京时间**那行说明。
+
+    用户原话：「在仪表盘加一个数据大盘，记录总转发次数，总抢包次数，总抢注次数，
+    只记录成功的，需要可选天，月，总，天，按北京时间0点开始计算」。
+
+    这里钉的是**用户能不能看懂这几个数是怎么算的**：「天」如果只写个「今天」，
+    用户根本不知道它从几点起算（服务跑在 UTC 上时会差 8 小时）。
+    """
+    tpl = (
+        Path(__file__).resolve().parents[1]
+        / "tg_assistant"
+        / "web"
+        / "templates"
+        / "dashboard.html"
+    )
+    html = tpl.read_text(encoding="utf-8")
+
+    assert "数据大盘" in html
+    for element_id in ("metric-forward", "metric-red_packet", "metric-reg_grab"):
+        assert f'id="{element_id}"' in html, f"{element_id} 没了 ⇒ 大盘上那个数永远是空的"
+    for label in ("总转发次数", "总抢包次数", "总抢注次数"):
+        assert label in html, f"少了计数项 {label}"
+    for window in ("day", "month", "total"):
+        assert f'data-range="{window}"' in html, f"少了「{window}」这个口径的切换按钮"
+    assert "北京时间" in html, "用户明确要求「按北京时间0点开始计算」，页面上必须写出来"
+    assert "只统计成功" in html, "用户要求「只记录成功的」，得让用户知道别的没算进来"
 
 
 def test_every_inline_handler_is_defined() -> None:

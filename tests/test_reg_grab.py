@@ -30,7 +30,9 @@ from tg_assistant.config import (
     RegGrabTask,
     RegGrabWindow,
 )
+from tg_assistant.metrics import MetricsStore
 from tg_assistant.reg_grab import (
+    ChainOutcome,
     ChainResult,
     PreparedTask,
     RegGrabHunter,
@@ -177,6 +179,22 @@ def task_of(hunter: RegGrabHunter, task_id: str | None = None) -> PreparedTask:
 
 
 # --------------------------------------------------------------------------- #
+
+class TestMetrics:
+    """大盘只记成功的抢注（PARTIAL 不算 —— 没注册成就是没成）。"""
+
+    def test_success_only(self, alog):
+        metrics = MetricsStore()
+        hunter = RegGrabHunter(bot_client(), rg_config(), alog, metrics=metrics)
+        task = task_of(hunter)
+
+        hunter._record(task, ChainOutcome(result=ChainResult.SUCCESS, code=CODE, chat_id=CHAT))
+        assert metrics.totals()["total"]["reg_grab"] == 1
+        hunter._record(task, ChainOutcome(result=ChainResult.PARTIAL, code=CODE, chat_id=CHAT))
+        hunter._record(task, ChainOutcome(result=ChainResult.FAILED, code=CODE, chat_id=CHAT))
+        hunter._record(task, ChainOutcome(result=ChainResult.SKIPPED, code=CODE, chat_id=CHAT))
+        assert metrics.totals()["total"]["reg_grab"] == 1, "只有 SUCCESS 才进大盘"
+
 class TestConfig:
     """配置模型：该拦的拦住，不该拦的别拦。"""
 

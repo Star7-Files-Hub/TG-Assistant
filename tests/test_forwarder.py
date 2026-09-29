@@ -34,6 +34,7 @@ from tg_assistant.forwarder import (
     content_fingerprint,
 )
 from tg_assistant.matching import CompiledMatcher
+from tg_assistant.metrics import MetricsStore
 from tg_assistant.runner import AccountRunner, MultiRunner
 
 from .conftest import FakeChat, FakeClient, FakeUser, make_message
