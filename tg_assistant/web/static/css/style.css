@@ -1941,6 +1941,53 @@ code { font-family: var(--font-mono); background: var(--bg); padding: 2px 6px; b
     border-radius: 10px; font-size: 13px; color: #d29922;
 }
 
+/* ---- 抢注任务卡片上的提示行 ----
+   任务卡片按 task.id 合并所有账号里的副本（对齐转发规则页），所以卡片上要说三件事：
+   「配置不完整」「当前不在时段」「各账号副本不一致」。
+   前两件严重程度差很远 —— 配置不完整是真错，不在时段是正常状态（到点就好），
+   所以分成两个类：红色说错，黄色说状态。 */
+.rule-warn,
+.rule-warn-info {
+    margin: 8px 16px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.6;
+}
+.rule-warn {
+    border: 1px solid rgba(248, 81, 73, 0.35);
+    background: rgba(248, 81, 73, 0.1);
+    color: #f85149;
+}
+.rule-warn-info {
+    border: 1px solid rgba(210, 153, 34, 0.4);
+    background: rgba(210, 153, 34, 0.1);
+    color: #d29922;
+}
+
+/* ---- 抢注：账号设置里的「并发上限」 ----
+   它是**账号级**的（不属于任何一条任务），跟抢注总开关、试发通知一起放在账号那行，
+   所以数字框要窄：宽了会把右侧两个控件挤到第二行。 */
+.rg-concurrency {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rg-concurrency input {
+    width: 58px;
+    padding: 4px 6px;
+    background: rgba(13, 17, 23, 0.6);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+    /* 跟抢红包工具栏那个数字框一样：不声明的话深色主题下的原生数字微调按钮
+       几乎看不见（同 test_time_inputs_render_in_dark_mode 那条守卫的由来）。 */
+    color-scheme: dark;
+}
+
 /* ============================================================
    侧边栏布局
    ============================================================ */

@@ -6,47 +6,47 @@
     <div class="rg-header">
         <div class="rg-header-left">
             <h1>抢注任务</h1>
-            <p class="text-muted">多条独立任务，各自监听会话、各自的识别正则与步骤链</p>
+            <!-- 页面顶部原来有一个「先选账号」的下拉框：不选账号就什么都看不到，
+                 而一条任务往往要写给好几个账号。现在跟「转发规则」页一样按**任务**
+                 为维度渲染，账号在弹窗里勾，一个都不勾 = 写入全部账号。 -->
+            <p class="text-muted">
+                任务按账号独立保存；新建时不勾账号 = 写入全部账号。
+                一条任务 = 一套「监听会话 + 识别正则 + 步骤链 + 时段」，改完自动生效，不用重启账号。
+            </p>
         </div>
         <div class="rg-header-right">
-            <div class="rg-account-select">
-                <label>账号</label>
-                <select id="account-selector" onchange="switchAccount()">
-                    <option value="">选择账号...</option>
-                </select>
-            </div>
-            <label class="rg-master-toggle">
-                <input type="checkbox" id="rg-enabled" onchange="toggleRegGrab()" />
-                <span class="toggle-slider"></span>
-                <span class="toggle-label">抢注总开关</span>
-            </label>
-        </div>
-    </div>
-
-    <div class="rg-content" id="rg-content" style="display:none;">
-        <div class="rg-warn" id="rg-warn" style="display:none;"></div>
-
-        <!-- 任务列表：卡片样式沿用抢红包那套（`.rp-task-*`），两边共用一份 CSS -->
-        <div class="rp-toolbar">
-            <button class="tg-btn tg-btn-primary" onclick="openTaskModal()">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <button class="tg-btn tg-btn-ghost" onclick="loadAll()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                    <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+                </svg>
+                刷新
+            </button>
+            <button class="tg-btn tg-btn-primary" id="btn-add-task" onclick="openTaskModal()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
                 新建任务
             </button>
-            <div class="rp-toolbar-right">
-                <label for="rg-max-concurrency">并发上限</label>
-                <input id="rg-max-concurrency" type="number" min="1" max="20" step="1" value="1"
-                       onchange="saveConcurrency()" />
-                <span class="rp-hint">同一账号同时处理几条码（账号级，不属于某条任务）</span>
-            </div>
         </div>
-
-        <div class="rp-task-list" id="rg-task-list"></div>
     </div>
 
-    <div class="rg-empty" id="rg-empty">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777z"/><path d="M15.5 7.5l3 3L22 7l-3-3"/></svg>
-        <h3>请先选择账号</h3>
-        <p>从上方下拉框选择一个账号来配置抢注任务</p>
+    <div class="rg-warn" id="rg-warn" style="display:none;"></div>
+
+    <!-- 任务列表：一条任务一张卡片（同一条任务扇出到 N 个账号也只出现一次，
+         「这条任务对哪些账号生效」由卡片里的「监听账号」勾选表达）。
+         ⚠️ 卡片结构直接复用转发规则那套 `.rule-*` 样式（`rules-list` / `rule-card`
+         / `rule-owners` / `rules-account-settings`）—— 两个页面是同一类界面，
+         把那份 CSS 再抄一遍迟早会漂移。 -->
+    <div class="rules-list" id="rg-task-list">
+        <div class="rules-empty" id="rg-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777z"/>
+                <path d="M15.5 7.5l3 3L22 7l-3-3"/>
+            </svg>
+            <h3>正在加载…</h3>
+            <p>稍等一下</p>
+        </div>
     </div>
 </div>
 
@@ -84,6 +84,15 @@
                     列表顺序<b>就是优先级</b>：同一条码只被第一个命中的任务处理 ——
                     多个任务一起动手会重复跑步骤链，在群里留下的痕迹也翻倍。
                 </p>
+            </div>
+
+            <!-- 应用账号：不勾 = 全部账号。放在弹窗里而不是页面顶部，
+                 这样「建任务」和「选账号」是同一个动作，不用先切换页面上下文。 -->
+            <div class="form-section">
+                <h3>应用账号</h3>
+                <p class="form-hint" id="rg-accounts-hint">不勾选任何账号 = 写入全部账号</p>
+                <div class="form-grid" id="rg-accounts"></div>
+                <p class="form-hint" id="rg-accounts-summary"></p>
             </div>
 
             <!-- 监听会话 -->
@@ -235,10 +244,13 @@
                     <label class="tg-checkbox"><input id="rg-notify" type="checkbox" checked /><span class="tg-checkmark"></span><span>推送通知</span></label>
                     <label class="tg-checkbox"><input id="rg-include-edited" type="checkbox" checked /><span class="tg-checkmark"></span><span>处理编辑事件</span></label>
                 </div>
-                <div class="rg-test-row" style="margin-top:12px;">
-                    <button type="button" class="tg-btn tg-btn-ghost tg-btn-sm" onclick="testNotify()">试发一条抢注通知</button>
-                    <span class="rg-hint" style="margin:0;">按<b>已保存</b>的配置走一遍通知通路，确认机器人收得到</span>
-                </div>
+                <!-- 「试发一条抢注通知」不在这个弹窗里：通知走的是**账号**的机器人，
+                     跟当前这条任务无关。它挪到了页面下方「各账号单独设置」里，
+                     每个账号一个按钮。 -->
+                <p class="rg-hint" style="margin-top:12px;">
+                    想确认通知通不通？用页面下方「各账号单独设置」里那个账号自己的
+                    「试发通知」按钮 —— 通知走的是账号的机器人，跟这条任务无关。
+                </p>
             </div>
         </div>
         <div class="tg-modal-footer">
@@ -251,13 +263,19 @@
 
 {% block scripts %}
 <script>
-    let currentAccount = '';
-    //: 整份 reg_grab 配置（含 tasks），GET 回来后在内存里改，再整份 PUT 回去。
-    let rgData = {};
-    //: 运行时快照里的 reg_grab 段（每条任务发现/处理了几个）—— 来自 /api/status。
-    let rgStats = {};
+    //: /api/reg_grab/overview 里的账号数组。渲染前会把「账号 → 任务」**转置**成
+    //: 「任务 → 拥有它的账号」—— 同一条任务是扇出写到多个账号、每个账号各存一份的，
+    //: 按账号渲染会让同一条任务在页面上出现 N 次，用户根本数不清自己有几条。
+    let accounts = [];
+    //: 账号名列表：「点开深链」步骤的「执行账号」下拉用它拼 option。
+    //: 存下来而不是现读 DOM，是因为步骤块是动态渲染的（同一个下拉会有很多份）。
+    let accountNames = [];
+    //: 运行时统计：账号名 → ``reg_grab`` 段（含 per_task）。拿不到就空着，不影响渲染。
+    let rgStatsByAccount = {};
     //: null = 新建；否则是被编辑任务的 id。
     let editingTaskId = null;
+    //: 编辑时这条任务当前落在哪些账号里 —— 保存时靠它算勾选框的**差集**。
+    let editingOwners = [];
     //: 弹窗内步骤链的编辑态。每次改动都写回这里，保存时整体提交。
     let steps = [];
     //: 服务端当前时间（HH:MM）—— 时间框填的是服务端时区，没有这个对照用户发现不了时区错位。
@@ -269,19 +287,15 @@
     const tagFields = ['chats', 'exclude_chats', 'text_patterns'];
     const tagInputs = {};
 
-    // 空态这块被两种场景复用（没选账号 / 选了账号但一条任务都没有），
-    // 所以先把「没选账号」的原始文案存下来。
-    let emptyHtml = '';
-
     const STEP_TYPES = [
         ['send', '发送消息'],
         ['click', '点击按钮'],
+        ['open_link', '点开深链'],
         ['wait', '等待'],
         ['wait_reply', '等待回复'],
     ];
 
     function init() {
-        emptyHtml = document.getElementById('rg-empty').innerHTML;
         tagFields.forEach(f => { tagInputs[f] = []; initTagInput(f); });
         // ⚠️ 三个 id 写成字面量，不要用「前缀 + id」拼接去取元素：
         // 「每个 getElementById 都要有对应 id」的守卫测试认的是括号里的**字面量**，
@@ -293,27 +307,51 @@
         });
         document.getElementById('rg-delay').addEventListener('input', renderDelayRange);
         document.getElementById('rg-jitter').addEventListener('input', renderDelayRange);
-        bindTaskListActions();
-        loadAccounts();
+        // 弹窗里的账号勾选 → 更新「将写入：…」摘要
+        document.getElementById('rg-accounts').addEventListener('change', updateAccountSummary);
+        bindListActions();
+        loadAll();
     }
 
-    //: 卡片上的编辑/删除/启停走 data-* + 事件委托，**不往内联 handler 里拼 task.id**。
+    //: 列表里的按钮与开关一律走 data-* + 事件委托，**不往内联 handler 里拼 task.id**。
     //:
     //: 道理跟规则页一样：id 是用户自由输入的，含一个单引号就能把
     //: ``onclick="openTaskModal('...')"`` 截断 —— HTML 转义救不了内联 handler，
     //: 因为浏览器会先把 ``&#39;`` 解码回单引号再交给 JS 解析。
-    function bindTaskListActions() {
+    function bindListActions() {
         const list = document.getElementById('rg-task-list');
-        list.addEventListener('click', function(e) {
-            const target = e.target.closest('[data-action]');
-            if (!target) return;
-            if (target.dataset.action === 'edit') openTaskModal(target.dataset.taskId);
-            else if (target.dataset.action === 'delete') deleteTask(target.dataset.taskId);
-        });
-        list.addEventListener('change', function(e) {
-            const box = e.target.closest('input[data-action="toggle"]');
-            if (box) toggleTask(box.dataset.taskId, box.checked);
-        });
+        list.addEventListener('click', onListClick);
+        list.addEventListener('change', onListChange);
+    }
+
+    function onListClick(event) {
+        const target = event.target.closest('[data-action]');
+        if (!target) return;
+        const action = target.dataset.action;
+        const taskId = target.dataset.taskId;
+        if (action === 'edit') {
+            editTask(taskId);
+        } else if (action === 'delete') {
+            deleteTask(taskId);
+        } else if (action === 'test-notify') {
+            testNotify(target.dataset.account);
+        }
+    }
+
+    function onListChange(event) {
+        const input = event.target;
+        const card = input.closest('[data-task-id]');
+        if (input.dataset.role === 'rg-task-enabled' && card) {
+            setTaskEnabled(card.dataset.taskId, input.checked);
+        } else if (input.dataset.role === 'rg-owner') {
+            // 账号名在 checkbox 的 value 上：任务卡片不在任何 [data-account] 里面，
+            // 靠父节点取账号会拿到 null（那样就会「勾了没反应」）。
+            setTaskOwner(input.dataset.taskId, input.value, input.checked);
+        } else if (input.dataset.role === 'rg-account-enabled') {
+            toggleRegGrab(input.dataset.account, input.checked);
+        } else if (input.dataset.role === 'rg-concurrency') {
+            saveConcurrency(input.dataset.account, input.value);
+        }
     }
 
     // ---- 标签输入 ----
@@ -323,6 +361,12 @@
         const input = document.getElementById(`rg-${tagDomId(field)}-field`);
         if (!input) return;
         input.addEventListener('keydown', function(e) {
+            // 🔴 中文输入法**选字/上屏**那一下也会派发 keydown(Enter) —— 带
+            // ``isComposing=true``（老浏览器是 keyCode 229）。不挡住的话，用户打
+            // 「主群」按回车选字时，这里会把还没上屏的拼音当成标签加进去，还顺手清空
+            // 输入框：字没了、进去一个半截值，主观感受就是"加不上"。
+            // 必须放在所有分支之前 —— 退格同理，上屏那一下不该删掉一个已有标签。
+            if (e.isComposing || e.keyCode === 229) return;
             if (e.key === 'Enter' && this.value.trim()) {
                 e.preventDefault();
                 if (!tagInputs[field].includes(this.value.trim())) {
@@ -360,57 +404,103 @@
         return Number.isFinite(parsed) ? parsed : fallback;
     }
 
-    // ---- 账号 ----
-    async function loadAccounts() {
-        const res = await fetch('/api/accounts');
-        const data = await res.json();
-        const sel = document.getElementById('account-selector');
-        sel.innerHTML = '<option value="">选择账号...</option>';
-        data.accounts.forEach(a => {
-            sel.innerHTML += `<option value="${attr(a.name)}">${escapeHtml(accountOptionText(a))}</option>`;
-        });
-        if (data.accounts.length > 0) {
-            sel.value = pickDefaultAccount(data.accounts, 'reg_grab');
-            switchAccount();
-        }
-    }
-
-    async function switchAccount() {
-        const sel = document.getElementById('account-selector');
-        currentAccount = sel.value;
-        if (!currentAccount) {
-            document.getElementById('rg-content').style.display = 'none';
-            document.getElementById('rg-empty').innerHTML = emptyHtml;
-            document.getElementById('rg-empty').style.display = 'flex';
+    // ---- 数据 ----
+    async function loadAll() {
+        let data;
+        try {
+            const res = await fetch('/api/reg_grab/overview');
+            if (!res.ok) { toast('抢注任务加载失败', false); return; }
+            data = await res.json();
+        } catch (err) {
+            toast('抢注任务加载失败：' + err, false);
             return;
         }
-        document.getElementById('rg-content').style.display = 'block';
-        document.getElementById('rg-empty').style.display = 'none';
-        await loadRegGrab();
+        accounts = data.accounts || [];
+        accountNames = accounts.map(a => a.name);
+        rgServerNow = data.server_now || '';
+        // 运行时统计（哪条任务真在干活）只是卡片上的一行数字：拿不到也必须把配置页
+        // 渲染出来，不能为一个计数器整页白屏。
+        rgStatsByAccount = {};
+        try {
+            const sres = await fetch('/api/status');
+            if (sres.ok) {
+                const status = await sres.json();
+                (status.accounts || []).forEach(a => {
+                    rgStatsByAccount[a.name] = (a.stats && a.stats.reg_grab) || {};
+                });
+            }
+        } catch (err) { /* 统计拿不到就算了，配置照样能改 */ }
+
+        const btn = document.getElementById('btn-add-task');
+        btn.disabled = accounts.length === 0;
+        btn.title = accounts.length === 0 ? '还没有账号，先去「账号」页添加' : '';
+        renderTasks();
     }
 
-    // ---- 加载 / 渲染 ----
-    async function loadRegGrab() {
-        const [cfgRes, statusRes] = await Promise.all([
-            fetch(`/api/config/${currentAccount}/reg_grab`),
-            fetch('/api/status').catch(() => null),
-        ]);
-        if (!cfgRes.ok) return;
-        rgData = await cfgRes.json();
+    function accountByName(name) { return accounts.find(a => a.name === name); }
 
-        // 运行时统计是「哪条任务真在干活」的唯一证据，拿不到也不该让页面挂掉。
-        rgStats = {};
-        if (statusRes && statusRes.ok) {
-            const status = await statusRes.json().catch(() => ({}));
-            const account = (status.accounts || []).find(a => a.name === currentAccount);
-            rgStats = (account && account.stats && account.stats.reg_grab) || {};
-        }
-        rgServerNow = rgData.server_now || '';
+    //: 从响应里来的任务带着服务端现算的三个只读字段（``ready`` / ``problem`` /
+    //: ``in_window``）。模型是 ``extra="forbid"``，原样 PUT 回去会 422；比对"两份是不是
+    //: 一样"时也要先把它们摘掉 —— 否则两个账号上形状相同的任务会被判成分叉
+    //: （ready 一样、in_window 一样，但没人保证顺序相同）。
+    function stripReadonly(task) {
+        const {ready, problem, in_window, ...rest} = task;
+        return rest;
+    }
 
-        document.getElementById('rg-enabled').checked = !!rgData.enabled;
-        document.getElementById('rg-max-concurrency').value = rgData.max_concurrency || 1;
-        renderTasks();
-        renderWarn(rgData);
+    // 把「账号 → 任务」**转置**成「任务 → 监听账号」。
+    //
+    // 为什么必须转置：同一条任务是扇出写到多个账号、每个账号各存一份的，按账号渲染
+    // 会让同一条任务在页面上出现 N 次，用户根本数不清自己有几条任务。合并成一张主卡片
+    // 后，「这条任务对哪些账号生效」改用勾选表达。
+    function collectTasks() {
+        const order = [];
+        const byId = new Map();
+        accounts.forEach(acc => {
+            (acc.tasks || []).forEach(task => {
+                let entry = byId.get(task.id);
+                if (!entry) {
+                    entry = {id: task.id, task: task, owners: [], variants: new Map(), divergent: []};
+                    byId.set(task.id, entry);
+                    order.push(entry);
+                }
+                entry.owners.push(acc.name);
+                entry.variants.set(acc.name, task);
+            });
+        });
+        order.forEach(entry => {
+            // 各账号里那份是不是**一模一样**：正常扇出是一样的，但有人手改过某个账号的
+            // config.json、或走过一次只写单账号的接口时就会分叉。分叉必须在卡片上说出来
+            // —— 否则卡片显示一份、别的账号按另一份跑，而「编辑保存会覆盖所有监听账号」
+            // 又会把差异悄悄抹掉。
+            const primary = JSON.stringify(stripReadonly(entry.task));
+            entry.divergent = entry.owners.filter(
+                name => JSON.stringify(stripReadonly(entry.variants.get(name))) !== primary
+            );
+        });
+        return order;
+    }
+
+    function findTaskEntry(taskId) {
+        return collectTasks().find(item => item.id === taskId) || null;
+    }
+
+    function statusOf(acc) {
+        if (acc.running) return {cls: 'status-running', text: '运行中'};
+        if (acc.session_exists) return {cls: 'status-stopped', text: '已登录'};
+        return {cls: 'status-offline', text: '未登录'};
+    }
+
+    //: 一条任务的运行时计数是所有监听账号的和 —— 任务维度上只有一个数字。
+    function statsForTask(entry) {
+        let detected = 0;
+        let success = 0;
+        entry.owners.forEach(name => {
+            const per = ((rgStatsByAccount[name] || {}).per_task || {})[entry.id] || {};
+            detected += per.detected || 0;
+            success += per.success || 0;
+        });
+        return {detected: detected, success: success};
     }
 
     function windowText(task) {
@@ -419,78 +509,199 @@
         return `${win.start || '08:00'}~${win.end || '23:00'}`;
     }
 
+    // ---- 渲染 ----
     function renderTasks() {
-        const tasks = rgData.tasks || [];
-        const empty = document.getElementById('rg-empty');
-        // 没有任务时复用这块空态，文案换成「还没有任务」。
-        if (tasks.length === 0 && currentAccount) {
-            empty.innerHTML = '<h3>还没有抢注任务</h3><p>点上方「新建任务」加一条</p>';
-            empty.style.display = 'flex';
-        } else if (currentAccount) {
-            empty.style.display = 'none';
+        const list = document.getElementById('rg-task-list');
+        if (accounts.length === 0) {
+            list.innerHTML = emptyBlock('还没有账号', '先去「账号」页添加一个 Telegram 账号，再回来配抢注任务');
+            return;
         }
-        document.getElementById('rg-task-list').innerHTML = tasks.map(renderTaskCard).join('');
+        // 任务按 task.id 合并（同一条任务扇出到 N 个账号也只出现一次），
+        // 账号各自的设置另起一节 —— 见 renderAccountSettings 里的说明。
+        const entries = collectTasks();
+        const cards = entries.length
+            ? `<div class="rules-rule-list">${entries.map(renderTaskCard).join('')}</div>`
+            : emptyBlock(
+                '还没有抢注任务',
+                '点击右上角「新建任务」开始创建；弹窗里一个账号都不勾就是写入全部账号'
+            );
+        list.innerHTML = cards + renderAccountSettings();
+        renderWarn();
     }
 
-    function renderTaskCard(task) {
+    function emptyBlock(title, desc) {
+        return `
+            <div class="rules-empty" id="rg-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777z"/><path d="M15.5 7.5l3 3L22 7l-3-3"/></svg>
+                <h3>${title}</h3>
+                <p>${desc}</p>
+            </div>`;
+    }
+
+    // 监听账号那一行：勾上 = 把这条任务写进该账号，取消 = 从该账号移除这条任务。
+    // 这是"以任务为维度"的核心操作 —— 任务只有一条，它落到哪些账号由这里决定。
+    function taskOwnersRow(entry) {
+        return `
+                    <div class="rule-owners" data-role="rule-owners">
+                        <span class="rule-owners-label"
+                              title="勾上 = 把这条任务写进该账号；取消 = 从该账号移除这条任务。一个都不勾就会删掉这条任务。">
+                            监听账号
+                            <span class="rule-owners-count">${entry.owners.length}/${accounts.length}</span>
+                        </span>
+                        <div class="rule-owners-list">
+                            ${accounts.map(acc => `
+                                <label class="tg-checkbox rule-owner">
+                                    <input type="checkbox" data-role="rg-owner" data-task-id="${attr(entry.id)}"
+                                           value="${escapeHtml(acc.name)}"
+                                           ${entry.owners.includes(acc.name) ? 'checked' : ''} />
+                                    <span class="tg-checkmark"></span>
+                                    <span>${escapeHtml(acc.name)}</span>
+                                </label>`).join('')}
+                        </div>
+                    </div>`;
+    }
+
+    function renderTaskCard(entry) {
+        const task = entry.task;
         const detect = task.detect || {};
-        const stats = (rgStats.per_task || {})[task.id] || {};
+        const stats = statsForTask(entry);
         const bits = [
             (task.steps || []).length ? `${task.steps.length} 步` : '缺步骤',
             detect.code_pattern ? '已填提取正则' : '缺提取正则',
             (task.chats || []).length ? `监听 ${task.chats.length} 个会话` : '监听全部会话',
             windowText(task),
         ];
-        if (stats.detected) bits.push(`发现 ${stats.detected} · 完成 ${stats.success || 0}`);
+        if (stats.detected) bits.push(`发现 ${stats.detected} · 完成 ${stats.success}`);
+        // 每一条都是 [类名, HTML]：红色是"配置错了"，黄色是"状态如此"（到点就好），
+        // 混成一个颜色会让用户以为「不在时段」也是配错了。
         const warns = [];
+        if (entry.divergent.length > 0) {
+            // 只提示、不拦：保存一次就会把所有副本对齐（PUT 不带 accounts = 改所有副本）。
+            warns.push(['rule-warn', '⚠️ 这条任务在 <b>' + entry.divergent.map(escapeHtml).join('、')
+                + '</b> 上的内容和别处<b>不一样</b>（有人单独改过那个账号的配置）。'
+                + '卡片显示的是其中一份，保存一次就会把所有监听账号对齐。']);
+        }
         if (task.ready === false) {
-            warns.push(`⚠️ ${escapeHtml(task.problem || '配置不完整，不会动手')}`);
+            warns.push(['rule-warn', `⚠️ ${escapeHtml(task.problem || '配置不完整，不会动手')}`]);
         } else if (task.enabled && task.in_window === false) {
-            warns.push(`⏸ 当前不在监听时段（${escapeHtml(windowText(task))}），到点才会动手`);
+            warns.push(['rule-warn-info', `⏸ 当前不在监听时段（${escapeHtml(windowText(task))}），到点才会动手`]);
         }
         return `
-        <div class="rp-task-card${task.enabled ? '' : ' rp-task-off'}">
-            <div class="rp-task-head">
-                <label class="rp-task-toggle">
-                    <input type="checkbox" data-action="toggle" data-task-id="${attr(task.id)}"
-                           ${task.enabled ? 'checked' : ''} />
-                    <span class="toggle-slider"></span>
-                </label>
-                <div class="rp-task-title">
-                    <h3>${escapeHtml(task.name || task.id)}</h3>
-                    <p>${escapeHtml(bits.join(' · '))}</p>
+            <div class="rule-card${task.enabled ? '' : ' rule-disabled'}" data-task-id="${attr(task.id)}">
+                <div class="rule-card-header">
+                    <div class="rule-card-title">
+                        <label class="tg-checkbox rule-toggle">
+                            <input type="checkbox" data-role="rg-task-enabled" data-task-id="${attr(task.id)}"
+                                   ${task.enabled ? 'checked' : ''} />
+                            <span class="tg-checkmark"></span>
+                        </label>
+                        <div>
+                            <div class="rule-name">${escapeHtml(task.name || task.id)}</div>
+                            <div class="rule-id">${escapeHtml(task.id)}</div>
+                        </div>
+                    </div>
+                    <div class="rule-card-actions">
+                        <button class="tg-btn tg-btn-sm tg-btn-ghost" data-action="edit" data-task-id="${attr(task.id)}"
+                                title="编辑（会改到所有监听账号）">编辑</button>
+                        <button class="tg-btn tg-btn-sm tg-btn-danger" data-action="delete" data-task-id="${attr(task.id)}"
+                                title="删除（会从所有监听账号删掉）">删除</button>
+                    </div>
                 </div>
-                <div class="rp-task-actions">
-                    <button class="tg-btn tg-btn-ghost" data-action="edit" data-task-id="${attr(task.id)}">编辑</button>
-                    <button class="tg-btn tg-btn-ghost rp-danger" data-action="delete" data-task-id="${attr(task.id)}">删除</button>
+                <div class="rule-card-body">
+                    <div class="rule-flow-value">${bits.map(b => `<span class="rule-tag">${escapeHtml(b)}</span>`).join('')}</div>
                 </div>
-            </div>
-            ${warns.map(w => `<div class="rp-task-warn">${w}</div>`).join('')}
-        </div>`;
+                ${warns.map(([cls, text]) => `<div class="${cls}">${text}</div>`).join('')}
+                ${taskOwnersRow(entry)}
+            </div>`;
     }
 
-    //: 总开关开着但一条能干活的任务都没有时给一条醒目的提示 —— 否则用户会以为功能坏了。
-    function renderWarn(data) {
+    //: 总开关开着、却没有一条**配置完整**的任务的账号 —— 这种「开了但什么都不会发生」
+    //: 的状态不该让用户自己猜，直接在页面顶部点名。
+    function renderWarn() {
         const box = document.getElementById('rg-warn');
-        if (!data.enabled) { box.style.display = 'none'; return; }
-        const tasks = data.tasks || [];
-        if (tasks.some(t => t.ready !== false)) { box.style.display = 'none'; return; }
-        box.innerHTML = '⚠️ 抢注总开关已开启，但还<b>没有一条配置完整的任务</b>（每条都要有「注册码提取正则」和至少一条步骤）—— 补齐前不会执行任何操作。';
+        const idle = accounts.filter(acc => acc.reg_grab_enabled
+            && !(acc.tasks || []).some(t => t.ready !== false));
+        if (idle.length === 0) { box.style.display = 'none'; return; }
+        box.innerHTML = '⚠️ ' + idle.map(a => escapeHtml(a.name)).join('、')
+            + ' 的抢注总开关已开启，但<b>没有一条配置完整的任务</b>'
+            + '（每条都要有「注册码提取正则」和至少一条步骤）—— 补齐前不会执行任何操作。';
         box.style.display = 'block';
     }
 
-    // ---- 弹窗 ----
-    function findTask(id) { return (rgData.tasks || []).find(t => t.id === id); }
+    // 账号维度：任务卡片按 task.id 合并之后，账号自己的设置（抢注总开关、并发上限、
+    // 试发通知）就不再挂在任何一张任务卡上了。单独收进这一节并默认折叠 ——
+    // 主视图留给任务，这些是"少数情况才来改一次"的东西。
+    function renderAccountSettings() {
+        // 每次 loadAll 都会重建 innerHTML。不把展开状态带过去的话，用户改一次并发上限
+        // （保存成功后会重拉）这一节就自己合上了，得重新点开 —— 白掉一次点击。
+        const prev = document.querySelector('.rg-account-settings');
+        const open = prev ? prev.open : false;
+        return `
+            <details class="rules-account-settings rg-account-settings" id="rg-account-settings"${open ? ' open' : ''}>
+                <summary>
+                    <span class="rules-account-settings-title">各账号单独设置</span>
+                    <span class="rules-account-settings-sub">抢注总开关 · 并发上限 · 试发通知</span>
+                </summary>
+                <div class="rules-account-settings-body">
+                    ${accounts.map(renderAccountGroup).join('')}
+                </div>
+            </details>`;
+    }
 
-    function openTaskModal(taskId) {
-        editingTaskId = taskId || null;
-        const task = taskId ? findTask(taskId) : null;
+    // 账号卡片：只放**账号自己的**东西。任务不在这里 —— 任务在上面的主卡片里，
+    // 一条任务一张，不随账号重复出现。
+    function renderAccountGroup(acc) {
+        const st = statusOf(acc);
+        const taskCount = (acc.tasks || []).length;
+        return `
+            <div class="rules-account-group" data-account="${escapeHtml(acc.name)}">
+                <div class="rules-account-group-header">
+                    <div class="rules-account-group-title">
+                        <span class="status-dot ${st.cls}"></span>
+                        <span class="rules-account-name">${escapeHtml(acc.name)}</span>
+                        ${acc.username ? `<span class="rules-account-user">@${escapeHtml(acc.username)}</span>` : ''}
+                        <span class="rules-account-count">${st.text} · ${taskCount} 条任务</span>
+                    </div>
+                    <div class="rules-account-group-actions">
+                        <label class="rg-concurrency" title="同一账号同时处理几条码。这是**账号级**的，不属于某条任务。">
+                            <span>并发上限</span>
+                            <input type="number" min="1" max="20" step="1"
+                                   value="${acc.max_concurrency || 1}"
+                                   data-role="rg-concurrency" data-account="${escapeHtml(acc.name)}" />
+                        </label>
+                        <button class="tg-btn tg-btn-sm tg-btn-ghost" data-action="test-notify"
+                                data-account="${escapeHtml(acc.name)}"
+                                title="按已保存的配置走一遍这个账号的通知通路，确认机器人收得到">试发通知</button>
+                        <label class="rules-master-toggle" title="该账号的抢注总开关（改完自动生效，不用重启）">
+                            <input type="checkbox" data-role="rg-account-enabled"
+                                   data-account="${escapeHtml(acc.name)}"
+                                   ${acc.reg_grab_enabled ? 'checked' : ''} />
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">抢注总开关</span>
+                        </label>
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    // ---- 弹窗 ----
+    function openTaskModal() { editTask(null); }
+
+    function editTask(taskId) {
+        const entry = taskId ? findTaskEntry(taskId) : null;
+        if (taskId && !entry) { toast('任务已不存在，请刷新', false); loadAll(); return; }
+        const task = entry ? entry.task : null;
+        editingTaskId = task ? task.id : null;
+        // 编辑时这排勾选框是**既有监听账号的勾选状态**，不是"要不要写全部账号"；
+        // 保存时靠 editingOwners 算差集（勾上=POST 写进去，勾掉=DELETE 移出去）。
+        editingOwners = entry ? entry.owners.slice() : [];
+
         document.getElementById('rg-modal-title').textContent =
             task ? `编辑任务 · ${task.name || task.id}` : '新建任务';
 
         const idBox = document.getElementById('rg-task-id');
         idBox.value = task ? task.id : '';
-        // id 是主键：改了等于换一条任务，界面上直接锁住，避免「改完发现多了两条」。
+        // id 是主键：改了等于换一条任务（还会撞上"另一个账号里没有这条"），所以锁住。
         idBox.disabled = !!task;
         document.getElementById('rg-task-name').value = (task && task.name) || '';
         document.getElementById('rg-task-enabled').checked = !task || task.enabled !== false;
@@ -521,6 +732,14 @@
         document.getElementById('rg-window-start').value = win.start || '08:00';
         document.getElementById('rg-window-end').value = win.end || '23:00';
 
+        document.getElementById('rg-accounts-hint').textContent = task
+            ? `勾选 = 这条任务要跑在哪些账号上（当前：${editingOwners.join('、') || '没有'}）。`
+              + '勾掉 = 保存时把它从该账号移除；勾上新的 = 保存时写进去。'
+            : '点这里选这条任务要写到哪些账号；不勾选任何账号 = 写入全部账号';
+        // ⚠️ 这里**不能**锁（规则页曾经传 true 把整排勾选框 disabled，用户根本点不动 ——
+        // 「转发规则中新勾选账号无法勾选」就是这么来的）。
+        renderAccountPicker(editingOwners);
+
         steps = ((task && task.steps) || []).map(s => Object.assign({}, s));
         renderSteps();
         renderDelayRange();
@@ -531,6 +750,60 @@
     function closeTaskModal() {
         document.getElementById('rg-modal').classList.remove('active');
         editingTaskId = null;
+        editingOwners = [];
+    }
+
+    // ---- 弹窗里的账号勾选 ----
+    function renderAccountPicker(checked) {
+        const box = document.getElementById('rg-accounts');
+        if (accounts.length === 0) {
+            box.innerHTML = '<p class="form-hint">还没有账号，先去「账号」页添加</p>';
+            updateAccountSummary();
+            return;
+        }
+        box.innerHTML = accounts.map(acc => `
+            <label class="tg-checkbox">
+                <input type="checkbox" value="${escapeHtml(acc.name)}"
+                       ${checked.includes(acc.name) ? 'checked' : ''} />
+                <span class="tg-checkmark"></span>
+                <span>${escapeHtml(acc.name)}${acc.username ? ` (@${escapeHtml(acc.username)})` : ''}</span>
+            </label>`).join('');
+        updateAccountSummary();
+    }
+
+    function selectedTaskAccounts() {
+        return Array.from(document.querySelectorAll('#rg-accounts input:checked')).map(i => i.value);
+    }
+
+    function updateAccountSummary() {
+        const el = document.getElementById('rg-accounts-summary');
+        if (!el) return;
+        const picked = selectedTaskAccounts();
+        // 编辑时这个框是**既有监听账号的勾选状态**，不是"要不要写全部账号"。
+        // 所以文案要说这次保存的**差集**变成了什么 —— 继续显示"将写入全部账号"
+        // 会和实际做的事对不上（用户勾掉一个账号时尤其误导）。
+        if (editingTaskId) {
+            const adds = picked.filter(name => !editingOwners.includes(name));
+            const removes = editingOwners.filter(name => !picked.includes(name));
+            if (picked.length === 0) {
+                el.textContent = '⚠ 一个账号都不勾 = 保存时把这条任务删掉';
+            } else if (adds.length === 0 && removes.length === 0) {
+                el.textContent = `监听账号不变：${picked.join('、')}`;
+            } else {
+                const bits = [];
+                if (adds.length) bits.push(`新增监听 ${adds.join('、')}`);
+                if (removes.length) bits.push(`取消监听 ${removes.join('、')}`);
+                el.textContent = `将写入：${picked.join('、')}（${bits.join('；')}）`;
+            }
+            return;
+        }
+        if (picked.length > 0) {
+            el.textContent = `将写入：${picked.join('、')}`;
+        } else if (accounts.length > 0) {
+            el.textContent = `将写入：全部账号（${accountNames.join('、')}）`;
+        } else {
+            el.textContent = '';
+        }
     }
 
     function collectTask() {
@@ -562,87 +835,210 @@
         };
     }
 
-    // ---- 保存 ----
-    function cleanTask(task) {
-        // GET 会在每条任务上多塞 ready / problem / in_window 三个只读字段；模型是
-        // extra="forbid" 的，带上去就 400。服务端也会丢，这里再丢一次更保险。
-        const {ready, problem, in_window, ...rest} = task;
-        return rest;
+    // ---- 保存：任务维度 ----
+    //: 所有写操作都走这里 —— 错误文案统一从 detail / message 里取（FastAPI 的 422
+    //: 把 detail 给成数组，直接塞给 toast 会渲染成 [object Object]）。
+    function detailText(data) {
+        if (typeof data.detail === 'string') return data.detail;
+        if (typeof data.message === 'string') return data.message;
+        return '';
     }
 
-    async function saveConfig(tasks) {
-        const payload = {
-            enabled: document.getElementById('rg-enabled').checked,
-            max_concurrency: parseInt(document.getElementById('rg-max-concurrency').value) || 1,
-            tasks: tasks.map(cleanTask),
-        };
-        const res = await fetch(`/api/config/${currentAccount}/reg_grab`, {
-            method: 'PUT', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload),
+    async function sendJson(method, url, body) {
+        const res = await fetch(url, {
+            method: method,
+            headers: {'Content-Type': 'application/json'},
+            body: body === undefined ? undefined : JSON.stringify(body),
         });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-            toast(data.detail || '保存失败', false);
-            return false;
+        return {ok: res.ok, data: data};
+    }
+    function postJson(url, body) { return sendJson('POST', url, body); }
+    function putJson(url, body) { return sendJson('PUT', url, body); }
+    function deleteJson(url) { return sendJson('DELETE', url); }
+
+    // 新建：POST /api/reg_grab/tasks（accounts 为空 = 扇出写入全部账号）。
+    // 已经存在同 id 的账号会被服务端**跳过**（conflicts），全都冲突才是 409。
+    async function saveNewTask(task) {
+        const res = await postJson('/api/reg_grab/tasks', {task: task, accounts: selectedTaskAccounts()});
+        if (!res.ok) { toast(detailText(res.data) || '保存失败', false); return false; }
+        const conflicts = res.data.conflicts || [];
+        let msg = `已保存到 ${(res.data.saved || []).length} 个账号`;
+        if (conflicts.length > 0) msg += `；${conflicts.join('、')} 已有同 id 任务，已跳过`;
+        toast(msg, true);
+        return true;
+    }
+
+    // 编辑保存：三步都走服务端**已有**的端点，顺序不能反。
+    //   1) PUT /api/reg_grab/tasks/{id}（不带 accounts = 更新所有现有副本）—— 内容改动
+    //   2) POST /api/reg_grab/tasks {task, accounts: [新增]}          —— 只写缺这条任务的账号
+    //   3) DELETE ...?accounts=<取消的>                               —— 从取消勾选的账号移除
+    // 只 PUT 的话，弹窗里新勾的账号**什么都不会发生**：那个账号里根本没有这条任务，
+    // 服务端算它 missing，不写也不报错 —— 界面显示"勾上了"，比锁着更糟。
+    async function saveEditedTask(task, adds, removes) {
+        const id = editingTaskId;
+        const res = await putJson(`/api/reg_grab/tasks/${encodeURIComponent(id)}`, {task: task});
+        if (!res.ok) { toast(detailText(res.data) || '保存失败', false); return false; }
+        const missing = res.data.missing || [];
+        const msgs = [`已更新 ${(res.data.updated || []).length} 个账号`];
+        if (missing.length) msgs.push(`${missing.join('、')} 上没有这条任务`);
+
+        if (adds.length) {
+            const added = await postJson('/api/reg_grab/tasks', {task: task, accounts: adds});
+            if (!added.ok) {
+                toast(detailText(added.data) || '写入新账号失败', false);
+                await loadAll();
+                return false;
+            }
+            msgs.push(`已写入 ${(added.data.saved || []).join('、')}`);
+            if ((added.data.conflicts || []).length) {
+                msgs.push(`${added.data.conflicts.join('、')} 已存在同 id 任务，已跳过`);
+            }
         }
-        toast('保存成功', true);
-        await loadRegGrab();
+        for (const name of removes) {
+            const removed = await deleteJson(
+                `/api/reg_grab/tasks/${encodeURIComponent(id)}?accounts=${encodeURIComponent(name)}`);
+            if (!removed.ok) {
+                toast(detailText(removed.data) || `从「${name}」移除失败`, false);
+                await loadAll();
+                return false;
+            }
+        }
+        if (removes.length) msgs.push(`已从 ${removes.join('、')} 移除`);
+        toast(msgs.join('；'), true);
         return true;
     }
 
     async function saveTask() {
+        if (accounts.length === 0) { toast('还没有账号，先去「账号」页添加', false); return; }
         const task = collectTask();
         // id 可以留空：服务端会自动生成一个（优先取名称里的 ASCII 片段，中文名生成
-        // task-xxxxxxxx），保存后 loadRegGrab() 会把生成结果拉回来显示 —— 所以这里
-        // 既不拦"必填"，也不在前端猜一个 id（前端猜的会和服务端不一致）。
-        const tasks = [...(rgData.tasks || [])];
+        // task-xxxxxxxx），保存后 loadAll() 会把生成结果拉回来显示 —— 所以这里既不拦
+        // "必填"，也不在前端猜一个 id（前端猜的会和服务端不一致）。
+        const picked = selectedTaskAccounts();
+        const adds = picked.filter(name => !editingOwners.includes(name));
+        const removes = editingOwners.filter(name => !picked.includes(name));
 
         if (editingTaskId) {
-            const at = tasks.findIndex(t => t.id === editingTaskId);
-            if (at < 0) { toast('任务已不存在，请刷新', false); return; }
-            tasks[at] = task;
-        } else {
-            // 只有用户真填了 id 才查重；留空那条交给服务端生成，不可能撞上。
-            if (task.id && tasks.some(t => t.id === task.id)) {
-                toast('任务 ID 已存在', false);
-                return;
+            // 勾选框一个都不留 = 这条任务哪儿都不生效了，等于删除 —— 后果比"少一个账号"重。
+            if (picked.length === 0
+                && !confirm(`「${task.name || editingTaskId}」的所有监听账号都被取消了。\n\n`
+                    + '保存后这条任务就没有任何账号在跑了（等于删除）。确定吗？')) return;
+            if (await saveEditedTask(task, adds, removes)) {
+                closeTaskModal();
+                await loadAll();
             }
-            tasks.push(task);
-        }
-        if (await saveConfig(tasks)) closeTaskModal();
-    }
-
-    async function toggleTask(id, enabled) {
-        const tasks = (rgData.tasks || []).map(t => (t.id === id ? {...t, enabled} : t));
-        await saveConfig(tasks);
-    }
-
-    async function deleteTask(id) {
-        const task = findTask(id);
-        if (!confirm(`确定删除任务「${(task && (task.name || task.id)) || id}」？`)) return;
-        await saveConfig((rgData.tasks || []).filter(t => t.id !== id));
-    }
-
-    async function saveConcurrency() {
-        await saveConfig(rgData.tasks || []);
-    }
-
-    async function toggleRegGrab() {
-        const box = document.getElementById('rg-enabled');
-        const enabled = box.checked;
-        const res = await fetch(`/api/config/${currentAccount}/reg_grab/enabled`, {
-            method: 'PUT', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({enabled}),
-        });
-        if (res.ok) {
-            toast(enabled ? '抢注任务已开启' : '抢注任务已关闭', true);
-            await loadRegGrab();
             return;
         }
-        // 后端会拒绝「一条配好的任务都没有就开开关」，把原因显示出来并把开关拨回去。
-        const data = await res.json().catch(() => ({}));
-        toast(data.detail || '操作失败', false);
-        box.checked = !enabled;
+        if (await saveNewTask(task)) {
+            closeTaskModal();
+            await loadAll();
+        }
+    }
+
+    //: 任务维度的启停：PUT 不带 accounts = 改**所有**监听账号里的这一份。
+    //: 只改一个账号会让同一条任务在不同账号上状态不一致，而用户根本看不出来。
+    async function setTaskEnabled(taskId, enabled) {
+        const entry = findTaskEntry(taskId);
+        if (!entry) { await loadAll(); return; }
+        const task = Object.assign(stripReadonly(entry.task), {enabled: enabled});
+        const res = await putJson(`/api/reg_grab/tasks/${encodeURIComponent(taskId)}`, {task: task});
+        if (res.ok) {
+            toast(`${enabled ? '已启用' : '已停用'}任务（${(res.data.updated || []).length} 个账号）`, true);
+        } else {
+            toast(detailText(res.data) || '保存失败', false);
+        }
+        await loadAll();  // 失败时也重拉，把开关拨回真实状态
+    }
+
+    //: 「监听账号」勾选：这是"以任务为维度"之后**唯一**增减任务作用范围的地方。
+    //:   勾上 = POST /api/reg_grab/tasks（只写缺这条任务的账号）。不能用 PUT：
+    //:          PUT 是"覆盖已存在的副本"，账号里没有这条任务时它算 missing，不写也不报错
+    //:          —— 界面看起来"勾上了、其实什么都没发生"。
+    //:   取消 = DELETE ...?accounts=<name>（这是"从该账号移除"，不是删除整条任务）。
+    async function setTaskOwner(taskId, accountName, checked) {
+        const entry = findTaskEntry(taskId);
+        if (!entry || !accountName) { await loadAll(); return; }
+
+        if (checked) {
+            const task = stripReadonly(entry.task);
+            const res = await postJson('/api/reg_grab/tasks', {task: task, accounts: [accountName]});
+            if (!res.ok) {
+                toast(detailText(res.data) || `写入账号「${accountName}」失败`, false);
+            } else {
+                toast(`任务「${taskId}」已写入「${accountName}」`, true);
+            }
+            await loadAll();  // 成功失败都重拉，把勾选状态拨回磁盘上的真实结果
+            return;
+        }
+
+        // 取消最后一个监听账号 = 这条任务哪儿都不生效了（等于删除）。先问一句。
+        if (entry.owners.length <= 1) {
+            const ok = confirm(
+                `「${accountName}」是任务「${taskId}」最后一个监听账号。\n\n`
+                + '取消后这条任务就没有任何账号在跑了（等于删除）。确定取消吗？'
+            );
+            if (!ok) { await loadAll(); return; }
+        }
+        const res = await deleteJson(
+            `/api/reg_grab/tasks/${encodeURIComponent(taskId)}?accounts=${encodeURIComponent(accountName)}`);
+        if (!res.ok) {
+            toast(detailText(res.data) || `从账号「${accountName}」移除失败`, false);
+        } else {
+            toast(`已从「${accountName}」移除任务「${taskId}」`, true);
+        }
+        await loadAll();
+    }
+
+    async function deleteTask(taskId) {
+        const entry = findTaskEntry(taskId);
+        if (!entry) { await loadAll(); return; }
+        const owners = entry.owners;
+        const scope = owners.length > 1
+            ? `\n\n任务「${taskId}」一共有 ${owners.length} 个监听账号，会一起删掉：\n${owners.join('、')}`
+            : `\n\n只有「${owners[0]}」在监听，删掉后这条任务就不存在了。`;
+        // 只想让它对某一个账号失效、不想整条删掉的情况很常见，直接指路，
+        // 免得用户拿"删除"当"取消一个账号"用（那会把其它账号一起删了）。
+        const hint = owners.length > 1 ? '\n\n只想让某个账号不再跑这条任务？去卡片上的「监听账号」取消它。' : '';
+        if (!confirm(`确定删除任务「${entry.task.name || taskId}」吗？${scope}${hint}`)) return;
+
+        const res = await deleteJson(`/api/reg_grab/tasks/${encodeURIComponent(taskId)}`);
+        if (res.ok) {
+            toast(`已从 ${(res.data.removed || []).length} 个账号删除`, true);
+            await loadAll();
+        } else {
+            toast(detailText(res.data) || '删除失败', false);
+        }
+    }
+
+    //: 并发上限是**账号级**的，走账号自己的配置端点整份 PUT 回去。
+    //: 它不属于任何一条任务，所以没有任务端点可用；``tasks`` 必须原样带上 ——
+    //: 那个端点不带 tasks 就是"把这个账号的任务列表清空"。
+    async function saveConcurrency(accountName, value) {
+        const acc = accountByName(accountName);
+        if (!acc) { await loadAll(); return; }
+        const payload = {
+            enabled: !!acc.reg_grab_enabled,
+            max_concurrency: Math.max(1, Math.min(20, parseInt(value, 10) || 1)),
+            tasks: (acc.tasks || []).map(stripReadonly),
+        };
+        const res = await putJson(`/api/config/${encodeURIComponent(accountName)}/reg_grab`, payload);
+        if (res.ok) toast(`「${accountName}」并发上限已保存`, true);
+        else toast(detailText(res.data) || '保存失败', false);
+        await loadAll();
+    }
+
+    //: 抢注总开关（账号级）。后端会拒绝「一条配好的任务都没有就开开关」，
+    //: 失败时把原因显示出来 —— 重拉一次就等于把开关拨回磁盘上的真实状态。
+    async function toggleRegGrab(accountName, enabled) {
+        const res = await putJson(
+            `/api/config/${encodeURIComponent(accountName)}/reg_grab/enabled`, {enabled: enabled});
+        if (res.ok) {
+            toast(enabled ? `「${accountName}」抢注任务已开启` : `「${accountName}」抢注任务已关闭`, true);
+        } else {
+            toast(detailText(res.data) || '操作失败', false);
+        }
+        await loadAll();
     }
 
     // ---- 步骤链编辑器 ----
@@ -658,9 +1054,11 @@
         // 换类型时把上一种类型专属的字段清掉，免得提交时留下互相矛盾的残留值。
         const step = steps[index];
         step.type = type;
-        ['chat', 'text', 'button', 'pattern'].forEach(k => { if (k in step) delete step[k]; });
+        ['chat', 'text', 'button', 'link_pattern', 'account', 'pattern']
+            .forEach(k => { if (k in step) delete step[k]; });
         if (type === 'wait') step.seconds = num(step.seconds) || 1;
         if (type === 'wait_reply') step.timeout = num(step.timeout) || 15;
+        if (type === 'open_link' && step.max_per_minute == null) step.max_per_minute = 3;
         renderSteps();
     }
 
@@ -761,6 +1159,47 @@
                 <p class="rg-hint">先在「当前消息」上找，找不到再退回该会话最近一条带按钮的消息</p>
             </div>`;
         }
+        if (step.type === 'open_link') {
+            // 「执行账号」下拉的选项来自 loadAll() 存下的账号名列表（见 accountNames），
+            // 这里不额外去读 DOM：步骤是动态渲染的，每次 getElementById 都要有对应 id，
+            // 拼写错了还会被「每个 getElementById 都要有对应 id」的守卫测试抓到。
+            const accountOptions = accountNames.map(name =>
+                `<option value="${attr(name)}" ${name === step.account ? 'selected' : ''}>${escapeHtml(name)}</option>`
+            ).join('');
+            return `
+            <div class="rg-input-group">
+                <label>链接正则</label>
+                <input type="text" value="${attr(step.link_pattern)}"
+                       placeholder="留空 = 只点 t.me/机器人?start=…-Renew_…（-Register_ 那种不点）"
+                       oninput="setStepField(${i}, 'link_pattern', this.value)" />
+                <p class="rg-hint">
+                    要 <b>2 个捕获组</b>：① 机器人用户名 ② payload。被遮罩结尾
+                    （<code>…-Renew_BuP░░░░░░░</code>）的链接默认**不命中** —— 那种码
+                    多半已经被人用掉了。
+                </p>
+            </div>
+            <div class="rg-grid">
+                <div class="rg-input-group">
+                    <label>执行账号</label>
+                    <select onchange="setStepField(${i}, 'account', this.value)">
+                        <option value="" ${step.account ? '' : 'selected'}>当前账号（默认）</option>
+                        ${accountOptions}
+                    </select>
+                    <p class="rg-hint">
+                        <b>谁设置谁点</b>：只有执行账号与当前账号一致时这一步才真的动手；
+                        其它账号上会跳过（不算失败）。所以要由某个账号来点，<b>那个账号自己的抢注任务
+                        也必须监听同样的会话</b>，否则它根本看不到这条消息。
+                    </p>
+                </div>
+                <div class="rg-input-group">
+                    <label>每分钟上限</label>
+                    <input type="number" min="0" max="60"
+                           value="${step.max_per_minute != null ? step.max_per_minute : 3}"
+                           oninput="setStepField(${i}, 'max_per_minute', num(this.value))" />
+                    <p class="rg-hint">0 = 不限。超出会排队等下一个额度窗口，等超过 30 秒就放弃并通知你。</p>
+                </div>
+            </div>`;
+        }
         if (step.type === 'wait') {
             return `
             <div class="rg-input-group">
@@ -805,6 +1244,10 @@
         } else if (step.type === 'click') {
             base.chat = step.chat || null;
             base.button = step.button || null;
+        } else if (step.type === 'open_link') {
+            base.link_pattern = step.link_pattern || null;
+            base.account = step.account || null;
+            base.max_per_minute = step.max_per_minute != null ? num(step.max_per_minute) : 3;
         } else if (step.type === 'wait') {
             base.seconds = num(step.seconds);
         } else if (step.type === 'wait_reply') {
@@ -851,8 +1294,11 @@
         el.textContent = `✅ 实际时段：${start} ~ ${end}${scope}　·　${clock}　${state}`;
     }
 
-    async function testNotify() {
-        const res = await fetch(`/api/config/${currentAccount}/reg_grab/test_notify`, {method: 'POST'});
+    //: 通知走的是**账号**的机器人，所以这个按钮按账号点（页面下方「各账号单独设置」里）。
+    async function testNotify(accountName) {
+        if (!accountName) return;
+        const res = await fetch(
+            `/api/config/${encodeURIComponent(accountName)}/reg_grab/test_notify`, {method: 'POST'});
         const data = await res.json().catch(() => ({}));
         toast(res.ok ? (data.detail || '测试通知已提交') : (data.detail || '发送失败'), res.ok);
     }

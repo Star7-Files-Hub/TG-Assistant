@@ -19,11 +19,13 @@ import random
 import re
 import time
 from datetime import datetime
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from tg_assistant.config import (
+    DEFAULT_REG_GRAB_LINK_PATTERN,
     AccountConfig,
     RegGrabConfig,
     RegGrabStep,
@@ -63,6 +65,21 @@ CODE_VALUE = "Ex5I0Fx5Bg"
 CODE_B = "MSKY-30-Register_JbrMDOxx38"
 CODE_VALUE_B = "JbrMDOxx38"
 PATTERN = r"Register_([A-Za-z0-9]{10})"
+#: 深链（点开深链步骤）用的机器人、payload 与几种消息文本。
+LINK_BOT = "potdot_eco_bot"
+LINK_BOT_CHAT = -1001234500777
+LINK_PAYLOAD = "Potdot_Eco-5-Renew_bAMP20Qzob"
+LINK_TEXT = f"🎟️ {CODE}\n续期专用链接：t.me/{LINK_BOT}?start={LINK_PAYLOAD}"
+#: 尾部被遮罩的链接（多半已经被别人用掉）
+LINK_MASKED_TEXT = (
+    f"🎟️ {CODE}\n续期专用链接：t.me/{LINK_BOT}?start=Potdot_Eco-5-Renew_BuP░░░░░░░"
+)
+#: 注册链接（用户拍板：只点 -Renew_，这种一律不点）
+LINK_REGISTER_TEXT = (
+    f"🎟️ {CODE}\n注册链接：t.me/{LINK_BOT}?start=Potdot_Eco-5-Register_bAMP20Qzob"
+)
+#: 能匹配"任意 payload"的宽松正则 —— 用来验证遮罩/Renew 两道兜底不依赖默认正则。
+LOOSE_LINK_PATTERN = r"t\.me/([A-Za-z0-9_]{4,32})\?start=([A-Za-z0-9_-]+)"
 
 
 class FakeNotifier:
@@ -178,6 +195,59 @@ def task_of(hunter: RegGrabHunter, task_id: str | None = None) -> PreparedTask:
     if task_id is None:
         return hunter.prepared[0]
     return next(task for task in hunter.prepared if task.id == task_id)
+
+
+# ---- 点开深链（open_link）用的小工具 ----
+
+def link_client(**kwargs) -> FakeClient:
+    """登记好深链机器人 ``@potdot_eco_bot`` 的客户端。"""
+    client = bot_client(**kwargs)
+    client.chat_map[LINK_BOT] = FakeChat(LINK_BOT_CHAT, title="Potdot")
+    return client
+
+
+def open_link_step(**overrides) -> dict:
+    step: dict = {"type": "open_link"}
+    step.update(overrides)
+    return step
+
+
+def rg_link_config(*extra_steps: dict, **step_overrides) -> AccountConfig:
+    """只有一条「点开深链」步骤的任务（可再追加后续步骤）。"""
+    return rg_multi(
+        rg_task("link", steps=[open_link_step(**step_overrides), *extra_steps])
+    )
+
+
+def link_sent(client: FakeClient) -> list[tuple]:
+    """``client.sent`` 里每次发送的 ``(chat_id, text)``。"""
+    return [(call.get("chat_id"), call.get("text")) for call in client.sent]
+
+
+class FakeClock:
+    """可控单调时钟：限流窗口 60 秒、排队上限 30 秒，测试里不能真等。
+
+    ⚠️ 假的 ``_sleep`` **必须**把时间往前推：排队逻辑是"睡到额度空出来再重查"，
+    时钟不动的话它会一直认为额度没空，死循环。
+    """
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def install(self, hunter: RegGrabHunter) -> "FakeClock":
+        hunter._clock = self
+        clock = self
+
+        async def fake_sleep(seconds: float) -> None:
+            clock.slept.append(seconds)
+            clock.now += seconds
+
+        hunter._sleep = fake_sleep
+        return self
 
 
 # --------------------------------------------------------------------------- #
@@ -304,6 +374,101 @@ class TestConfig:
     def test_empty_chats_means_watch_everything(self) -> None:
         config = AccountConfig.model_validate({"reg_grab": {"enabled": True, "chats": []}})
         assert config.watched_chats() == []
+
+
+# --------------------------------------------------------------------------- #
+class TestOpenLinkStepConfig:
+    """``open_link``（点开深链）步骤的配置层：默认值、校验、默认正则的行为。
+
+    用户原话：「t.me/potdot_eco_bot?start=Potdot_Eco-5-Renew_bAMP20Qzob，这种使用
+    抢注时需要直接点击的链接能做么，当正则匹配到 t.me/xxxx?start=xxx-Renew_ 则点击」。
+    """
+
+    def test_type_and_label_are_registered(self) -> None:
+        from tg_assistant.config import REG_GRAB_STEP_LABELS, RegGrabStepType
+
+        assert "open_link" in get_args(RegGrabStepType)
+        assert REG_GRAB_STEP_LABELS["open_link"] == "点开深链"
+
+    def test_defaults(self) -> None:
+        step = RegGrabStep(type="open_link")
+        assert step.link_pattern is None, "留空 = 用引擎里的默认深链正则"
+        assert step.account is None, "留空 = 当前账号（谁设置谁点）"
+        assert step.max_per_minute == 3
+
+    def test_blank_fields_become_none(self) -> None:
+        """面板清空输入框会提交空串，不能把空串当成"填了"。"""
+        step = RegGrabStep(type="open_link", link_pattern="   ", account="")
+        assert step.link_pattern is None
+        assert step.account is None
+
+    def test_invalid_link_pattern_is_rejected(self) -> None:
+        """写坏的正则必须在配置层报错，不能留到运行时表现为"这一步什么都不做"。"""
+        with pytest.raises(ValidationError, match="正则无效"):
+            RegGrabStep(type="open_link", link_pattern="t.me/([A-Za-z0-9_")
+
+    def test_link_pattern_needs_two_groups(self) -> None:
+        """引擎按 group(1)/group(2) 取机器人名与 payload，组数不够要当场拦住。"""
+        with pytest.raises(ValidationError, match="2 个捕获组"):
+            RegGrabStep(type="open_link", link_pattern=r"t\.me/([A-Za-z0-9_]{4,32})")
+
+    def test_max_per_minute_bounds(self) -> None:
+        assert RegGrabStep(type="open_link", max_per_minute=0).max_per_minute == 0, "0 = 不限"
+        assert RegGrabStep(type="open_link", max_per_minute=60).max_per_minute == 60
+        with pytest.raises(ValidationError):
+            RegGrabStep(type="open_link", max_per_minute=61)
+        with pytest.raises(ValidationError):
+            RegGrabStep(type="open_link", max_per_minute=-1)
+
+    def test_unused_fields_are_not_validated(self) -> None:
+        """按 type 决定哪些字段有意义 —— 别的类型上留着残留值不该报错。
+
+        面板切类型时会清字段，但老配置/手写 JSON 里可能留着 ``link_pattern``：
+        在 ``send`` 步骤上它毫无意义，拿它去报错只会让用户莫名其妙。
+        """
+        step = RegGrabStep(type="send", text="hi", link_pattern="(((((")
+        assert step.link_pattern == "((((("
+        click = RegGrabStep(type="click", button="领取", account="SevenStar")
+        assert click.account == "SevenStar", "account 留着也不拦（只是这一步用不上）"
+
+    def test_default_link_pattern_matches_the_real_link(self) -> None:
+        """默认正则的行为 = Lead 在线上实测过的那张表，钉死它。"""
+        pattern = re.compile(DEFAULT_REG_GRAB_LINK_PATTERN)
+        found = pattern.search(
+            "续期专用链接：t.me/potdot_eco_bot?start=Potdot_Eco-5-Renew_bAMP20Qzob 点它"
+        )
+        assert found is not None
+        assert found.group(1) == "potdot_eco_bot"
+        assert found.group(2) == "Potdot_Eco-5-Renew_bAMP20Qzob"
+
+    def test_default_link_pattern_ignores_masked_and_register_links(self) -> None:
+        pattern = re.compile(DEFAULT_REG_GRAB_LINK_PATTERN)
+        # 尾部被遮罩：多半已经被人用掉了，不能去点
+        assert (
+            pattern.search("t.me/potdot_eco_bot?start=Potdot_Eco-5-Renew_BuP░░░░░░░")
+            is None
+        )
+        # 注册链接：用户拍板一律不点
+        assert (
+            pattern.search("t.me/potdot_eco_bot?start=Potdot_Eco-5-Register_bAMP20Qzob")
+            is None
+        )
+
+    def test_mask_chars_are_the_documented_ones(self) -> None:
+        from tg_assistant.config import REG_GRAB_MASK_CHARS
+
+        assert set(REG_GRAB_MASK_CHARS) == set("░▒▓█")
+        assert REG_GRAB_MASK_CHARS in DEFAULT_REG_GRAB_LINK_PATTERN, (
+            "默认正则与引擎的遮罩兜底必须共用同一份字符集"
+        )
+
+    def test_task_with_open_link_step_is_ready(self) -> None:
+        task = RegGrabTask(
+            id="link",
+            detect={"code_pattern": PATTERN},
+            steps=[{"type": "open_link"}],
+        )
+        assert task.ready is True
 
 
 # --------------------------------------------------------------------------- #
@@ -735,6 +900,512 @@ class TestSteps:
         started = time.perf_counter()
         await hunter._run(task_of(hunter), rg_message(), CODE_VALUE, started)
         assert time.perf_counter() - started >= 0.05
+
+
+# --------------------------------------------------------------------------- #
+class TestOpenLinkStep:
+    """``open_link``：命中 ``t.me/<bot>?start=<payload>`` 就"点开"。
+
+    点开的等价动作是**给那个机器人发** ``/start <payload>``；机器人名与 payload
+    只能从消息里现取（这条消息里是 ``potdot_eco_bot``，别的品牌又是另一个），
+    所以这一步不能复用目标会话写死的 ``send``。
+    """
+
+    @pytest.mark.asyncio
+    async def test_clicks_the_link_found_in_the_message(self, alog) -> None:
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert link_sent(client) == [(f"@{LINK_BOT}", f"/start {LINK_PAYLOAD}")]
+        assert outcome.result is ChainResult.SUCCESS
+        assert outcome.steps[0].result is StepResult.OK
+        assert hunter.stats["links_clicked"] == 1
+        assert hunter.stats["steps_skipped"] == 0
+        assert hunter.task_stats["link"]["links_clicked"] == 1
+        # 🔴 链级 detail 必须带上每一步的说明：面板与通知只显示它。只写
+        # "全部 1 步执行成功"的话，用户看不到"点了哪条链接、发的是什么"。
+        assert "/start" in outcome.steps[0].detail
+        assert "/start" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_custom_link_pattern_is_used(self, alog) -> None:
+        """自定义正则要真的生效（否则用户改了半天毫无反应）。"""
+        client = link_client()
+        hunter = build(
+            rg_link_config(link_pattern=LOOSE_LINK_PATTERN), client=client, alog=alog
+        )
+        await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+        assert link_sent(client) == [(f"@{LINK_BOT}", f"/start {LINK_PAYLOAD}")]
+
+    # ---- 不该点的情况（一律"跳过"，不算失败） ----
+
+    @pytest.mark.asyncio
+    async def test_masked_link_is_not_clicked(self, alog) -> None:
+        """被遮罩的链接默认正则就不命中 ⇒ 一个消息都不发。"""
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_MASKED_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == []
+        assert outcome.result is ChainResult.SKIPPED
+        assert outcome.result is not ChainResult.FAILED, "跳过不是失败"
+        assert hunter.stats["links_clicked"] == 0
+        assert hunter.stats["steps_skipped"] == 1
+        assert "深链" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_masked_link_is_not_clicked_even_with_a_loose_pattern(self, alog) -> None:
+        """🔴 遮罩兜底不能跟着用户正则一起消失。
+
+        宽松正则能匹配到遮罩链接，但捕获组会在遮罩字符处停下 —— 只看捕获组会得出
+        "没被遮罩"的错误结论，所以兜底查的是整段链接文本。
+        """
+        client = link_client()
+        hunter = build(
+            rg_link_config(link_pattern=LOOSE_LINK_PATTERN), client=client, alog=alog
+        )
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_MASKED_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == []
+        assert "遮罩" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_register_link_is_not_clicked(self, alog) -> None:
+        """注册链接（``-Register_``）：用户拍板一律不点。"""
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_REGISTER_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == []
+        assert outcome.result is ChainResult.SKIPPED
+
+    @pytest.mark.asyncio
+    async def test_register_link_is_not_clicked_even_with_a_loose_pattern(self, alog) -> None:
+        """自定义正则也绕不过"只点 -Renew_"这条线。"""
+        client = link_client()
+        hunter = build(
+            rg_link_config(link_pattern=LOOSE_LINK_PATTERN), client=client, alog=alog
+        )
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_REGISTER_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == []
+        assert "-Renew_" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_message_without_any_link_is_skipped(self, alog) -> None:
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(), CODE_VALUE, time.perf_counter()
+        )
+        assert client.sent == []
+        assert outcome.result is ChainResult.SKIPPED
+        assert "没有可点开的续期深链" in outcome.detail
+
+    # ---- 执行账号：谁设置谁点 ----
+
+    @pytest.mark.asyncio
+    async def test_other_account_skips_without_failing(self, alog) -> None:
+        """这一步由别的账号负责 ⇒ 跳过，不算失败，一个消息也不发。"""
+        client = link_client()
+        hunter = build(rg_link_config(account="SevenStar"), client=client, alog=alog)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == [], "不该由我来点"
+        assert outcome.result is ChainResult.SKIPPED
+        assert "SevenStar" in outcome.detail
+        assert "test-account" in outcome.detail
+        assert hunter.stats["failed"] == 0, "跳过绝不能算失败"
+        assert hunter.stats["steps_skipped"] == 1
+        assert hunter.stats["links_skipped"] == 1
+        assert hunter.task_stats["link"]["links_skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_matching_account_still_clicks(self, alog) -> None:
+        """执行账号 == 当前账号 ⇒ 照点（不然这个字段就成了"永远不点"）。"""
+        client = link_client()
+        hunter = build(rg_link_config(account="test-account"), client=client, alog=alog)
+        await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+        assert link_sent(client) == [(f"@{LINK_BOT}", f"/start {LINK_PAYLOAD}")]
+
+    @pytest.mark.asyncio
+    async def test_unknown_current_account_skips_fail_closed(self, alog) -> None:
+        """🔴 拿不到当前账号名时**宁可不点**：指定了执行账号的步骤一律跳过。
+
+        反过来的选择（拿不准就当自己是）会让"本不该点的账号"去点，代价比漏点大。
+        """
+        log = CapturingLog()
+        client = link_client()
+        hunter = build(rg_link_config(account="SevenStar"), client=client, alog=log)
+        assert hunter.account is None, "CapturingLog 没有 account 属性 = 账号名未知"
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == []
+        assert outcome.result is ChainResult.SKIPPED
+        assert "抢注步骤跳过" in log.text, "跳过必须留痕（用户会问'为什么没点'）"
+        assert "SevenStar" in log.text and "未知" in log.text
+
+    # ---- 安全阀 ①：同一个 payload 只点一次 ----
+
+    @pytest.mark.asyncio
+    async def test_same_payload_is_clicked_only_once(self, alog) -> None:
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+        task = task_of(hunter)
+
+        first = await hunter._run(task, rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter())
+        second = await hunter._run(task, rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter())
+
+        assert first.result is ChainResult.SUCCESS
+        assert len(client.sent) == 1, "同一个 payload 只点一次"
+        assert second.result is ChainResult.SKIPPED
+        assert "已经点过" in second.detail
+        assert hunter.stats["links_clicked"] == 1
+        assert hunter.stats["links_skipped"] == 1
+
+    @pytest.mark.asyncio
+    async def test_dedupe_is_account_wide_across_tasks(self, alog) -> None:
+        """去重是**账号级**的：两条任务都配了同一条深链，也只能点一次。
+
+        同一条码常被多个群转发、多条任务也可能都配了这一步 —— 各点一次等于多留
+        一次脚本痕迹。
+        """
+        client = link_client()
+        hunter = build(
+            rg_multi(
+                rg_task("a", steps=[open_link_step()]),
+                rg_task("b", steps=[open_link_step()]),
+            ),
+            client=client,
+            alog=alog,
+        )
+
+        await hunter._run(task_of(hunter, "a"), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter())
+        await hunter._run(task_of(hunter, "b"), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter())
+
+        assert len(client.sent) == 1
+
+    # ---- 安全阀 ②：每分钟上限（排队 / 放弃） ----
+
+    @pytest.mark.asyncio
+    async def test_fourth_click_within_a_minute_gives_up_and_notifies(self, alog) -> None:
+        """默认上限 3：同一分钟内第 4 次要等 60 秒 > 30 秒上限 ⇒ 放弃并通知。
+
+        时间源是可控的（``FakeClock``），不会真的睡 30 秒。
+        """
+        client = link_client()
+        notifier = FakeNotifier()
+        hunter = build(rg_link_config(), client=client, alog=alog, notifier=notifier)
+        clock = FakeClock().install(hunter)
+        task = task_of(hunter)
+
+        for index in range(3):
+            payload = f"Potdot_Eco-{index}-Renew_bAMP20Qzob"
+            await hunter._run(
+                task,
+                rg_message(f"t.me/{LINK_BOT}?start={payload}"),
+                CODE_VALUE,
+                time.perf_counter(),
+            )
+
+        assert len(client.sent) == 3
+        outcome = await hunter._run(
+            task,
+            rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-9-Renew_bAMP20Qzob"),
+            CODE_VALUE,
+            time.perf_counter(),
+        )
+
+        assert len(client.sent) == 3, "超限这一条不许发出去"
+        assert outcome.result is ChainResult.FAILED, "该抢没抢到 = 失败（要通知）"
+        assert "限流" in outcome.detail
+        assert hunter.stats["links_throttled"] == 1
+        assert clock.slept == [], "等 60 秒超过 30 秒上限，不该真去睡"
+        # 每一条链都会推通知（前三步成功也推），这里只认"失败"那一条。
+        failed = [task for task in notifier.tasks if task.context["result"] == "failed"]
+        assert len(failed) == 1, "限流放弃必须通知用户"
+        assert "限流" in failed[0].text
+
+    @pytest.mark.asyncio
+    async def test_over_limit_waits_for_the_next_slot_when_it_is_close(self, alog) -> None:
+        """额度快空出来时**排队**等，而不是直接放弃（差几秒就是别人的了）。"""
+        client = link_client()
+        hunter = build(rg_link_config(max_per_minute=1), client=client, alog=alog)
+        clock = FakeClock().install(hunter)
+        task = task_of(hunter)
+
+        await hunter._run(
+            task,
+            rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-1-Renew_bAMP20Qzob"),
+            CODE_VALUE,
+            time.perf_counter(),
+        )
+        clock.now += 35  # 第一条还在 60 秒窗口内，但只剩 25 秒的空档
+
+        outcome = await hunter._run(
+            task,
+            rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-2-Renew_bAMP20Qzob"),
+            CODE_VALUE,
+            time.perf_counter(),
+        )
+
+        assert clock.slept == [pytest.approx(25)], "只等空档那 25 秒"
+        assert outcome.result is ChainResult.SUCCESS
+        assert len(client.sent) == 2
+        assert hunter.stats["links_throttled"] == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_means_unlimited(self, alog) -> None:
+        client = link_client()
+        hunter = build(rg_link_config(max_per_minute=0), client=client, alog=alog)
+        clock = FakeClock().install(hunter)
+        task = task_of(hunter)
+
+        for index in range(5):
+            await hunter._run(
+                task,
+                rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-{index}-Renew_bAMP20Qzob"),
+                CODE_VALUE,
+                time.perf_counter(),
+            )
+
+        assert len(client.sent) == 5, "0 = 不限"
+        assert clock.slept == []
+
+    @pytest.mark.asyncio
+    async def test_limit_is_per_step_not_global(self, alog) -> None:
+        """上限记在**步骤**上：两条任务各有各的额度，不会互相挤掉。"""
+        client = link_client()
+        hunter = build(
+            rg_multi(
+                rg_task("a", steps=[open_link_step(max_per_minute=1)]),
+                rg_task("b", steps=[open_link_step(max_per_minute=1)]),
+            ),
+            client=client,
+            alog=alog,
+        )
+        FakeClock().install(hunter)
+
+        await hunter._run(
+            task_of(hunter, "a"),
+            rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-1-Renew_bAMP20Qzob"),
+            CODE_VALUE,
+            time.perf_counter(),
+        )
+        await hunter._run(
+            task_of(hunter, "b"),
+            rg_message(f"t.me/{LINK_BOT}?start=Potdot_Eco-2-Renew_bAMP20Qzob"),
+            CODE_VALUE,
+            time.perf_counter(),
+        )
+
+        assert len(client.sent) == 2
+
+    # ---- 安全阀 ④：只在任务时段内点 ----
+
+    @pytest.mark.asyncio
+    async def test_outside_window_does_not_click(self, alog) -> None:
+        """时段外整条链都不跑（现有 ``_in_window`` 已经保证），这里钉死它。"""
+        client = link_client()
+        hunter = build(
+            rg_multi(
+                rg_task(
+                    "link",
+                    steps=[open_link_step()],
+                    window={"enabled": True, "start": "08:00", "end": "23:00"},
+                )
+            ),
+            client=client,
+            alog=alog,
+        )
+        hunter._now = lambda: at(3, 0)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert client.sent == [], "半夜不该点"
+        assert outcome.result is ChainResult.SKIPPED
+        assert outcome.steps == [], "压根不该跑步骤"
+
+    def test_outside_window_dispatch_counts_as_outside(self, alog) -> None:
+        """走真实入口（``_dispatch``）时记的是 ``outside_window`` 而不是"命中"。
+
+        这样用户查"为什么没点"时看到的是"时段外"，而不是一片空白。
+        """
+        client = link_client()
+        hunter = build(
+            rg_multi(
+                rg_task(
+                    "link",
+                    steps=[open_link_step()],
+                    window={"enabled": True, "start": "08:00", "end": "23:00"},
+                )
+            ),
+            client=client,
+            alog=alog,
+        )
+        hunter._now = lambda: at(3, 0)
+        hunter._dispatch(rg_message(LINK_TEXT), edited=False)
+
+        assert hunter.stats["outside_window"] == 1
+        assert hunter.stats["detected"] == 0
+        assert client.sent == []
+
+    # ---- 安全阀 ③：点完能把机器人的回执接住 ----
+
+    @pytest.mark.asyncio
+    async def test_bot_chat_is_learned_into_the_watch_filter(self, alog) -> None:
+        """🔴 深链机器人必须补进 handler 过滤器。
+
+        配置里写不出这个机器人（每条消息里的可能不同），不补进去的话它的回执会被
+        ``filters.chat(...)`` 挡在外面，后面的「等待回复」永远等不到 ——
+        用户看到的是"点了但没下文"。
+        """
+        client = link_client()
+        hunter = build(
+            rg_multi(rg_task("link", chats=[CHAT], steps=[open_link_step()])),
+            client=client,
+            alog=alog,
+        )
+        assert LINK_BOT not in hunter._watch_chats()
+
+        await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert LINK_BOT in hunter._watch_chats(), "记的是不带 @ 的裸用户名（与配置层同口径）"
+
+    @pytest.mark.asyncio
+    async def test_wait_reply_after_open_link_catches_the_bot_answer(self, alog) -> None:
+        """安全阀 ③：点完接一个「等待回复」，机器人的回执要能被接住。
+
+        ``open_link`` 会把链目标换成刚点开的机器人，所以后面的 ``wait_reply``
+        不用再填会话。
+        """
+        client = link_client()
+        hunter = build(
+            rg_multi(
+                rg_task(
+                    "link",
+                    steps=[
+                        open_link_step(),
+                        {"type": "wait_reply", "pattern": "续期成功", "timeout": 1.0},
+                    ],
+                )
+            ),
+            client=client,
+            alog=alog,
+        )
+
+        async def feed() -> None:
+            await asyncio.sleep(0.05)
+            hunter._bus.feed(
+                LINK_BOT_CHAT,
+                make_message(
+                    "✅ 续期成功：Potdot_Eco-5",
+                    chat=FakeChat(LINK_BOT_CHAT, title="Potdot"),
+                    sender=FakeUser(9, is_bot=True),
+                ),
+            )
+
+        feeder = asyncio.create_task(feed())
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+        await feeder
+
+        assert outcome.result is ChainResult.SUCCESS
+        assert [step.type for step in outcome.steps] == ["open_link", "wait_reply"]
+        assert "续期成功" in outcome.steps[1].detail
+
+    @pytest.mark.asyncio
+    async def test_resolve_chat_id_normalises_the_at_sign(self, alog) -> None:
+        """🔴 运行时不带 ``@`` 去查表。
+
+        配置里写的 ``@testbot`` 早被校验器归一化成 ``testbot``，但 ``open_link``
+        从消息里抠出来的 ``"@potdot_eco_bot"`` 是**运行时拼的**，绕过了那一层。
+        不归一化的话 ``get_chat("@potdot_eco_bot")`` 查不到 peer ⇒ 后接的
+        「等待回复」必炸，表现就是"链接点了，但等不到回复"。
+        """
+        client = link_client()
+        hunter = build(rg_link_config(), client=client, alog=alog)
+
+        assert await hunter._resolve_chat_id(f"@{LINK_BOT}") == LINK_BOT_CHAT
+        assert await hunter._resolve_chat_id(LINK_BOT.upper()) == LINK_BOT_CHAT, "大小写同口径"
+        assert await hunter._resolve_chat_id(LINK_BOT_CHAT) == LINK_BOT_CHAT, "数字 id 原样返回"
+
+    # ---- 发送失败：算失败，而且不许把 payload 拉黑 ----
+
+    @pytest.mark.asyncio
+    async def test_send_failure_fails_the_step_but_keeps_the_payload(self, alog) -> None:
+        """发不出去 = 失败（要通知），但**不能**把这条码记成"点过了"。
+
+        记了的话一次网络抖动就把这条码永久拉黑，用户永远等不到它被点开。
+        """
+        client = link_client(send_error=RuntimeError("boom"))
+        hunter = build(rg_link_config(), client=client, alog=alog)
+
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(LINK_TEXT), CODE_VALUE, time.perf_counter()
+        )
+
+        assert outcome.result is ChainResult.FAILED
+        assert hunter.stats["links_failed"] == 1
+        assert hunter.stats["links_clicked"] == 0
+        assert hunter._clicked_links == {}, "失败不记去重，留着重试的机会"
+        assert hunter.task_stats["link"]["links_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_skipped_step_does_not_block_the_rest_of_the_chain(self, alog) -> None:
+        """跳过的是**这一步**，后面的步骤照跑（否则一个可选的点击会拖垮整条链）。"""
+        client = link_client()
+        hunter = build(
+            rg_link_config(
+                {"type": "send", "text": "点完了 {code}", "chat": "@testbot"}
+            ),
+            client=client,
+            alog=alog,
+        )
+        outcome = await hunter._run(
+            task_of(hunter), rg_message(), CODE_VALUE, time.perf_counter()
+        )
+
+        assert [step.result for step in outcome.steps] == [
+            StepResult.SKIPPED,
+            StepResult.OK,
+        ]
+        assert outcome.result is ChainResult.SUCCESS, "有一步真做了 ⇒ 整条链算成功"
+        # ``send`` 的 ``@testbot`` 在配置层被归一化成 ``testbot``，引擎再解析成数字 id
+        # 才发出去（后面的 wait_reply 得靠数字 id 订阅消息）—— 这是既定行为。
+        assert link_sent(client) == [(BOT_CHAT, f"点完了 {CODE_VALUE}")]
+        assert "1/2 步成功，1 步跳过" in outcome.detail
 
 
 # --------------------------------------------------------------------------- #
@@ -1774,12 +2445,18 @@ def _reg_grab_template() -> str:
 
 
 def _js_function_body(html: str, name: str) -> str:
-    """截出某个 JS 函数的函数体。
+    """截出某个 JS 函数的函数体（``async function`` / 普通 ``function`` 都认）。
 
     ⚠️ 断言必须限定在函数体内：模板别处也可能出现同样的字符串，全文搜的话
     把接线删掉测试照样过（test_web_pages.py 里有一份同名的同款工具）。
     """
-    start = html.index(f"async function {name}(")
+    for prefix in ("async function ", "function "):
+        head = f"{prefix}{name}("
+        if head in html:
+            start = html.index(head)
+            break
+    else:  # pragma: no cover - 函数被删掉时给出可读的失败
+        raise AssertionError(f"模板里找不到 JS 函数 {name}()")
     end = html.index("\n    }\n", start)
     return html[start:end]
 
@@ -1933,6 +2610,67 @@ class TestTestExtractEndpoint:
         assert "任务 ID 不能为空" not in html, "前端不该再拦 id 必填"
         save = _js_function_body(html, "saveTask")
         assert "if (!task.id)" not in save, "id 留空时保存路径不能提前 return"
+
+
+# --------------------------------------------------------------------------- #
+class TestOpenLinkPanel:
+    """面板：步骤类型下拉 + 「点开深链」的三个字段。
+
+    ⚠️ 只钉住步骤编辑器本身。账号选择放进任务卡片、整页按任务维度改版属于 task-8，
+    不在这些用例的范围内。
+    """
+
+    @staticmethod
+    def _step_types(html: str) -> list[tuple[str, str]]:
+        block = re.search(r"const STEP_TYPES = \[(.*?)\];", html, re.S)
+        assert block, "面板里找不到 STEP_TYPES"
+        return re.findall(r"\['([a-z_]+)', '([^']+)'\]", block.group(1))
+
+    def test_step_type_is_offered(self) -> None:
+        assert ("open_link", "点开深链") in self._step_types(_reg_grab_template())
+
+    def test_panel_and_backend_agree_on_step_types(self) -> None:
+        """前后端类型必须一一对应：漏一个就是"面板上没有这个能力"。"""
+        from tg_assistant.config import REG_GRAB_STEP_LABELS
+
+        values = [value for value, _ in self._step_types(_reg_grab_template())]
+        assert values == list(REG_GRAB_STEP_LABELS), "顺序也照后端来，少一处将来会漂的地方"
+
+    def test_fields_are_rendered_with_the_needed_hints(self) -> None:
+        body = _js_function_body(_reg_grab_template(), "stepFields")
+        assert "step.type === 'open_link'" in body
+        for field in ("link_pattern", "account", "max_per_minute"):
+            assert f"'{field}'" in body, f"open_link 的 {field} 字段没渲染"
+        # 这两句话是用户拍板的语义，删掉面板就会引导用户配错：
+        assert "谁设置谁点" in body, "要说清执行账号的语义"
+        assert "也必须监听同样的会话" in body, "要说清「那个账号得看得到这条消息」"
+
+    def test_clean_step_submits_exactly_the_open_link_fields(self) -> None:
+        """切类型时残留字段会被清掉，但当前类型该交的字段一个都不能少。"""
+        body = _js_function_body(_reg_grab_template(), "cleanStep")
+        branch = body[body.index("step.type === 'open_link'") :]
+        branch = branch[: branch.index("} else")]
+        for field in ("link_pattern", "account", "max_per_minute"):
+            assert f"base.{field} =" in branch, f"cleanStep 漏了 {field}"
+        # 字段名打错的话保存时会 422（模型 extra="forbid"），这里提前拦住
+        assert {"link_pattern", "account", "max_per_minute"} <= set(RegGrabStep.model_fields)
+
+    def test_panel_payload_is_accepted_by_the_model(self) -> None:
+        """面板交上来的那三个字段，模型必须原样收下。"""
+        step = RegGrabStep.model_validate(
+            {
+                "type": "open_link",
+                "name": "",
+                "delay": 0,
+                "optional": False,
+                "link_pattern": None,
+                "account": "SevenStar",
+                "max_per_minute": 5,
+            }
+        )
+        assert step.account == "SevenStar"
+        assert step.max_per_minute == 5
+        assert step.link_pattern is None
 
 
 # --------------------------------------------------------------------------- #

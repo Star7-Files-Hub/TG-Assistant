@@ -1112,17 +1112,40 @@ class RedPacketConfig(StrictModel):
 #:
 #: - ``send``：往指定会话发一条消息，模板支持 ``{code}`` 等变量；
 #: - ``click``：点掉某条消息上的内联按钮（按按钮文字正则匹配）；
+#: - ``open_link``：点开消息里的 ``t.me/xxx?start=…`` 深链
+#:   （等价于给那个机器人发 ``/start <payload>``，机器人名与 payload 从消息里现取）；
 #: - ``wait``：空等若干秒（给机器人留出处理时间）；
 #: - ``wait_reply``：等目标会话的下一条消息，命中正则才算成功。
-RegGrabStepType = Literal["send", "click", "wait", "wait_reply"]
+RegGrabStepType = Literal["send", "click", "open_link", "wait", "wait_reply"]
 
 #: 步骤类型的中文名。只用于日志与界面提示，落盘一律用英文 key。
 REG_GRAB_STEP_LABELS: dict[str, str] = {
     "send": "发送消息",
     "click": "点击按钮",
+    "open_link": "点开深链",
     "wait": "等待",
     "wait_reply": "等待回复",
 }
+
+#: 注册码通知里的**遮罩字符**：尾部被它们盖住（``…-Renew_BuP░░░░░░░``）。
+#:
+#: 单独提出来是因为有两处要用同一份字符集：这里的默认深链正则（尾部守卫），
+#: 以及引擎里"链接带遮罩就别点"的兜底判断。抄两份迟早会漏一处。
+REG_GRAB_MASK_CHARS = "░▒▓█"
+
+#: ``open_link`` 步骤的默认深链正则（**2 个捕获组**：① 机器人用户名 ② payload）。
+#:
+#: 为什么是这个形状（用户在服务器上用 ``re`` 实测过，别再"简化"）：
+#:
+#: * 只认 payload 里含 ``Renew_`` 的链接 —— 用户拍板：``-Register_`` 那种注册链接
+#:   **不点**（注册链接点了可能真的注册掉，续期链接点错了代价小得多）；
+#: * 尾部 ``(?![A-Za-z0-9_░▒▓█])`` 是**遮罩守卫**：被盖住尾巴的 ``…-Renew_BuP░░░░░░░``
+#:   必须**不命中**。那种码十有八九已经被人用掉了，去点只是白跑一趟、还多留一次痕迹；
+#: * 载荷要求至少 3 位随机后缀，避免匹配到 ``…-Renew_`` 这种截断文本。
+DEFAULT_REG_GRAB_LINK_PATTERN = (
+    r"t\.me/([A-Za-z0-9_]{4,32})\?start=([A-Za-z0-9_-]*Renew_[A-Za-z0-9]{3,})"
+    rf"(?![A-Za-z0-9_{REG_GRAB_MASK_CHARS}])"
+)
 
 
 def _check_regex(pattern: str, field: str) -> None:
@@ -1155,6 +1178,22 @@ class RegGrabStep(StrictModel):
     #: 其中 ``{code}`` 是正则提取出来的注册码。
     text: Optional[str] = None
 
+    # ---- open_link ----
+    #: 深链正则；留空用 :data:`DEFAULT_REG_GRAB_LINK_PATTERN`。
+    #:
+    #: 🔴 **必须正好带 2 个捕获组**：① 机器人用户名 ② payload。引擎按 ``group(1)`` /
+    #: ``group(2)`` 取这两个值，组数不对在运行时表现为"这一步永远没动作"，
+    #: 所以配置层直接拦住（见 :meth:`_check`）。
+    link_pattern: Optional[str] = None
+    #: 执行账号；留空 = 当前账号。
+    #:
+    #: 用户拍板：**谁设置谁点** —— 这一步只在"执行账号 == 当前账号"时真正动手，
+    #: 其它账号上直接跳过（不算失败）。跨账号替别人点需要拿别人的 client，
+    #: 那要动 runner 的架构，超出这一步的范围。
+    account: Optional[str] = None
+    #: 每分钟最多点几次；0 = 不限。超限排队等下一个额度窗口，等超过 30 秒放弃。
+    max_per_minute: int = Field(default=3, ge=0, le=60)
+
     # ---- click ----
     #: 按钮文字正则（忽略大小写）。在「当前消息」上找，找不到再退回目标会话
     #: 最近一条带按钮的消息。
@@ -1177,7 +1216,7 @@ class RegGrabStep(StrictModel):
             return parse_chat_ref(value)
         return value
 
-    @field_validator("text", "button", "pattern", mode="before")
+    @field_validator("text", "button", "link_pattern", "account", "pattern", mode="before")
     @classmethod
     def _blank_to_none(cls, value: Any) -> Any:
         """界面里清空一个输入框会提交空串，这里统一当成「没填」。"""
@@ -1193,6 +1232,18 @@ class RegGrabStep(StrictModel):
             if not (self.button or "").strip():
                 raise ValueError("click 步骤必须填写按钮文字")
             _check_regex(self.button, "reg_grab.steps[].button")
+        if self.type == "open_link" and self.link_pattern:
+            # 自定义深链正则写错必须在这里报出来：留到运行时才发现的话，表现是
+            # 「这一步什么都不做」，最难看的一种错。
+            _check_regex(self.link_pattern, "reg_grab.steps[].link_pattern")
+            # 捕获组数也要在这里看住：引擎要靠 group(1)/group(2) 取机器人名与 payload，
+            # 少一个组就会在真正抢码时才炸（而且是"没动作"这种静默形态）。
+            groups = re.compile(self.link_pattern).groups
+            if groups < 2:
+                raise ValueError(
+                    "open_link 步骤的链接正则需要 2 个捕获组"
+                    f"（① 机器人用户名 ② payload），当前只有 {groups} 个"
+                )
         if self.type == "wait_reply" and self.pattern:
             _check_regex(self.pattern, "reg_grab.steps[].pattern")
         return self

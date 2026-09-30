@@ -49,6 +49,8 @@ from pyrogram.handlers import EditedMessageHandler, MessageHandler
 from .client import with_flood_retry
 from .metrics import MetricsStore
 from .config import (
+    DEFAULT_REG_GRAB_LINK_PATTERN,
+    REG_GRAB_MASK_CHARS,
     REG_GRAB_STEP_LABELS,
     AccountConfig,
     RegGrabConfig,
@@ -143,6 +145,42 @@ class ChainOutcome:
     cost_ms: float = 0.0
     #: 是哪条任务干的 —— 多任务之后，日志里不写这个就分不清是哪条链跑的。
     task: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# 步骤控制：故意跳过 ≠ 失败
+# --------------------------------------------------------------------------- #
+class _StepSkipped(Exception):
+    """这一步按配置**故意没做**，不是失败。
+
+    典型场景（``open_link``）：执行账号不是当前账号、payload 已经点过、
+    消息里根本没有可点的深链。用一个独立异常而不是给 ``_run_step`` 加一个
+    "跳过了"的返回值：那个签名是 ``(说明, 当前消息, 目标会话)``，加第四位会传染到
+    每一个步骤；异常只在真正需要跳过的步骤里抛出。
+
+    跳过**不**把整条链标成 PARTIAL：用户要的语义是"这一步没做"，而不是"部分成功"。
+    """
+
+
+class OpenLinkThrottled(RuntimeError):
+    """点开深链被限流、且等不到下一个额度窗口（**这是失败**，要通知用户）。
+
+    和 :class:`_StepSkipped` 分开：跳过是"本来就不该我做"，限流放弃是"本来该抢却
+    没抢到" —— 后者必须推一条通知，否则用户以为一切正常。
+    """
+
+
+#: 点开深链的限流窗口（秒）。用户拍板「每分钟最多 N 次」，所以窗口固定 60 秒。
+_OPEN_LINK_WINDOW = 60.0
+#: 排队等待上限（秒）。抢注是秒级的事：等一分钟这条码早没了，而且会把并发槽
+#: 一直占着；超过这个上限就放弃并通知。
+_OPEN_LINK_MAX_WAIT = 30.0
+#: 链接带遮罩字符（``░▒▓█``，连出现两次以上）就**不点**：那种码多半已经被用掉，
+#: 点它只是白跑一趟还多留一次痕迹。默认深层正则里已有尾部守卫，这里是兜底 ——
+#: 用户自定义 ``link_pattern`` 时守卫不能跟着一起消失。
+_MASKED_PAYLOAD = re.compile(f"[{REG_GRAB_MASK_CHARS}]{{2,}}")
+#: 只有 payload 里含它才点（用户拍板：``-Register_`` 那种一律不点）。
+_OPEN_LINK_MARKER = "-Renew_"
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +312,10 @@ class PreparedTask:
     steps: list[RegGrabStep]
     #: 与 ``steps`` 一一对应的按钮正则（``click`` 用）。
     button_patterns: list[Optional[re.Pattern[str]]]
+    #: 与 ``steps`` 一一对应的深链正则（``open_link`` 用）。留空时用
+    #: :data:`~tg_assistant.config.DEFAULT_REG_GRAB_LINK_PATTERN` —— 解析放在这里，
+    #: 用户配置里就只留一个"没填"的空值，默认值将来要改也不用动已存的配置。
+    link_patterns: list[Optional[re.Pattern[str]]]
     #: 与 ``steps`` 一一对应的回执正则（``wait_reply`` 用）。
     reply_patterns: list[Optional[re.Pattern[str]]]
 
@@ -304,6 +346,14 @@ class PreparedTask:
             button_patterns=[
                 compile_user_pattern(step.button)
                 if step.type == "click" and step.button
+                else None
+                for step in steps
+            ],
+            link_patterns=[
+                # 留空 ⇒ 用默认深链正则（只认 -Renew_、带遮罩守卫）。编译标志与
+                # 其它用户正则一致：多行模式、区分大小写（深链是 URL，别放宽）。
+                compile_user_pattern(step.link_pattern or DEFAULT_REG_GRAB_LINK_PATTERN)
+                if step.type == "open_link"
                 else None
                 for step in steps
             ],
@@ -364,6 +414,25 @@ class RegGrabHunter:
         self._chat_ids: dict[str, int] = {}
         self._me_id: Optional[int] = None
         self._me_names: list[str] = []
+        #: 当前账号名（来自 ``AccountLogger``）。只有一个账号名可以比对，
+        #: 「这一步由谁点」的判定就靠它。
+        #:
+        #: 取不到时（测试里的日志替身没有 ``account``）**当成未知**：指定了执行账号的
+        #: 步骤一律跳过 —— 宁可不动手，也不能让"不该点的账号"去点。
+        self.account: Optional[str] = getattr(alog, "account", None)
+        #: 已经点过的 payload → 点它的时间（账号级共享）。
+        #:
+        #: 为什么账号级而不是任务级：同一条码常被多个群转发、多任务也可能都配了
+        #: ``open_link`` —— 谁点到就是谁点到了，绝不能两个任务各点一次。
+        #: 记录时机在**发出去之后**：发送失败时不记，否则一次网络抖动就把这条码
+        #: 永久拉黑了。
+        self._clicked_links: dict[str, float] = {}
+        #: 限流用的滑动窗口：``"任务id:步骤序号"`` → 最近的发送时刻列表。
+        self._link_hits: dict[str, list[float]] = {}
+        #: 从深链里学到的机器人会话（**不带 @ 的裸用户名**，与配置层同口径）。
+        #: 它们必须进 handler 过滤器，否则机器人的回执会被 ``filters.chat(...)``
+        #: 挡在外面，后面的「等待回复」永远等不到 —— 用户看到的就是"点了但没下文"。
+        self._link_chats: set[str] = set()
         self.stats = {
             "detected": 0,
             "started": 0,
@@ -378,6 +447,13 @@ class RegGrabHunter:
             "outside_window": 0,
             "steps_ok": 0,
             "steps_failed": 0,
+            #: 步骤被**故意跳过**的次数（open_link 最常见的几种跳过原因）。
+            "steps_skipped": 0,
+            #: 深链：真正点开的次数 / 跳过次数 / 限流放弃次数 / 发送失败次数。
+            "links_clicked": 0,
+            "links_skipped": 0,
+            "links_throttled": 0,
+            "links_failed": 0,
         }
         #: 每条任务各自的计数。多任务之后「一共抢到 3 个」说明不了是哪条任务干的。
         self.task_stats: dict[str, dict[str, int]] = {
@@ -412,6 +488,12 @@ class RegGrabHunter:
             for step in task.steps:
                 if step.chat is not None and step.chat not in chats:
                     chats.append(step.chat)
+        # 深链步骤的目标机器人**配置里写不出来**（每条消息里的机器人可能不同），
+        # 只能等真正点开一次之后才知道是谁；学到之后必须补进过滤器，否则它的回执
+        # 进不来。见 ``_link_chats``。
+        for chat in sorted(self._link_chats):
+            if chat not in chats:
+                chats.append(chat)
         return chats
 
     @staticmethod
@@ -956,6 +1038,11 @@ class RegGrabHunter:
                         task, index, step, message, current, chain_target, variables
                     )
                     result = StepResult.OK
+                except _StepSkipped as skip:
+                    # 「这一步故意没做」不是失败：照样记账、照样往下走，但不把整条链
+                    # 标成 PARTIAL —— 用户要的语义是"没做"，不是"部分成功"。
+                    result = StepResult.SKIPPED
+                    detail = str(skip)
                 except Exception as exc:  # noqa: BLE001 - 单步失败不能拖垮整条链的记账
                     result = StepResult.FAILED
                     detail = self._failure_detail(exc)
@@ -971,6 +1058,24 @@ class RegGrabHunter:
                         cost_ms=cost_ms,
                     )
                 )
+                if result is StepResult.SKIPPED:
+                    self.stats["steps_skipped"] += 1
+                    self.task_stats[task.id]["steps_skipped"] += 1
+                    if step.type == "open_link":
+                        self.stats["links_skipped"] += 1
+                        self.task_stats[task.id]["links_skipped"] += 1
+                    # 跳过**必须**留痕：用户事后问"为什么没点"时，这条就是答案。
+                    self.alog.info(
+                        "抢注步骤跳过",
+                        task=task.label,
+                        step=index,
+                        total=len(task.steps),
+                        type=REG_GRAB_STEP_LABELS.get(step.type, step.type),
+                        name=step_label(step),
+                        reason=detail,
+                        cost_ms=round(cost_ms, 1),
+                    )
+                    continue
                 if result is StepResult.OK:
                     self.stats["steps_ok"] += 1
                     self.task_stats[task.id]["steps_ok"] += 1
@@ -1007,8 +1112,19 @@ class RegGrabHunter:
                 outcome.result = ChainResult.FAILED
                 break
 
+        # 每一步都被跳过 ⇒ 这条链其实**一步都没做**（典型：open_link 指定的执行账号
+        # 不是当前账号；那条任务会由那个账号自己的引擎去执行）。按 SKIPPED 收尾，
+        # 别给用户推一条"成功"通知 —— 他什么都没做，通知只会是噪音。
+        # ⚠️ 只在**有步骤**时改写：一条步骤都没有的任务维持老行为（改它属于另一件事）。
+        if (
+            outcome.result is ChainResult.SUCCESS
+            and outcome.steps
+            and not any(step.result is StepResult.OK for step in outcome.steps)
+        ):
+            outcome.result = ChainResult.SKIPPED
+
         outcome.cost_ms = (time.perf_counter() - started) * 1000
-        outcome.detail = self._summarize(outcome)
+        outcome.detail = self._detail_with_steps(outcome)
         self._record(task, outcome)
         self._log_outcome(outcome)
         # SKIPPED 只记日志不推通知：码已经被别人用掉这种事，推给用户纯属噪音。
@@ -1039,6 +1155,14 @@ class RegGrabHunter:
         if step.type == "click":
             detail, message = await self._step_click(task, index, step, target, current)
             return detail, message, chain_target
+
+        if step.type == "open_link":
+            # 目标会话是**消息里的那个机器人**，不是配置里写死的会话 ⇒ 这一步
+            # 会把它设成新的链目标，后面接一个「等待回复」就能接住机器人的回执。
+            detail, bot_chat = await self._step_open_link(
+                task, index, step, source, current
+            )
+            return detail, current, bot_chat
 
         if step.type == "wait":
             if step.seconds > 0:
@@ -1141,6 +1265,247 @@ class RegGrabHunter:
         self.alog.info("已点击抢注按钮", button=button_label(button), chat_id=chat_id)
         return f"已点击「{button_label(button)}」{shown}", message
 
+    async def _step_open_link(
+        self,
+        task: PreparedTask,
+        index: int,
+        step: RegGrabStep,
+        source: Any,
+        current: Any,
+    ) -> tuple[str, str]:
+        """点开消息里的 ``t.me`` 深链：等价于给那个机器人发 ``/start <payload>``。
+
+        为什么不能直接用 ``send`` 步骤：``send`` 的目标会话是**配置里写死的**，
+        而深链里的机器人每条消息都可能不同（这条是 ``potdot_eco_bot``，别的品牌又是
+        另一个），所以机器人名与 payload 只能从消息里现取。
+
+        🔴 宁可漏点也不能点错：下面每一道闸门不通过都走 :class:`_StepSkipped`
+        （不算失败），只有"该发却没发出去"和"限流等到超时"才算失败：
+
+        1. 消息里没有匹配的深链（默认正则只认 payload 含 ``-Renew_`` 的）；
+        2. 链接带遮罩字符、或 payload 不含 ``-Renew_``（用户自定义正则也绕不过这两条）；
+        3. 这一步指定的执行账号不是当前账号（**谁设置谁点**）；
+        4. 这个 payload 已经点过（账号级记忆，``code_ttl`` 内只点一次）；
+        5. 限流：超过 ``max_per_minute`` 就排队等下一个额度窗口，等超过 30 秒放弃
+           —— 这条**算失败**（会通知用户），因为它是"本来该抢却没抢到"。
+        """
+        pattern = task.link_patterns[index - 1]
+        if pattern is None:  # pragma: no cover - 配置校验已经拦住了
+            raise ValueError("open_link 步骤缺少深链正则")
+
+        # 先看当前消息、再退回最初那条：链上前面若有「等待回复」，深链通常就在机器人
+        # 刚回的那条里；而"群里直接贴深链"是最常见的用法，那就是最初那条。
+        found, token = self._find_link(pattern, current, source)
+        if found is None:
+            raise _StepSkipped(
+                "消息里没有可点开的续期深链"
+                "（默认只认 t.me/机器人?start=…-Renew_…，-Register_ 那种不点）"
+            )
+        bot = found.group(1)
+        payload = found.group(2)
+
+        if _OPEN_LINK_MARKER not in payload:
+            raise _StepSkipped(
+                f"payload 里没有 {_OPEN_LINK_MARKER}，按设置不点（只点续期深链）"
+            )
+        if _MASKED_PAYLOAD.search(token):
+            raise _StepSkipped(
+                f"链接尾部带遮罩字符（{REG_GRAB_MASK_CHARS}），这条码多半已经被人用掉，不点"
+            )
+
+        wanted = (step.account or "").strip()
+        mine = (self.account or "").strip()
+        if wanted and wanted != mine:
+            raise _StepSkipped(
+                f"这一步设置由账号「{wanted}」执行，当前账号是「{mine or '未知'}」，跳过"
+                "（那个账号自己的抢注任务要在同样的会话里监听，才会由它来点）"
+            )
+
+        if self._link_clicked(payload, task):
+            raise _StepSkipped(
+                f"payload 已经点过了（{task.config.code_ttl:.0f} 秒内只点一次）"
+            )
+
+        waited = await self._open_link_slot(task, index, step)
+        if waited > 0:
+            self.alog.info(
+                "点开深链：等到了下一个额度窗口，继续点",
+                task=task.label,
+                step=index,
+                waited_s=round(waited, 1),
+            )
+
+        chat = f"@{bot}"
+        text = f"/start {payload}"
+
+        # 解析成数字 id 只是为了给**后面**的步骤（wait_reply）用；发送本身照原样用
+        # ``@username``（与人工点开这条深链最接近的写法）。解析不到也不拦着发送。
+        resolved = await self._resolve_chat_id(chat)
+        if resolved is None:
+            self.alog.warning(
+                "无法解析深链机器人，后续步骤可能等不到它的回复",
+                chat=chat,
+                hint="先手动在客户端打开一次这个机器人的会话",
+            )
+
+        async def _do() -> Any:
+            return await self.client.send_message(chat_id=chat, text=text)
+
+        try:
+            sent = await with_flood_retry(
+                _do,
+                alog=self.alog,
+                action="点开抢注深链",
+                retries=1,
+                max_flood_wait=10.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - 记一笔再往上抛（由链统一记失败）
+            self.stats["links_failed"] += 1
+            self.task_stats[task.id]["links_failed"] += 1
+            self.alog.warning(
+                "点开深链发送失败",
+                task=task.label,
+                step=index,
+                chat=chat,
+                payload=truncate(payload, 80, "…"),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+        # 只有**发出去之后**才记去重：发送失败时留着重试的机会。
+        self._clicked_links[payload] = self._clock()
+        self.stats["links_clicked"] += 1
+        self.task_stats[task.id]["links_clicked"] += 1
+        self.alog.info(
+            "已点开抢注深链（等价于给机器人发 /start）",
+            task=task.label,
+            step=index,
+            bot=chat,
+            payload=truncate(payload, 80, "…"),
+            waited_s=round(waited, 1),
+            message_id=getattr(sent, "id", None),
+        )
+        # 把机器人记进 handler 过滤器：否则它的回执会被 ``filters.chat(...)`` 挡在
+        # 外面，后接的「等待回复」永远等不到。只在**新**机器人时重装一次。
+        # ⚠️ 记的是**不带 @ 的裸用户名**：监听会话在配置层就是这么归一化的
+        # （见 ``parse_chat_ref``），保持一致，别让同一个会话出现两种写法。
+        self._learn_link_chat(bot)
+        # 链目标换成解析好的数字 id（解析不到就退回 @username）：紧跟其后的
+        # 「等待回复」要靠它订阅这个机器人的消息，同 ``_step_send`` 的理由。
+        target = resolved if resolved is not None else chat
+        return f"已给 {chat} 发 /start {truncate(payload, 60, '…')}", target
+
+    @staticmethod
+    def _find_link(
+        pattern: re.Pattern[str], *messages: Any
+    ) -> tuple[Optional[re.Match[str]], str]:
+        """在这些消息里按先后顺序找第一条匹配的深链。
+
+        返回 ``(匹配对象, 链接所在的整段文本)``；都没有则 ``(None, "")``。
+
+        ⚠️ 第二个返回值是**匹配起点到下一个空白**之间的那一整段，不是捕获组：遮罩
+        字符（``░▒▓█``）不在 URL 字符集里，用户自定义的正则很可能一到遮罩处就停下，
+        只看捕获组会得出"没被遮罩"的错误结论。
+        """
+        for message in messages:
+            if message is None:
+                continue
+            text = message_text(message) or ""
+            found = pattern.search(text)
+            if found:
+                token = re.split(r"\s", text[found.start() :], maxsplit=1)[0]
+                return found, token
+        return None, ""
+
+    def _learn_link_chat(self, chat: str) -> None:
+        """把深链机器人加进"要收它消息"的集合，并在需要时重装 handler。
+
+        ⚠️ 这一步不是锦上添花：``_install_handlers`` 用 ``filters.chat(watched)``
+        只放行关心的会话，深链里的机器人**配置里写不出来**，不补进去的话
+        「等待回复」收不到回执，用户看到的是"点了但没下文"。
+        只在发现新机器人时重装（add/remove 之间的极短窗口理论上可能漏一条消息，
+        代价远小于"回执永远收不到"）。
+        """
+        if chat in self._link_chats:
+            return
+        self._link_chats.add(chat)
+        if self.enabled:
+            self._install_handlers()
+
+    def _link_clicked(self, payload: str, task: PreparedTask) -> bool:
+        """这个 payload 是不是已经点过了？``code_ttl`` 内算点过，之后可以重试。"""
+        now = self._clock()
+        ttl = task.config.code_ttl
+        if ttl > 0:
+            cutoff = now - ttl
+            for key in [k for k, seen in self._clicked_links.items() if seen < cutoff]:
+                del self._clicked_links[key]
+        return payload in self._clicked_links
+
+    async def _open_link_slot(
+        self, task: PreparedTask, index: int, step: RegGrabStep
+    ) -> float:
+        """取一个发送额度；必要时排队等下一个窗口。返回实际等待秒数。
+
+        ``max_per_minute=0`` = 不限。超限时**排队**而不是直接丢掉 —— 抢注的窗口很窄，
+        差几秒就是别人的了；但等待超过 :data:`_OPEN_LINK_MAX_WAIT` 就放弃并抛
+        :class:`OpenLinkThrottled`（走失败路径，会给用户推通知）。
+        """
+        limit = step.max_per_minute
+        if limit <= 0:
+            return 0.0
+
+        key = f"{task.id}:{index}"
+        waited = 0.0
+        while True:
+            now = self._clock()
+            hits = [
+                seen
+                for seen in self._link_hits.get(key, [])
+                if now - seen < _OPEN_LINK_WINDOW
+            ]
+            self._link_hits[key] = hits
+            if len(hits) < limit:
+                # 额度记在**发送之前**：限流要保护的是"这个账号发起请求的频率"，
+                # 发失败也算发过（失败本身有另外的计数与通知）。
+                hits.append(now)
+                return waited
+            wait_s = _OPEN_LINK_WINDOW - (now - min(hits))
+            if waited + wait_s > _OPEN_LINK_MAX_WAIT:
+                self.stats["links_throttled"] += 1
+                self.task_stats[task.id]["links_throttled"] += 1
+                self.alog.warning(
+                    "点开深链触发限流，等待超过上限已放弃",
+                    task=task.label,
+                    step=index,
+                    limit=limit,
+                    window_s=_OPEN_LINK_WINDOW,
+                    need_wait_s=round(wait_s, 1),
+                    waited_s=round(waited, 1),
+                    max_wait_s=_OPEN_LINK_MAX_WAIT,
+                )
+                raise OpenLinkThrottled(
+                    f"点开深链限流：每分钟最多 {limit} 次，还要等 {wait_s:.0f} 秒"
+                    f"（上限 {_OPEN_LINK_MAX_WAIT:.0f} 秒），已放弃"
+                )
+            self.alog.info(
+                "点开深链触发限流，排队等下一个额度窗口",
+                task=task.label,
+                step=index,
+                limit=limit,
+                wait_s=round(wait_s, 1),
+            )
+            await self._sleep(wait_s)
+            waited += wait_s
+
+    def _clock(self) -> float:
+        """单调时钟。抽成方法是为了测试能注入可控时间源（限流窗口不必真等 60 秒）。"""
+        return time.monotonic()
+
+    async def _sleep(self, seconds: float) -> None:
+        """等待。抽成方法是为了测试能跳过真实等待（排队最多 30 秒）。"""
+        await asyncio.sleep(seconds)
+
     async def _step_wait_reply(
         self,
         task: PreparedTask,
@@ -1214,21 +1579,29 @@ class RegGrabHunter:
         return None
 
     async def _resolve_chat_id(self, ref: Any) -> Optional[int]:
-        """把会话引用解析成数字 id；``@username`` 的结果会缓存下来。"""
+        """把会话引用解析成数字 id；``@username`` 的结果会缓存下来。
+
+        🔴 查表前要**归一化**（小写、去掉前导 ``@``），与
+        :func:`~tg_assistant.matching.parse_chat_ref` 同一口径。配置里写的
+        ``@testbot`` 早就被校验器归一化成 ``testbot`` 了，但**运行时拼出来**的引用
+        （比如 ``open_link`` 从消息里抠出的 ``"@potdot_eco_bot"``）没有经过那一层：
+        不在这里归一化的话 ``get_chat("@potdot_eco_bot")`` 查不到 peer，后接的
+        ``wait_reply`` 必然解析失败 —— 表现就是"链接点了，但等不到回复"。
+        """
         if isinstance(ref, int):
             return ref
         if ref is None:
             return None
-        key = str(ref)
+        key = str(ref).strip().lstrip("@").lower()
         cached = self._chat_ids.get(key)
         if cached is not None:
             return cached
         try:
-            chat = await self.client.get_chat(ref)
+            chat = await self.client.get_chat(key)
         except Exception as exc:  # noqa: BLE001 - 解析失败只影响这一条链
             self.alog.warning(
                 "解析会话失败",
-                chat=key,
+                chat=str(ref),
                 error=f"{type(exc).__name__}: {exc}",
             )
             return None
@@ -1255,17 +1628,44 @@ class RegGrabHunter:
 
     @staticmethod
     def _summarize(outcome: ChainOutcome) -> str:
+        """整条链的一句话汇总（**不含**每步的说明，那些由 :meth:`_detail_with_steps` 拼）。"""
         total = len(outcome.steps)
         ok = sum(1 for step in outcome.steps if step.result is StepResult.OK)
         failed = [step for step in outcome.steps if step.result is StepResult.FAILED]
+        skipped = [step for step in outcome.steps if step.result is StepResult.SKIPPED]
         if outcome.result is ChainResult.SUCCESS:
+            if skipped:
+                # "全部成功"在这里是假话：有步骤被跳过了，必须说出来。
+                return f"{ok}/{total} 步成功，{len(skipped)} 步跳过"
             return f"全部 {total} 步执行成功"
         if outcome.result is ChainResult.PARTIAL:
             return f"{ok}/{total} 步成功，{len(failed)} 步失败（已按配置忽略）"
+        if outcome.result is ChainResult.SKIPPED and skipped and not failed:
+            # 具体原因在下面按步拼接，这里就不重复写了（同一条原因说两遍反而难读）。
+            return f"{len(skipped)}/{total} 步跳过"
         if failed:
             first = failed[0]
             return f"第 {first.index} 步「{first.label}」失败：{truncate(first.detail, 200, '…')}"
         return "没有可执行的步骤"
+
+    @classmethod
+    def _detail_with_steps(cls, outcome: ChainOutcome) -> str:
+        """链级说明 = 一句话汇总 + 每一步自己的说明。
+
+        为什么必须把每一步的说明带出来：用户能在**面板和通知**里看到的只有
+        ``ChainOutcome.detail``。只写"全部 1 步执行成功"的话，他看不到究竟点了哪条
+        链接、发的是什么、哪一步被跳过了 —— 而抢注最需要确认的恰恰是这个
+        （等出事再去翻日志就晚了）。
+        """
+        summary = cls._summarize(outcome)
+        parts = [
+            f"{step.index}.{step.label}：{step.detail}"
+            for step in outcome.steps
+            if step.detail
+        ]
+        if not parts:
+            return summary
+        return f"{summary}；" + "；".join(parts)
 
     def _record(self, task: PreparedTask, outcome: ChainOutcome) -> None:
         key = {

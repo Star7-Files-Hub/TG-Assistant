@@ -851,7 +851,11 @@ FEATURE_PAGES = {
     "cloudflare_ip.html": "cloudflare_ip",
     "notify.html": "notify",
     "red_packet.html": "red_packet",
-    "reg_grab.html": "reg_grab",
+    # ⚠️ reg_grab.html / rules.html **故意**不在这里：这两页已经没有「当前账号」这个
+    # 概念了 —— 它们按任务维度渲染**所有**账号（同一张卡片带「监听账号」勾选），
+    # 页面上根本没有账号下拉框，也就无所谓"默认选中哪个账号"。
+    # 「每个账号都得出现」这条约束由 test_reg_grab_page_is_a_task_list_with_an_editor_modal
+    # 里的 renderAccountGroup 断言接手。
 }
 
 
@@ -1183,7 +1187,7 @@ def test_cloudflare_notify_toggle_roundtrips_through_the_api(account, client) ->
 
 
 # --------------------------------------------------------------------------- #
-# 抢注页：多任务（任务卡片列表 + 弹窗编辑）
+# 抢注页：任务维度（一条任务一张卡片，账号在弹窗里勾）
 # --------------------------------------------------------------------------- #
 def _reg_grab_html() -> str:
     web_dir = Path(__file__).resolve().parents[1] / "tg_assistant" / "web"
@@ -1191,7 +1195,11 @@ def _reg_grab_html() -> str:
 
 
 def test_reg_grab_page_is_a_task_list_with_an_editor_modal() -> None:
-    """抢注页要跟抢红包一样是「任务卡片列表 + 弹窗编辑」，不再是整页单任务大表单。"""
+    """抢注页要跟规则页一样是「任务卡片列表 + 弹窗编辑」，而且按**任务**为维度。
+
+    页面顶部原来有个「先选账号」的下拉框：不选账号什么都看不到，而一条任务往往
+    要写给好几个账号。规则页走的就是这条路（转置 + 弹窗勾账号），抢注页对齐它。
+    """
     html = _reg_grab_html()
 
     for dom in (
@@ -1200,8 +1208,11 @@ def test_reg_grab_page_is_a_task_list_with_an_editor_modal() -> None:
         'id="rg-task-id"',
         'id="rg-task-name"',
         'id="rg-task-enabled"',
-        # 并发上限是**账号级**的，留在列表工具栏上，不跟着任务进弹窗
-        'id="rg-max-concurrency"',
+        # 账号在弹窗里勾（不勾 = 全部账号），跟规则页同一套交互
+        'id="rg-accounts"',
+        'id="rg-accounts-summary"',
+        # 账号级设置（抢注总开关 / 并发上限 / 试发通知）收在折叠区里
+        'id="rg-account-settings"',
     ):
         assert dom in html, f"抢注页缺少 {dom}"
     assert "新建任务" in html
@@ -1216,7 +1227,9 @@ def test_reg_grab_page_is_a_task_list_with_an_editor_modal() -> None:
     ):
         assert dom in html, f"弹窗里缺少 {dom}"
 
-    # 单任务时代的「整页保存」必须退场，否则用户以为还有第二个保存入口
+    # 「先选账号」那套必须退场：页面顶部不再有账号下拉，也不再有「整页保存」
+    assert 'id="account-selector"' not in html, "抢注页还留着「先选账号」的下拉框"
+    assert "function switchAccount" not in html, "按账号切换的老逻辑还在"
     assert "function saveRegGrab" not in html, "单任务时代的整页保存函数还在"
 
     for func in (
@@ -1225,16 +1238,62 @@ def test_reg_grab_page_is_a_task_list_with_an_editor_modal() -> None:
         "openTaskModal",
         "collectTask",
         "saveTask",
-        "toggleTask",
+        "setTaskEnabled",
+        "setTaskOwner",
         "deleteTask",
         "saveConcurrency",
         "toggleRegGrab",
     ):
         assert f"function {func}(" in html, f"抢注页缺少 {func}()"
 
+    # 任务维度 = 把「账号 → 任务」**转置**成「任务 → 账号」。不做这一步同一条任务会
+    # 在页面上出现 N 次（规则页就是这么改的：用户原话「以任务为维度，而不是以账号」）。
+    collect = _js_function_body(html, "collectTasks")
+    assert "entry.owners.push(acc.name)" in collect, "collectTasks() 没有把任务合并成一条"
+    assert "byId" in collect, "collectTasks() 没有按 id 合并"
+
+    # 账号级开关不能因为"页面没有账号下拉框"就没地方改：每个账号一张小卡片。
+    group = _js_function_body(html, "renderAccountGroup")
+    for marker in (
+        'data-role="rg-account-enabled"',
+        'data-role="rg-concurrency"',
+        'data-action="test-notify"',
+    ):
+        assert marker in group, f"账号设置里缺少 {marker}"
+
+
+def test_reg_grab_page_uses_the_task_dimension_endpoints() -> None:
+    """四个任务维度端点都得真的被调用 —— 少一个就会出现「界面上改了、磁盘没变」。"""
+    html = _reg_grab_html()
+
+    assert "'/api/reg_grab/overview'" in html, "没有用总览接口"
+    assert "'/api/reg_grab/tasks'" in html, "没有用任务增删接口"
+    # 路径里的 id 要过 encodeURIComponent：id 是用户自由输入的，空格 / # / / 都能把 URL 弄坏
+    assert "/api/reg_grab/tasks/${encodeURIComponent(" in html
+
+    save = _js_function_body(html, "saveTask")
+    assert "saveNewTask(task)" in save, "新建没有走 POST"
+    assert "saveEditedTask(task, adds, removes)" in save, "编辑没有落成「改 + 增 + 删」的差集"
+    for name in ("adds", "removes"):
+        assert name in save, f"编辑保存没算 {name} 差集"
+
+    # 编辑 = PUT（所有现有副本）+ POST（新勾的账号）+ DELETE（取消勾选的账号）。
+    # 只 PUT 的话，新勾的账号里根本没有这条任务，服务端算 missing：界面显示"勾上了"，
+    # 磁盘上什么也没发生 —— 比锁着更糟。
+    edited = _js_function_body(html, "saveEditedTask")
+    assert "putJson(`/api/reg_grab/tasks/${encodeURIComponent(id)}`" in edited
+    assert "postJson('/api/reg_grab/tasks'" in edited
+    assert "`/api/reg_grab/tasks/${encodeURIComponent(id)}?accounts=${encodeURIComponent(name)}`" in edited
+
+    # 启停 / 删除是**任务级**的：不带 accounts = 改所有监听账号里的这一份
+    enabled = _js_function_body(html, "setTaskEnabled")
+    assert "putJson(`/api/reg_grab/tasks/${encodeURIComponent(taskId)}`" in enabled
+    removed = _js_function_body(html, "deleteTask")
+    assert "deleteJson(`/api/reg_grab/tasks/${encodeURIComponent(taskId)}`" in removed
+
 
 def test_reg_grab_task_card_actions_are_delegated() -> None:
-    """卡片上的编辑 / 删除 / 启停**不许**把 ``task.id`` 拼进内联 handler。
+    """卡片上的编辑 / 删除 / 启停 / 监听账号**不许**把 ``task.id`` 拼进内联 handler。
 
     ``RegGrabTask.id`` 是用户自由输入的，只要含一个单引号就能把
     ``onclick="openTaskModal('...')"`` 截断 —— 而 HTML 转义救不了内联 handler：
@@ -1246,16 +1305,33 @@ def test_reg_grab_task_card_actions_are_delegated() -> None:
 
     assert 'data-action="edit"' in body
     assert 'data-action="delete"' in body
-    assert 'data-action="toggle"' in body
+    assert 'data-role="rg-task-enabled"' in body
     assert 'data-task-id="${attr(task.id)}"' in body
     assert "onclick=" not in body, "卡片又把 task.id 拼进内联 handler 了"
     assert "onchange=" not in body, "卡片又把 task.id 拼进内联 handler 了"
 
-    # 委托本身要接线：点按钮 / 拨开关都得有人接
-    init = _js_function_body(html, "bindTaskListActions")
+    # 「监听账号」那一排勾选框：账号名在 value 上，task.id 在 data-* 上
+    owners = _js_function_body(html, "taskOwnersRow")
+    assert 'data-role="rg-owner"' in owners
+    assert 'data-task-id="${attr(entry.id)}"' in owners
+    assert "onclick=" not in owners, "监听账号又把 task.id 拼进内联 handler 了"
+
+    # 委托本身要接线：点按钮 / 拨开关 / 勾账号 / 改并发都得有人接
+    init = _js_function_body(html, "bindListActions")
     assert "addEventListener('click'" in init
     assert "addEventListener('change'" in init
-    assert "dataset.taskId" in init
+    click = _js_function_body(html, "onListClick")
+    assert "dataset.taskId" in click
+    change = _js_function_body(html, "onListChange")
+    assert "input.dataset.role === 'rg-owner'" in change
+    assert "card.dataset.taskId" in change
+
+    # 勾上 = POST 写进那个账号；取消 = DELETE 从那个账号移除。两者不能混：
+    # PUT 对"账号里没有这条任务"算 missing，勾了也不会有任何变化。
+    owner = _js_function_body(html, "setTaskOwner")
+    assert "postJson('/api/reg_grab/tasks'" in owner, "勾选没有走 POST"
+    assert "deleteJson(" in owner, "取消勾选没有走 DELETE"
+    assert "?accounts=" in owner
 
 
 def test_reg_grab_tag_input_ids_match_the_dom() -> None:
@@ -1286,23 +1362,36 @@ def test_reg_grab_tag_input_ids_match_the_dom() -> None:
     assert "${field}-field" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
     assert "${field}-list" not in html, "又拿字段名直接拼 id 了（下划线 ≠ 连字符）"
 
+    # 中文输入法选字那一下也会派发 Enter —— 不挡住就会把没上屏的拼音当标签加进去。
+    tag_input = _js_function_body(html, "initTagInput")
+    assert "e.isComposing" in tag_input, "标签输入没挡输入法的回车"
 
-def test_reg_grab_page_saves_the_whole_task_list() -> None:
-    """保存要把**整份** tasks 数组 PUT 回去（跟抢红包一致），账号级字段一起带上。"""
+
+def test_reg_grab_task_payload_drops_the_readonly_fields() -> None:
+    """GET 多塞的 ``ready`` / ``problem`` / ``in_window`` 必须在提交前丢掉。
+
+    模型是 ``extra="forbid"`` 的，原样 PUT 回去就是 422（"保存失败"，而且看不出原因）。
+    比对"各账号里的副本是不是分叉"时也要先摘掉它们 —— 那三个是服务端**现算**的，
+    不摘的话形状相同的两份也会被判成分叉。
+    """
     html = _reg_grab_html()
 
-    save = _js_function_body(html, "saveConfig")
-    assert "tasks: tasks.map(cleanTask)" in save
-    assert "max_concurrency" in save
-    assert "/reg_grab`" in save or "/reg_grab" in save
+    strip = _js_function_body(html, "stripReadonly")
+    assert "{ready, problem, in_window, ...rest}" in strip
 
-    clean = _js_function_body(html, "cleanTask")
-    # GET 多塞的三个只读字段必须在提交前丢掉：模型是 extra="forbid" 的
-    assert "{ready, problem, in_window, ...rest}" in clean
+    collect = _js_function_body(html, "collectTasks")
+    assert "stripReadonly(" in collect, "判断副本是否分叉时没摘只读字段"
 
-    collect = _js_function_body(html, "collectTask")
+    # 提交的字段一个都不能少（少一个 = 静默把用户的配置改回默认值）
+    task = _js_function_body(html, "collectTask")
     for key in ("id:", "name:", "enabled:", "chats:", "detect:", "steps:", "window:"):
-        assert key in collect, f"collectTask() 没提交 {key}"
+        assert key in task, f"collectTask() 没提交 {key}"
+
+    # 账号级并发上限走账号自己的配置端点，必须**带上该账号的任务列表**：
+    # 那个端点不带 tasks 就是"把任务列表清空"。
+    concurrency = _js_function_body(html, "saveConcurrency")
+    assert "tasks: (acc.tasks || []).map(stripReadonly)" in concurrency
+    assert "/api/config/" in concurrency
 
 
 def test_red_packet_page_edit_age_is_filled_in_minutes_stored_in_seconds() -> None:
@@ -1416,147 +1505,6 @@ def test_rules_global_state_warns_when_the_name_list_could_not_be_read() -> None
     load = _js_function_body(html, "loadAll")
     assert "data.global_excludes" in load, "总览响应里那一份没被读进来"
     assert "load_errors" in load, "失败次数没有传到状态上"
-
-
-def test_rules_page_collapses_long_match_lists() -> None:
-    """匹配条件 ≥ 3 条时折叠成 ``<details>``，而不是把卡片铺满一屏。
-
-    用户原话：「正则规则不用全部展示，点击编辑或加个倒三角打开」。
-    线上那条规则配了 **20 条**正则（2026-09-29 取证），全铺出来一张卡片就是一屏，
-    真正有用的信息（来源 / 目标 / 模式）全被挤到看不见的地方。
-
-    阈值定在 3：1～2 条时不折叠 —— 为了两条条件多一次点击只会更碍事。
-    """
-    html = _rules_html()
-
-    assert "PATTERN_COLLAPSE_THRESHOLD = 3" in html
-    patterns = _js_function_body(html, "renderRulePatterns")
-    # 折叠的判定必须真的用上阈值（< 阈值就照原样铺开）
-    assert "patterns.length < PATTERN_COLLAPSE_THRESHOLD" in patterns
-    assert '<details class="rule-patterns-details">' in patterns
-    # 收起时给预览 + 条数：只留一个数字的话，用户判断不出这条规则到底匹配什么
-    assert "rule-patterns-count" in patterns
-    assert "rule-pattern-preview" in patterns
-
-    # 卡片必须走这个函数：只定义不调用的话，长规则照样全铺出来
-    card = _js_function_body(html, "renderRuleCard")
-    assert "renderRulePatterns(match, patterns)" in card
-
-
-
-# --------------------------------------------------------------------------- #
-# 转发规则页：以**任务**为维度展示（同一条规则不重复出现）
-# --------------------------------------------------------------------------- #
-def test_rules_page_renders_one_card_per_rule_not_per_account() -> None:
-    """同一条规则在 N 个账号里各存一份，页面上只能出现**一次**。
-
-    🔴 用户原话：「展示以及任务是以任务为维度，而不是以账号，同样的规则不做二次
-    展现，一条主规则，选择监听账号即可」。规则当初就是扇出写出去的（``POST
-    /api/rules`` 不带 accounts 写全部账号），按账号渲染会让同一条规则重复出现 N 次：
-    用户数不清自己有几条任务，也不知道改一处会不会影响别处。
-
-    所以渲染入口必须先做一次「账号 → 规则」的**转置**，再按 rule.id 出卡片。
-    """
-    html = _rules_html()
-
-    render = _js_function_body(html, "renderRules")
-    assert "collectRules()" in render, "规则列表没有按 rule.id 合并"
-    assert "entries.map(renderRuleCard)" in render, "主卡片不是按规则维度渲染的"
-    assert "accounts.map(renderAccountGroup)" not in render, (
-        "renderRules 又回到按账号渲染了 —— 同一条规则会重复出现"
-    )
-    assert "renderAccountSettings()" in render, "账号级设置没有单独的落点"
-    # 有账号但一条规则都没有时，账号级设置必须照样渲染：老代码在这一步整天提前
-    # return，排除名单连入口都没有 —— 而"先把我不要的群填上"正是新环境的第一步。
-    assert "return" not in render[render.index("collectRules()"):], (
-        "规则为空时又提前 return 了，账号级设置会跟着一起不渲染"
-    )
-
-    collect = _js_function_body(html, "collectRules")
-    assert "byId.get(rule.id)" in collect, "没有按 rule.id 去重"
-    assert "entry.owners.push(acc.name)" in collect, "没有聚出「这条规则落在哪些账号」"
-    # 各账号里那份内容可能分叉（手改过某个账号的 config.json / 走过单账号接口）。
-    # 分叉必须能被卡片说出来，否则显示一份、别的账号按另一份跑。
-    assert "entry.divergent" in collect
-
-    card = _js_function_body(html, "renderRuleCard")
-    assert "entry.owners" in card
-    assert "data-rule-id" in card
-
-    # 账号卡片里**不许**再有规则卡片：规则已经搬到主视图了
-    group = _js_function_body(html, "renderAccountGroup")
-    assert "renderRuleCard" not in group, "账号卡片里还在渲染规则 —— 同一条规则会重复出现"
-
-
-def test_rules_page_card_can_move_a_rule_between_accounts() -> None:
-    """卡片上的「监听账号」勾选 = 把这条规则写进 / 移出某个账号，其余账号不受影响。
-
-    两个端点绝不能弄混：
-      * 勾上要用 ``POST /api/rules``（只写缺这条规则的账号）。用 PUT 的话，账号里
-        没有这条规则时它只算 ``missing`` —— **不写也不报错**，界面看起来勾上了、
-        其实什么都没发生。
-      * 取消要用 ``DELETE /api/rules/{id}?accounts=<name>``。不带 accounts 的
-        DELETE 是"从所有账号删掉"（那是删除键的语义），混用会把其它账号一起干掉。
-    """
-    html = _rules_html()
-    set_owner = _js_function_body(html, "setRuleOwner")
-
-    assert "'/api/rules'" in set_owner and "method: 'POST'" in set_owner, (
-        "勾上监听账号没有走 POST /api/rules（用 PUT 时该账号没有这条规则就会静默不写）"
-    )
-    assert "?accounts=" in set_owner and "method: 'DELETE'" in set_owner, (
-        "取消监听账号没有走 DELETE ?accounts=（不带 accounts 会把其它账号一起删了）"
-    )
-    # 取消最后一个监听账号 = 这条规则没有任何账号在跑（等于删除），必须先问
-    assert "confirm(" in set_owner and "最后一个监听账号" in set_owner
-    # 成功失败都要重拉：界面不能停在"看起来成功了"的状态
-    assert set_owner.count("await loadAll()") >= 2
-
-    # 账号名从 checkbox 的 value 上取 —— 主卡片不在任何 [data-account] 里面，
-    # 靠 closest('[data-account]') 取账号会拿到 null（那样"勾了没反应"）。
-    change = _js_function_body(html, "onRuleListChange")
-    assert "rule-owner" in change and "input.value" in change
-
-    row = _js_function_body(html, "ruleOwnersRow")
-    assert 'data-role="rule-owner"' in row
-    assert 'value="${escapeHtml(acc.name)}"' in row
-    assert "监听账号" in row
-    assert "checked" in row, "卡片刻不出哪些账号在监听"
-
-
-def test_rules_page_account_scoped_settings_stay_out_of_the_rule_cards() -> None:
-    """账号级的东西（转发总开关 / 排除名单）单独一区，别混进规则卡片。
-
-    规则改成按 rule.id 合并之后，这些设置不再属于任何一条规则。混在卡片里的话，
-    用户又会以为"这个排除名单只对当前这条规则生效"—— 而"账号级"正是它最容易被
-    误解的地方（弹窗里那份才是规则级的）。
-
-    ⚠️ 「已使用注册码拦截」**不**在这一节里了：它已经全局化（见
-    ``test_rules_page_has_a_global_used_codes_block``），所以这里**断言它不在**
-    账号卡片里 —— 否则用户会看到"每个账号一套已用码设置"这种已经不成立的界面。
-    """
-    html = _rules_html()
-
-    settings = _js_function_body(html, "renderAccountSettings")
-    assert "rules-account-settings" in settings
-    assert "accounts.map(renderAccountGroup)" in settings
-    assert "各账号单独设置" in settings, "没有标题，用户不知道这一节是干什么的"
-    # 每次 loadAll 都会重建 innerHTML：展开状态必须带过去，
-    # 否则用户改一次名单（保存后会重拉）这一节就自己合上了。
-    assert "document.querySelector('.rules-account-settings')" in settings
-    assert "open" in settings
-
-    group = _js_function_body(html, "renderAccountGroup")
-    for needle in ("forward-enabled", "excludeChatsRow(acc)"):
-        assert needle in group, f"账号卡片里少了 {needle}"
-    assert "usedCodesRow(acc)" not in group, (
-        "已用码拦截已全局化，不该再出现在账号卡片里（会让人以为每号一套）"
-    )
-
-    # 这一节是 #rules-list 的子元素 ⇒ 已有的委托（click / change / keydown）照旧覆盖它
-    init = _js_function_body(html, "init")
-    assert "getElementById('rules-list')" in init
-    assert "addEventListener('change', onRuleListChange)" in init
 
 
 def test_rules_page_has_a_global_used_codes_block() -> None:

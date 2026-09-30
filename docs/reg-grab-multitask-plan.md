@@ -90,22 +90,75 @@ enabled 不看；返回「配好了没有」= 有 detect.code_pattern 且至少�
 
 ## 三、API + 页面 — teammate「web」
 
-### API（api.py，仅 reg_grab 段落 ~892–1000）
-对齐 red_packet 三个端点：
-- `GET /config/{name}/reg_grab`：返回 `config.model_dump()`；给每个 task 附 `ready`/`problem`/`in_window`；顶层附 `server_now`（`datetime.now().strftime("%H:%M")`）。
-- `PUT /config/{name}/reg_grab`：`_REG_GRAB_TASK_READONLY = ("ready","problem","in_window")` 从每个 task 里剔除后再 `RegGrabConfig.model_validate`。顶层 `server_now` 也要剔除。
-- `PUT /config/{name}/reg_grab/enabled`：总开关。开启时的校验改为**至少有一条 ready 的任务**（对齐 red_packet enabled 的宽松策略；不要再看扁平 detect/steps）。
-- `POST .../reg_grab/test_notify` 保持不动（账号级）。
+> ⚠️ **本节有一处方向性调整，以本节为准**：页面最后**不是**「照抄 red_packet.html
+> （顶部选账号 + 该账号的任务列表）」，而是**对齐 rules.html 的「任务维度」** ——
+> 页面一次渲染**所有**账号，「这条任务跑在哪些账号上」由卡片里的「监听账号」勾选表达。
+> 原因：一条抢注任务经常要扇出给多个账号，按账号渲染会让同一条任务在页面上出现 N 次，
+> 用户数不清自己有几条。规则页就是这么改的，原话：
+> 「展示以及任务是以任务为维度，而不是以账号，同样的规则不做二次展现」。
+
+### API（api.py，仅 reg_grab 段：约 1240–1415 与 1420–1660）
+
+账号维度（原有，保留）：
+- `GET/PUT /config/{name}/reg_grab`：`_REG_GRAB_TASK_READONLY = ("ready","problem","in_window")`
+  在 `RegGrabConfig.model_validate` 之前从每个 task 里剔除，顶层 `server_now` 同样剔除；
+  `GET` 给每条任务附 `ready`/`problem`/`in_window`、顶层附 `server_now`。
+- `PUT /config/{name}/reg_grab/enabled`：总开关，开启时要求**至少有一条 ready 的任务**
+  （宽松策略，对齐 red_packet；不再看扁平 detect/steps）。
+- `POST /config/{name}/reg_grab/test_notify`、`POST /reg_grab/test_extract`：保持不动。
+
+任务维度（新增 4 个，对齐 `/api/rules*`）：
+- `GET  /api/reg_grab/overview` → `{accounts: [{name, username, display_name, enabled,
+  running, session_exists, reg_grab_enabled, max_concurrency, tasks: [...]}], server_now}`。
+  **一次**拿全所有账号，页面不再逐账号 N+1（否则账号 A 落盘、B 还没落盘时会把
+  "写了一半的状态"当快照渲染出来）。
+- `POST /api/reg_grab/tasks` body `{task, accounts}` → `{saved, conflicts, task}`。
+  `accounts` 缺省/空 = 扇出**全部**账号；同 id 已存在的账号**跳过**并计入 `conflicts`
+  （全冲突才 409 —— 否则「发给全部账号」在某个号手工加过时就完全用不了了）；
+  一个账号都没有 400；任务本身非法 400（"任务校验失败"）。
+- `PUT  /api/reg_grab/tasks/{task_id}` body `{task}`（裸 body 也认）→ `{updated, missing}`。
+  不带 `accounts` = 改**所有**拥有者里的那一份（发 N 个 per-account PUT 会在第 3 个失败时
+  留下"一半账号改了、一半没改"，用户还看到报错）；改成别的账号已占用的 id ⇒ 409；
+  哪儿都没有这条任务 ⇒ 404。
+- `DELETE /api/reg_grab/tasks/{task_id}?accounts=`（逗号分隔）→ `{removed}`。
+  带上 = **只从这些账号**移除（卡片上取消勾选）；不带 = 从**所有**账号删掉（卡片删除键）；
+  哪儿都没有 ⇒ 404，不假装成功。
+- id 留空由服务端生成（`RegGrabConfig._assign_ids` + `_auto_task_id`）：优先取名称里的
+  ASCII 片段，纯中文名回落 `task-xxxxxxxx`，同一次保存内保证不撞号。
 
 ### 页面（reg_grab.html）
-照抄 red_packet.html 的任务卡片列表 + 弹窗编辑交互：
-- 顶部：账号选择 + 总开关 + 并发上限（账号级）+「新增任务」按钮 + 任务卡片列表 `#rg-task-list`。
-- 弹窗：把现有的「监听会话 / 识别正则 / 步骤链 / 时段 / 延迟&jitter&code_ttl&notify&include_edited」表单搬进**单任务弹窗**，多出 `id`/`name`/`enabled`。
-- `loadTasks/renderTasks/renderTaskCard/openTaskModal/collectTask/saveTask/toggleTask/deleteTask/saveConcurrency/toggleRegGrab` 逐个对齐 red_packet.html 的同名函数。
-- 标签输入沿用 rules.html 的经验：**state 键用下划线字段名，DOM id 用连字符**，用 `tagDomId` 桥接（避免回车加不进）。
-- 步骤链编辑器保留现有实现，作为弹窗内的一个区块。
+- 顶部**没有**账号下拉（`switchAccount()` 已删），只有「刷新」+「新建任务」；
+  `collectTasks()` 把「账号 → 任务」**转置**成「任务 → 账号」，同一条任务只渲染一张卡片。
+- 任务卡片：启停（PUT，改所有拥有者）／编辑／删除／**监听账号勾选**
+  （勾 = `POST /api/reg_grab/tasks {accounts:[name]}`；取消 = `DELETE ...?accounts=name`；
+  取消**最后一个**账号会二次确认 —— 那等于把这条任务删掉）。卡片直接复用 rules.html
+  那套 `.rule-*` 样式，不复制一份 CSS。
+- 卡片提示分三类、两种颜色：各账号副本**分叉**（有人手改过单个账号的 config.json）、
+  缺提取正则／缺步骤（红 —— 真错了）；当前不在时段（黄 —— 到点就好，不是配错）。
+- 弹窗：基本信息（id 可留空，编辑时锁住）／**应用账号**（不勾 = 全部账号；编辑时显示
+  勾选**差集**"新增监听 / 取消监听"）／监听会话／识别正则／步骤链／时段／高级设置。
+  编辑保存 = `PUT`（所有现有副本）+ `POST`（新勾的账号）+ `DELETE`（取消勾选的账号）——
+  只 PUT 的话新勾的账号"勾上了但什么都没发生"（服务端算 missing，不写也不报错）。
+- 账号级设置（抢注总开关／并发上限／试发通知）收进「各账号单独设置」折叠节
+  `#rg-account-settings`：并发上限走 `PUT /api/config/{name}/reg_grab`，**必须原样带上
+  该账号的 tasks**（那个端点不带 tasks 就是"清空任务列表"）；`test_notify` 也从弹窗
+  挪到这里（通知走的是账号的机器人，跟哪条任务无关）。
+- 卡片/列表上的按钮、开关、勾选一律 `data-*` + 事件委托，**不往内联 handler 里拼
+  `task.id`**（id 由用户自由输入，含一个单引号就能截断属性；HTML 转义救不了内联 handler）。
+- 标签输入沿用 rules.html 的经验：state 键用下划线字段名、DOM id 用连字符、`tagDomId`
+  桥接；并且挡掉中文输入法**选字**那一下的 `keydown(Enter)`（`e.isComposing || keyCode===229`）。
+- 步骤链编辑器保留原实现（含「点开深链」`open_link` 的 `link_pattern` / `account` /
+  `max_per_minute`）。
 
-页面/运行时测试：`tests/test_web_pages.py`、`tests/test_web_runtime.py`、`tests/test_web_api.py` 里 reg_grab 相关用例改成多任务契约（GET 返回 tasks[].ready、PUT 往返、enabled 校验、页面含任务列表 DOM）。
+测试：`tests/test_web_pages.py` 5 条抢注页用例（52 条静态断言：DOM 契约、**没有**账号下拉、
+4 个端点都被调用、`encodeURIComponent`、data-* 委托、只读字段剥离、并发保存带 tasks、
+输入法回车）；`tests/test_web_api.py` 9 条任务维度接口用例（overview 覆盖每个账号 /
+POST 扇出与 conflicts / 409 / id 生成 / PUT 所有拥有者与裸 body / 404 / DELETE 单账号与全删 /
+只读字段往返 / 400 与空注册表）；`tests/test_web_runtime.py` 一条 feature flags 用例。
+
+⚠️ `FEATURE_PAGES` 里的 `"reg_grab.html": "reg_grab"` 已**移除**（rules.html 同样不在表里）：
+那条守卫查的是「功能页的账号下拉不能无脑选第一个」，而任务维度页面**根本没有**账号下拉，
+这个不变式在它身上已不成立；等价的「每个账号都必须渲染」由 `renderAccountGroup` 的断言接手。
 
 ---
 
@@ -118,3 +171,23 @@ enabled 不看；返回「配好了没有」= 有 detect.code_pattern 且至少�
 - engine：`tg_assistant/reg_grab.py`、`tests/test_reg_grab.py`
 - web：`tg_assistant/web/routers/api.py`（仅 reg_grab 段）、`tg_assistant/web/templates/reg_grab.html`、
   `tests/test_web_api.py`、`tests/test_web_pages.py`、`tests/test_web_runtime.py`
+
+---
+
+## 六、落地状态（本次改造收尾时）
+- **§一 配置层**：已落地并提交。
+- **§二 引擎层**：还差「点开深链」`open_link` 的收尾 —— `tests/test_reg_grab.py::TestOpenLinkStep`
+  这 4 条仍红：
+  - `test_clicks_the_link_found_in_the_message`
+  - `test_fourth_click_within_a_minute_gives_up_and_notifies`
+  - `test_wait_reply_after_open_link_catches_the_bot_answer`
+  - `test_skipped_step_does_not_block_the_rest_of_the_chain`
+
+  断言都是「点完了 `{code}`」发去了 chat id（`-1001234500000`）而不是 `@testbot`，
+  即 open_link 那一步的目标会话解析还没对。所以 engine 侧文件（`config.py` /
+  `reg_grab.py` / `test_reg_grab.py`）**暂时没有提交**。
+- **§三 API + 页面**：已落地。远端 `tests/test_web_api.py tests/test_web_pages.py
+  tests/test_web_runtime.py -q` ⇒ **216 passed / 13 skipped / 0 failed**；
+  全量 `tests/ -q` ⇒ **1328 passed / 13 skipped / 4 failed**（4 条**全部**是上面那批 `TestOpenLinkStep`，
+  与 web 层无关）。
+- 抢注页 / 样式 / 页面与接口测试这一批归 teammate「web-ui-dev」，与 engine 侧那批一起提交。
