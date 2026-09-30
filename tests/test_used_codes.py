@@ -575,10 +575,23 @@ class TestUsedCodesConfig:
     def test_defaults(self):
         guard = ForwardUsedCodes()
         assert guard.enabled is True
-        assert guard.notice_keywords == ["码使用"]
+        # 「已被使用 / 已使用 / 已经使用」是 2026-10-01 补的语序：它们**不含**
+        # 连着的「码使用」，只认后者会整类漏掉使用通知（线上实测漏过一次）。
+        assert guard.notice_keywords == ["码使用", "已被使用", "已使用", "已经使用"]
         assert guard.min_visible == 3
         assert guard.ttl == 3600.0
         assert guard.persist is True
+
+    def test_default_pattern_covers_both_word_orders(self):
+        """默认正则要同时认「使用了 <码>」与「<码> 已被使用」两种语序。"""
+        import re
+
+        pattern = re.compile(ForwardUsedCodes().notice_pattern)
+        assert pattern.groups == 2  # 两条分支各一个捕获组（learn 取第一个非空的）
+        head = pattern.search("使用了 MSKY-30-Register_abcdef")
+        assert head is not None and head.group(1) == "MSKY-30-Register_abcdef"
+        tail = pattern.search("ChaPanda-30-Register_abcdef 注册码已被使用")
+        assert tail is not None and tail.group(2) == "ChaPanda-30-Register_abcdef"
 
     def test_keywords_accept_comma_string(self):
         guard = ForwardUsedCodes(notice_keywords="码使用, 已使用")
@@ -595,3 +608,70 @@ class TestUsedCodesConfig:
     def test_unknown_key_rejected(self):
         with pytest.raises(ValueError):
             ForwardUsedCodes(nonsense=1)
+
+
+class TestTailStyleNoticeShapes:
+    """2026-10-01 线上漏拦：**码在前、使用短语在后**。
+
+    旧配置（``keywords=['码使用']`` + 只认「使用了 <码>」的正则）对这类通知既学不到、
+    也拦不住，于是「注册码已被使用」的通知本身被转发到了目标群。这里锁住**生产默认
+    值**必须能认出来 —— 而且**绝不能**把生码消息误当成通知（那会把新码全废掉）。
+    """
+
+    @staticmethod
+    def production_store() -> UsedCodeStore:
+        """完全按生产默认值配置：不在这里另抄一份关键词/正则。"""
+        defaults = ForwardUsedCodes()
+        item = UsedCodeStore()
+        item.configure(
+            enabled=True,
+            keywords=defaults.notice_keywords,
+            pattern=defaults.notice_pattern,
+            min_visible=defaults.min_visible,
+            ttl=3600.0,
+            persist=False,
+            ignore_pattern=defaults.ignore_token_pattern,
+        )
+        return item
+
+    def test_learns_code_that_precedes_the_phrase(self) -> None:
+        item = self.production_store()
+        text = (
+            "此 ChaPanda-30-Register_Dy7c868cLl \n"
+            "注册码已被使用,是 8806911980 的形状了喔"
+        )
+        assert item.learn(text) == ["chapanda-30-register_dy7c868cll"]
+        # 关键：学完之后**它自己**就会被 is_used 拦下 —— 学习跑在规则循环之前，
+        # 所以这一条修复同时解决了「没学到」和「被转发出去」两个问题。
+        assert item.is_used(text) == "chapanda-30-register_dy7c868cll"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "MSKY-30-Register_f1tAbCd 已使用",
+            "CineTrail-30-Register_gCKHLMOCCM 注册码已经使用",
+        ],
+    )
+    def test_other_tail_phrasings_are_learned(self, text: str) -> None:
+        assert len(self.production_store().learn(text)) == 1
+
+    def test_head_style_notice_still_works(self) -> None:
+        """原有语序不能回归。"""
+        item = self.production_store()
+        assert item.learn(
+            "🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░"
+        ) == ["msky-30-register_f1t"]
+
+    def test_generation_message_is_not_a_notice(self) -> None:
+        """生码消息里也有码，但它没提「已使用」——学进去等于把新码全废掉。"""
+        item = self.production_store()
+        text = (
+            "🎯 ChaPanda3_bot已为您生成了 30天 注册码 10 个\n\n"
+            "t.me/ChaPanda3_bot?start=ChaPanda-30-Register_Dy7c868cLl"
+        )
+        assert item.learn(text) == []
+
+    def test_chatter_without_used_marker_is_ignored(self) -> None:
+        item = self.production_store()
+        assert item.learn("这个插件怎么使用 1panel 啊") == []
+        assert item.learn("Emby 使用教程") == []

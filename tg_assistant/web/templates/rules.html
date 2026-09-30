@@ -1026,8 +1026,8 @@
     // 会被后端判 400，用户看到的是"保存失败"却不知道要填什么。
     const USED_CODES_DEFAULTS = {
         enabled: true,
-        notice_keywords: ['码使用'],
-        notice_pattern: '使用[了]?\\s*([A-Za-z0-9][^\\s，。、]*)',
+        notice_keywords: ['码使用', '已被使用', '已使用', '已经使用'],
+        notice_pattern: '使用[了]?\\s*([A-Za-z0-9][^\\s，。、]*)|([A-Za-z0-9][^\\s，。、]*)[\\s,，、]*(?:注册码)?(?:已经?|已)(?:被)?使用',
         ignore_token_pattern: '^\\d+-\\w+$',
         min_visible: 3,
         ttl: 3600
