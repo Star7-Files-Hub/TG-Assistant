@@ -602,6 +602,139 @@ def test_used_codes_defaults_are_on(client, app, account) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 「已使用注册码」拦截 —— 全局（所有账号共用一份）
+#
+# 用户原话：「将……已使用注册码拦截做成全局，而不是账号级」。
+# 线上三个账号（小白 / SevenStar / 只想睡觉）的这份策略一字不差完全相同，
+# 同一份存了三遍、面板上还得填三遍 —— 下面钉住"写一次、所有账号一致"。
+# --------------------------------------------------------------------------- #
+def test_global_used_codes_round_trip(client, app, account) -> None:
+    """写进全局端点 → 总览接口顶层 ``global_used_codes`` 必须带回来。"""
+    resp = client.put(
+        "/api/forward-used-codes",
+        json={
+            "enabled": True,
+            "notice_keywords": ["码使用", "已使用"],
+            "min_visible": 4,
+            "ttl": 1800,
+            "persist": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    payload = client.get("/api/rules").json()
+    assert payload["global_used_codes"]["min_visible"] == 4
+    assert payload["global_used_codes"]["ttl"] == 1800
+    assert payload["global_used_codes"]["notice_keywords"] == ["码使用", "已使用"]
+
+
+def test_global_used_codes_is_shared_across_accounts(client, app, two_accounts) -> None:
+    """全局策略写一次，**每个**账号读到的都是同一份 —— 这就是"全局"的定义。"""
+    assert (
+        client.put("/api/forward-used-codes", json={"min_visible": 5}).status_code == 200
+    )
+
+    rows = {a["name"]: a for a in client.get("/api/rules").json()["accounts"]}
+    assert rows[NAME]["used_codes"]["min_visible"] == 5
+    assert rows[NAME2]["used_codes"]["min_visible"] == 5, "第二个账号没跟着一起生效"
+
+
+def test_legacy_account_used_codes_endpoint_writes_global(client, app, account) -> None:
+    """旧的账号级端点保留可用，但它**写的是全局那份**（不再各写各的）。
+
+    老前端 / 老脚本还在调 ``/api/config/{name}/forward-used-codes``：让它继续能存，
+    但存进全局配置 —— 否则同一个界面（老页面）在 A 账号保存只会改 A，
+    与"一处配置、全账号一致"直接冲突。
+    """
+    resp = client.put(
+        f"/api/config/{NAME}/forward-used-codes", json={"min_visible": 6}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("scope") == "global", "旧端点要显式告诉调用方写的是全局"
+
+    payload = client.get("/api/rules").json()
+    assert payload["global_used_codes"]["min_visible"] == 6
+
+
+def test_legacy_account_used_codes_endpoint_still_404s_unknown_account(client, app) -> None:
+    """号名笔误照旧 404 —— 不因为"反正写全局"就把明显的错悄悄咽下去。"""
+    resp = client.put("/api/config/ghost/forward-used-codes", json={"enabled": True})
+    assert resp.status_code == 404
+
+
+def test_global_used_codes_rejects_bad_regex_with_readable_error(client, app) -> None:
+    """正则是最容易写错的一项，报错必须是人能看懂的中文，而不是 pydantic 那一大段。"""
+    resp = client.put("/api/forward-used-codes", json={"notice_pattern": "([A-Za-z0-9"})
+    assert resp.status_code == 400
+    assert "正则" in resp.json()["detail"]
+
+
+def test_global_used_codes_rejects_unknown_field(client, app) -> None:
+    resp = client.put("/api/forward-used-codes", json={"nonsense": 1})
+    assert resp.status_code == 400
+
+
+def test_global_used_codes_partial_update_keeps_other_fields(client, app) -> None:
+    """只改一个字段不能把没传的字段打回默认值（面板不暴露 ``persist``）。"""
+    assert (
+        client.put(
+            "/api/forward-used-codes",
+            json={"enabled": True, "persist": False, "ttl": 7200},
+        ).status_code
+        == 200
+    )
+    resp = client.put("/api/forward-used-codes", json={"min_visible": 5})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["used_codes"]["persist"] is False, "没传 persist 不能被重置"
+    assert resp.json()["used_codes"]["ttl"] == 7200, "没传 ttl 不能被重置"
+    assert resp.json()["used_codes"]["min_visible"] == 5
+
+
+def test_global_used_codes_accepts_nested_payload(client, app) -> None:
+    resp = client.put(
+        "/api/forward-used-codes", json={"used_codes": {"enabled": False}}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["used_codes"]["enabled"] is False
+
+
+def test_global_used_codes_does_not_touch_account_configs(client, app, account) -> None:
+    """写全局策略**不能**顺手改账号 ``config.json``（规则 / 排除名单一个都不能动）。
+
+    全局化最容易踩的坑就是"顺手把账号配置也重写一遍"，于是加个拦截、规则就没了。
+    """
+    assert client.post(f"/api/config/{NAME}/rules", json=_rule_payload()).status_code == 200
+    assert (
+        client.put(
+            f"/api/config/{NAME}/forward-exclude-chats", json={"exclude_chats": [-100999]}
+        ).status_code
+        == 200
+    )
+    config_path = account.paths.account(NAME).config_file
+    before = config_path.read_bytes()
+
+    assert (
+        client.put("/api/forward-used-codes", json={"min_visible": 5}).status_code == 200
+    )
+
+    assert config_path.read_bytes() == before, "写全局策略不该动到账号 config.json"
+    row = next(a for a in client.get("/api/rules").json()["accounts"] if a["name"] == NAME)
+    assert [r["id"] for r in row["rules"]] == ["r1"], "规则不能被清掉"
+    assert row["exclude_chats"] == [-100999]
+
+
+def test_global_used_codes_surfaces_load_errors(client, app) -> None:
+    """>0 说明磁盘上那份策略没读到，此刻按缺省策略在跑 —— 面板要靠它报警。"""
+    store = app.state.store
+    path = store.paths.forward_used_codes_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ 这不是合法 JSON", encoding="utf-8")
+
+    payload = client.get("/api/rules").json()
+    assert payload["global_used_codes"]["load_errors"] >= 1
+
+
+# --------------------------------------------------------------------------- #
 # 规则试跑
 # --------------------------------------------------------------------------- #
 def test_rules_test_regex_match_and_groups(client, app, account) -> None:
@@ -1301,6 +1434,234 @@ def test_reg_grab_rejects_invalid_payload(client, app, account) -> None:
     )
     assert duplicated.status_code == 400, duplicated.text
     assert "重复" in duplicated.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 抢注：任务维度（跨账号）
+# --------------------------------------------------------------------------- #
+def _add_account(app, name: str) -> None:
+    """临时再加一个账号 —— 「只从某几个账号移除」这类语义要 ≥3 个账号才验得出来。"""
+    store = app.state.store
+    store.upsert_account(AccountRecord(name=name, created_at=utc_now_iso()))
+    store.load_account_config(name, create=True)
+
+
+def _overview(client) -> dict:
+    resp = client.get("/api/reg_grab/overview")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _task_ids(client, name: str) -> list[str]:
+    return [task["id"] for task in client.get(f"/api/config/{name}/reg_grab").json()["tasks"]]
+
+
+def test_reg_grab_overview_covers_every_account(client, app, two_accounts) -> None:
+    """任务维度列表要**一次**拿到所有账号的快照（含账号级开关/并发 + 每条任务的 ready）。
+
+    页面不再有"当前账号"，逐账号 N+1 拉配置不只是多几个请求：账号 A 落盘、B 还没
+    落盘时会把"写了一半的状态"当快照渲染出来。
+    """
+    first_url = f"/api/config/{NAME}/reg_grab"
+    second_url = f"/api/config/{NAME2}/reg_grab"
+    assert client.put(
+        first_url, json={"enabled": True, "max_concurrency": 2, "tasks": [_reg_grab_task()]}
+    ).status_code == 200
+    assert client.put(
+        second_url,
+        json={"tasks": [_reg_grab_task(), _reg_grab_task(id="tmp", name="临时", detect={})]},
+    ).status_code == 200
+
+    body = _overview(client)
+    assert [each["name"] for each in body["accounts"]] == [NAME, NAME2]
+    assert len(body["server_now"]) == 5 and body["server_now"][2] == ":"
+
+    first, second = body["accounts"]
+    assert first["reg_grab_enabled"] is True
+    assert first["max_concurrency"] == 2
+    assert [task["id"] for task in first["tasks"]] == ["main"]
+    assert "running" in first and "session_exists" in first
+
+    assert second["reg_grab_enabled"] is False
+    assert second["max_concurrency"] == 1
+    assert [task["id"] for task in second["tasks"]] == ["main", "tmp"]
+    # 只读字段照旧带上：卡片要靠它显示「配置不完整」，不用自己重算一遍
+    assert second["tasks"][0]["ready"] is True and second["tasks"][0]["in_window"] is True
+    assert second["tasks"][1]["ready"] is False
+    assert "注册码提取正则" in second["tasks"][1]["problem"]
+
+
+def test_reg_grab_task_can_be_added_to_other_accounts(client, app, two_accounts) -> None:
+    """POST 把一条任务写到别的账号；同 id 已存在的账号**跳过**并回 conflicts，全冲突才 409。"""
+    created = client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": [NAME, NAME2]}
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["saved"] == [NAME, NAME2]
+    assert created.json()["conflicts"] == []
+    assert _task_ids(client, NAME) == ["main"] and _task_ids(client, NAME2) == ["main"]
+
+    # 再发一次同一批：全都已存在 ⇒ 409（不报错的话用户会以为又写了一份）
+    all_conflict = client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": [NAME, NAME2]}
+    )
+    assert all_conflict.status_code == 409
+    assert "都已存在" in all_conflict.json()["detail"]
+
+    # 第三个账号：只写它，已经有的那个算冲突
+    _add_account(app, "third")
+    partial = client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": [NAME, "third"]}
+    )
+    assert partial.status_code == 200, partial.text
+    assert partial.json()["saved"] == ["third"]
+    assert partial.json()["conflicts"] == [NAME]
+    assert _task_ids(client, "third") == ["main"]
+
+    # 一条**新**任务发给全部账号（accounts 缺省 = 全部）
+    fresh = client.post("/api/reg_grab/tasks", json={"task": _reg_grab_task(id="second-task")})
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["saved"] == [NAME, NAME2, "third"]
+    assert _task_ids(client, NAME) == ["main", "second-task"]
+
+
+def test_reg_grab_task_post_generates_a_missing_id(client, app, two_accounts) -> None:
+    """id 留空由服务端生成；同名再来一条也不能撞上（撞了就回一句莫名其妙的"都已存在"）。"""
+    blank = {**_reg_grab_task(id="", name="main"), "id": ""}
+    first = client.post("/api/reg_grab/tasks", json={"task": blank, "accounts": [NAME]})
+    assert first.status_code == 200, first.text
+    generated = first.json()["task"]["id"]
+    assert generated, "空 id 没有被生成"
+    assert _task_ids(client, NAME) == [generated]
+
+    second = client.post("/api/reg_grab/tasks", json={"task": blank, "accounts": [NAME]})
+    assert second.status_code == 200, second.text
+    second_id = second.json()["task"]["id"]
+    assert second_id != generated, "同名任务生成了同一个 id（紧接着会判成冲突）"
+    assert _task_ids(client, NAME) == [generated, second_id]
+
+
+def test_reg_grab_task_update_hits_every_owner(client, app, two_accounts) -> None:
+    """PUT 更新**所有拥有者**里的那一份（卡片启停开关走它），并回 updated / missing。
+
+    不发 N 个 per-account PUT 的理由：第 3 个账号失败时前 2 个已经落盘了 ——
+    用户看到报错，却有一半账号已经变了。
+    """
+    assert client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": [NAME, NAME2]}
+    ).status_code == 200
+
+    stopped = {**_reg_grab_task(), "enabled": False, "name": "改过名"}
+    resp = client.put("/api/reg_grab/tasks/main", json={"task": stopped})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] == [NAME, NAME2]
+    assert resp.json()["missing"] == []
+
+    for name in (NAME, NAME2):
+        tasks = client.get(f"/api/config/{name}/reg_grab").json()["tasks"]
+        assert len(tasks) == 1, f"{name} 里冒出了多余的任务：{tasks}"
+        assert tasks[0]["enabled"] is False and tasks[0]["name"] == "改过名"
+
+    # body 直接就是任务本身也认（与 POST 的 {task: ...} 两种写法都支持）
+    plain = client.put("/api/reg_grab/tasks/main", json={**stopped, "name": "裸 body"})
+    assert plain.status_code == 200, plain.text
+    assert plain.json()["updated"] == [NAME, NAME2]
+
+    # 重名冲突：把 main 改成其它账号里已经占用的 id ⇒ 409（重复 id 会让同一条消息被处理两次）
+    assert client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(id="other"), "accounts": [NAME]}
+    ).status_code == 200
+    clash = client.put("/api/reg_grab/tasks/main", json={"task": _reg_grab_task(id="other")})
+    assert clash.status_code == 409
+    assert "无法改名" in clash.json()["detail"]
+
+    # 不存在的任务 id ⇒ 404
+    assert (
+        client.put("/api/reg_grab/tasks/nope", json={"task": _reg_grab_task(id="nope")}).status_code
+        == 404
+    )
+
+
+def test_reg_grab_task_delete_can_be_scoped_to_one_account(client, app, two_accounts) -> None:
+    """DELETE ?accounts= 只移除指定账号；**不带 accounts 才是全删**（与规则页一致）。"""
+    _add_account(app, "third")
+    assert client.post("/api/reg_grab/tasks", json={"task": _reg_grab_task()}).status_code == 200
+    assert _task_ids(client, NAME) == ["main"]
+    assert _task_ids(client, "third") == ["main"]
+
+    one = client.delete(f"/api/reg_grab/tasks/main?accounts={NAME}")
+    assert one.status_code == 200, one.text
+    assert one.json()["removed"] == [NAME]
+    # 其它账号一点没受影响
+    assert _task_ids(client, NAME) == []
+    assert _task_ids(client, NAME2) == ["main"]
+    assert _task_ids(client, "third") == ["main"]
+
+    # 逗号分隔一次移除两个
+    both = client.delete(f"/api/reg_grab/tasks/main?accounts={NAME2},third")
+    assert both.status_code == 200, both.text
+    assert both.json()["removed"] == [NAME2, "third"]
+    assert _task_ids(client, NAME2) == [] and _task_ids(client, "third") == []
+
+    # 哪儿都没有这条任务了 ⇒ 404（而不是假装成功）
+    assert client.delete("/api/reg_grab/tasks/main").status_code == 404
+    # 指定了一个不存在的账号 ⇒ 404，别静默忽略
+    assert client.delete("/api/reg_grab/tasks/main?accounts=nobody").status_code == 404
+
+
+def test_reg_grab_task_endpoints_ignore_readonly_fields(client, app, two_accounts) -> None:
+    """GET 回来的任务带 ready / problem / in_window，页面原样回传时不能被判 400。"""
+    assert client.post("/api/reg_grab/tasks", json={"task": _reg_grab_task()}).status_code == 200
+    roundtrip = client.get(f"/api/config/{NAME}/reg_grab").json()["tasks"][0]
+    assert {"ready", "problem", "in_window"} <= set(roundtrip)
+
+    resp = client.put("/api/reg_grab/tasks/main", json={"task": {**roundtrip, "name": "往返"}})
+    assert resp.status_code == 200, resp.text
+    assert client.get(f"/api/config/{NAME}/reg_grab").json()["tasks"][0]["name"] == "往返"
+
+
+def test_reg_grab_task_post_rejects_bad_input(client, app, two_accounts) -> None:
+    """坏任务 / 不存在的账号要给 400 / 404（而不是 500），而且什么都别写进去。"""
+    bad = client.post(
+        "/api/reg_grab/tasks", json={"task": {**_reg_grab_task(), "steps": "not-a-list"}}
+    )
+    assert bad.status_code == 400
+    assert "任务校验失败" in bad.json()["detail"]
+
+    unknown = client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": ["nobody"]}
+    )
+    assert unknown.status_code == 404
+
+    assert _task_ids(client, NAME) == [] and _task_ids(client, NAME2) == []
+
+
+def test_reg_grab_task_delete_without_accounts_removes_every_owner(
+    client, app, two_accounts
+) -> None:
+    """**不带** accounts 的 DELETE 才是"从所有账号删掉"（卡片上的删除键）。
+
+    带上 accounts 是"只从某个账号移除"（卡片上取消勾选一个账号）—— 两者语义差一个
+    参数，混了就是"我只想让它在一个号上停掉，结果别的号也一起没了"。
+    """
+    assert client.post(
+        "/api/reg_grab/tasks", json={"task": _reg_grab_task(), "accounts": [NAME, NAME2]}
+    ).status_code == 200
+
+    resp = client.delete("/api/reg_grab/tasks/main")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["removed"] == [NAME, NAME2]
+    assert _task_ids(client, NAME) == [] and _task_ids(client, NAME2) == []
+
+
+def test_reg_grab_task_post_needs_a_target_account(client, app) -> None:
+    """一个账号都没有时 POST 要 400（"还没有任何账号"），别写进一个不存在的账号。"""
+    # 注意：这个用例**故意**不要 ``two_accounts`` fixture —— 要的就是空注册表
+    assert _overview(client)["accounts"] == []
+
+    resp = client.post("/api/reg_grab/tasks", json={"task": _reg_grab_task()})
+    assert resp.status_code == 400
+    assert "账号" in resp.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #

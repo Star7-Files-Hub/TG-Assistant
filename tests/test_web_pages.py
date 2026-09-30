@@ -1525,11 +1525,15 @@ def test_rules_page_card_can_move_a_rule_between_accounts() -> None:
 
 
 def test_rules_page_account_scoped_settings_stay_out_of_the_rule_cards() -> None:
-    """账号级的东西（转发总开关 / 排除名单 / 已用注册码）单独一区，别混进规则卡片。
+    """账号级的东西（转发总开关 / 排除名单）单独一区，别混进规则卡片。
 
     规则改成按 rule.id 合并之后，这些设置不再属于任何一条规则。混在卡片里的话，
     用户又会以为"这个排除名单只对当前这条规则生效"—— 而"账号级"正是它最容易被
     误解的地方（弹窗里那份才是规则级的）。
+
+    ⚠️ 「已使用注册码拦截」**不**在这一节里了：它已经全局化（见
+    ``test_rules_page_has_a_global_used_codes_block``），所以这里**断言它不在**
+    账号卡片里 —— 否则用户会看到"每个账号一套已用码设置"这种已经不成立的界面。
     """
     html = _rules_html()
 
@@ -1543,8 +1547,212 @@ def test_rules_page_account_scoped_settings_stay_out_of_the_rule_cards() -> None
     assert "open" in settings
 
     group = _js_function_body(html, "renderAccountGroup")
-    for needle in ("forward-enabled", "excludeChatsRow(acc)", "usedCodesRow(acc)"):
+    for needle in ("forward-enabled", "excludeChatsRow(acc)"):
         assert needle in group, f"账号卡片里少了 {needle}"
+    assert "usedCodesRow(acc)" not in group, (
+        "已用码拦截已全局化，不该再出现在账号卡片里（会让人以为每号一套）"
+    )
+
+    # 这一节是 #rules-list 的子元素 ⇒ 已有的委托（click / change / keydown）照旧覆盖它
+    init = _js_function_body(html, "init")
+    assert "getElementById('rules-list')" in init
+    assert "addEventListener('change', onRuleListChange)" in init
+
+
+def test_rules_page_has_a_global_used_codes_block() -> None:
+    """规则页顶部要有「全局已使用注册码拦截」区块 —— 它的**面板入口**。
+
+    用户原话：「将……已使用注册码拦截做成全局，而不是账号级」。后端 ``PUT
+    /api/forward-used-codes`` 做完了而面板上没有入口的话，功能等于不存在 ——
+    这个项目已经踩过一次（账号级黑名单字段/引擎/测试都在，面板里连输入框都没有）。
+
+    区块画在 ``#rules-list`` **外面**（它不属于任何一个账号分组），
+    所以它跟"有没有账号 / 有没有规则"无关。
+    """
+    html = _rules_html()
+
+    for dom in (
+        'id="rules-used-codes-global"',
+        'id="rules-used-codes-body"',
+        'id="rules-used-codes-state"',
+    ):
+        assert dom in html, f"规则页缺少 {dom}"
+    assert "全局已使用注册码拦截" in html, "区块没有标题，用户不知道这是干什么的"
+    assert "所有账号" in html, "没讲清这是跨账号共用的一份"
+    # 区块在所有账号分组之前（也就是外面），不是某个账号分组的一部分
+    assert html.index('id="rules-used-codes-global"') < html.index('id="rules-list"')
+
+    # 渲染挂在全局排除那一次里（同一个时机：跟有没有账号无关，放在提前 return 之前）
+    render = _js_function_body(html, "renderGlobalExcludes")
+    assert "renderGlobalUsedCodes();" in render, "全局已用码区块没被渲染出来"
+
+    # 事件委托要单独接一次（它在 #rules-list 外面），否则点「保存」没人响应
+    init = _js_function_body(html, "init")
+    assert "getElementById('rules-used-codes-global')" in init
+
+
+def test_rules_global_used_codes_saves_through_the_global_endpoint() -> None:
+    """全局那行走 ``/api/forward-used-codes``（没有账号参数）。
+
+    它和账号级旧入口（``/api/config/{name}/forward-used-codes``）的区别写在
+    ``saveUsedCodes`` 里：全局那份 DOM 上只有 ``data-global="1"``、没有账号，
+    保存时不能因为账号名为空就直接 return（那样点「保存」会静默什么都不做）。
+    """
+    html = _rules_html()
+
+    save = _js_function_body(html, "saveUsedCodes")
+    assert "/api/forward-used-codes" in save
+    assert "dataset.global" in save, "作用域要从 DOM 标记读，不靠账号名猜"
+    assert "isGlobal" in save, "没区分全局 / 账号级两条路径"
+    assert "/api/config/" in save, "账号级那条老端点不能被顺手删掉"
+
+    row = _js_function_body(html, "usedCodesRow")
+    assert 'data-global="1"' in row, "全局行没有作用域标记，保存时会走错端点"
+    assert "data-account=" in row
+
+    load = _js_function_body(html, "loadAll")
+    assert "data.global_used_codes" in load, "总览响应顶层那份没被读进来"
+
+    # 状态也要能报"文件读不到"（此刻按缺省策略在跑），与全局排除名单同一套处置
+    state = _js_function_body(html, "renderGlobalUsedCodesState")
+    assert "globalUsedCodesErrors" in state, "状态没读失败次数"
+    assert "默认策略" in state, "提示文案没说清此刻是按什么在跑"
+
+
+def test_rules_page_collapses_long_match_lists() -> None:
+    """匹配条件 ≥ 3 条时折叠成 ``<details>``，而不是把卡片铺满一屏。
+
+    用户原话：「正则规则不用全部展示，点击编辑或加个倒三角打开」。
+    线上那条规则配了 **20 条**正则（2026-09-29 取证），全铺出来一张卡片就是一屏，
+    真正有用的信息（来源 / 目标 / 模式）全被挤到看不见的地方。
+
+    阈值定在 3：1～2 条时不折叠 —— 为了两条条件多一次点击只会更碍事。
+    """
+    html = _rules_html()
+
+    assert "PATTERN_COLLAPSE_THRESHOLD = 3" in html
+    patterns = _js_function_body(html, "renderRulePatterns")
+    # 折叠的判定必须真的用上阈值（< 阈值就照原样铺开）
+    assert "patterns.length < PATTERN_COLLAPSE_THRESHOLD" in patterns
+    assert '<details class="rule-patterns-details">' in patterns
+    # 收起时给预览 + 条数：只留一个数字的话，用户判断不出这条规则到底匹配什么
+    assert "rule-patterns-count" in patterns
+    assert "rule-pattern-preview" in patterns
+
+    # 卡片必须走这个函数：只定义不调用的话，长规则照样全铺出来
+    card = _js_function_body(html, "renderRuleCard")
+    assert "renderRulePatterns(match, patterns)" in card
+
+
+
+# --------------------------------------------------------------------------- #
+# 转发规则页：以**任务**为维度展示（同一条规则不重复出现）
+# --------------------------------------------------------------------------- #
+def test_rules_page_renders_one_card_per_rule_not_per_account() -> None:
+    """同一条规则在 N 个账号里各存一份，页面上只能出现**一次**。
+
+    🔴 用户原话：「展示以及任务是以任务为维度，而不是以账号，同样的规则不做二次
+    展现，一条主规则，选择监听账号即可」。规则当初就是扇出写出去的（``POST
+    /api/rules`` 不带 accounts 写全部账号），按账号渲染会让同一条规则重复出现 N 次：
+    用户数不清自己有几条任务，也不知道改一处会不会影响别处。
+
+    所以渲染入口必须先做一次「账号 → 规则」的**转置**，再按 rule.id 出卡片。
+    """
+    html = _rules_html()
+
+    render = _js_function_body(html, "renderRules")
+    assert "collectRules()" in render, "规则列表没有按 rule.id 合并"
+    assert "entries.map(renderRuleCard)" in render, "主卡片不是按规则维度渲染的"
+    assert "accounts.map(renderAccountGroup)" not in render, (
+        "renderRules 又回到按账号渲染了 —— 同一条规则会重复出现"
+    )
+    assert "renderAccountSettings()" in render, "账号级设置没有单独的落点"
+    # 有账号但一条规则都没有时，账号级设置必须照样渲染：老代码在这一步整天提前
+    # return，排除名单连入口都没有 —— 而"先把我不要的群填上"正是新环境的第一步。
+    assert "return" not in render[render.index("collectRules()"):], (
+        "规则为空时又提前 return 了，账号级设置会跟着一起不渲染"
+    )
+
+    collect = _js_function_body(html, "collectRules")
+    assert "byId.get(rule.id)" in collect, "没有按 rule.id 去重"
+    assert "entry.owners.push(acc.name)" in collect, "没有聚出「这条规则落在哪些账号」"
+    # 各账号里那份内容可能分叉（手改过某个账号的 config.json / 走过单账号接口）。
+    # 分叉必须能被卡片说出来，否则显示一份、别的账号按另一份跑。
+    assert "entry.divergent" in collect
+
+    card = _js_function_body(html, "renderRuleCard")
+    assert "entry.owners" in card
+    assert "data-rule-id" in card
+
+    # 账号卡片里**不许**再有规则卡片：规则已经搬到主视图了
+    group = _js_function_body(html, "renderAccountGroup")
+    assert "renderRuleCard" not in group, "账号卡片里还在渲染规则 —— 同一条规则会重复出现"
+
+
+def test_rules_page_card_can_move_a_rule_between_accounts() -> None:
+    """卡片上的「监听账号」勾选 = 把这条规则写进 / 移出某个账号，其余账号不受影响。
+
+    两个端点绝不能弄混：
+      * 勾上要用 ``POST /api/rules``（只写缺这条规则的账号）。用 PUT 的话，账号里
+        没有这条规则时它只算 ``missing`` —— **不写也不报错**，界面看起来勾上了、
+        其实什么都没发生。
+      * 取消要用 ``DELETE /api/rules/{id}?accounts=<name>``。不带 accounts 的
+        DELETE 是"从所有账号删掉"（那是删除键的语义），混用会把其它账号一起干掉。
+    """
+    html = _rules_html()
+    set_owner = _js_function_body(html, "setRuleOwner")
+
+    assert "'/api/rules'" in set_owner and "method: 'POST'" in set_owner, (
+        "勾上监听账号没有走 POST /api/rules（用 PUT 时该账号没有这条规则就会静默不写）"
+    )
+    assert "?accounts=" in set_owner and "method: 'DELETE'" in set_owner, (
+        "取消监听账号没有走 DELETE ?accounts=（不带 accounts 会把其它账号一起删了）"
+    )
+    # 取消最后一个监听账号 = 这条规则没有任何账号在跑（等于删除），必须先问
+    assert "confirm(" in set_owner and "最后一个监听账号" in set_owner
+    # 成功失败都要重拉：界面不能停在"看起来成功了"的状态
+    assert set_owner.count("await loadAll()") >= 2
+
+    # 账号名从 checkbox 的 value 上取 —— 主卡片不在任何 [data-account] 里面，
+    # 靠 closest('[data-account]') 取账号会拿到 null（那样"勾了没反应"）。
+    change = _js_function_body(html, "onRuleListChange")
+    assert "rule-owner" in change and "input.value" in change
+
+    row = _js_function_body(html, "ruleOwnersRow")
+    assert 'data-role="rule-owner"' in row
+    assert 'value="${escapeHtml(acc.name)}"' in row
+    assert "监听账号" in row
+    assert "checked" in row, "卡片刻不出哪些账号在监听"
+
+
+def test_rules_page_account_scoped_settings_stay_out_of_the_rule_cards() -> None:
+    """账号级的东西（转发总开关 / 排除名单）单独一区，别混进规则卡片。
+
+    规则改成按 rule.id 合并之后，这些设置不再属于任何一条规则。混在卡片里的话，
+    用户又会以为"这个排除名单只对当前这条规则生效"—— 而"账号级"正是它最容易被
+    误解的地方（弹窗里那份才是规则级的）。
+
+    ⚠️ 「已使用注册码拦截」**不**在这一节里了：它已经全局化（见
+    ``test_rules_page_has_a_global_used_codes_block``），所以这里**断言它不在**
+    账号卡片里 —— 否则用户会看到"每个账号一套已用码设置"这种已经不成立的界面。
+    """
+    html = _rules_html()
+
+    settings = _js_function_body(html, "renderAccountSettings")
+    assert "rules-account-settings" in settings
+    assert "accounts.map(renderAccountGroup)" in settings
+    assert "各账号单独设置" in settings, "没有标题，用户不知道这一节是干什么的"
+    # 每次 loadAll 都会重建 innerHTML：展开状态必须带过去，
+    # 否则用户改一次名单（保存后会重拉）这一节就自己合上了。
+    assert "document.querySelector('.rules-account-settings')" in settings
+    assert "open" in settings
+
+    group = _js_function_body(html, "renderAccountGroup")
+    for needle in ("forward-enabled", "excludeChatsRow(acc)"):
+        assert needle in group, f"账号卡片里少了 {needle}"
+    assert "usedCodesRow(acc)" not in group, (
+        "已用码拦截已全局化，不该再出现在账号卡片里（会让人以为每号一套）"
+    )
 
     # 这一节是 #rules-list 的子元素 ⇒ 已有的委托（click / change / keydown）照旧覆盖它
     init = _js_function_body(html, "init")

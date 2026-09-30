@@ -82,15 +82,11 @@ class AccountPaths:
 
     @property
     def used_codes_file(self) -> Path:
-        """「已被用掉的注册码」记忆（转发前靠它拦掉废码）。
+        """【已弃用·仅供迁移读取】账号级「已用注册码」记忆的旧位置。
 
-        🔴 **为什么必须落盘**：码被用掉是**永久事实**，而这份记忆原本只在内存里 ——
-        一次重启就忘光，重启之后同一条已经用掉的码又能被转发出去，用户拿到的还是废码。
-        这与 ``RecentContentDedupe`` 落盘（``Paths.dedupe_file``）是同一个理由。
-
-        放在**账号目录**下、而不是像去重表那样放 ``data/`` 根共享：``ttl`` /
-        ``min_visible`` 都是账号级配置，共用一份数据就等于让 A 账号的策略去裁剪
-        B 账号的记忆（A 的 TTL 一到就把 B 还要用的前缀删了）。
+        「已用码拦截」已改成**全局一份**（见 :meth:`Paths.used_codes_file`）：
+        任一账号看到「码已使用」通知，所有账号都不再转发这条码。引擎不再读这里，
+        只有一次性迁移脚本会来读旧文件、把历史记忆并进全局那份（不丢数据）。
         """
         return self.root / "used_codes.json"
 
@@ -102,7 +98,8 @@ class AccountPaths:
         消息不再被点第二次**（红包 bot 会反复编辑同一条消息，见 ``RedPacketHunter._settle``）。
         一次重启就忘光 —— 线上实测（2026-09-29）一条长驻红包 8 小时里被点了 8 次，
         中间夹着 8 次服务重启：11:16 已经判出「你已经领过」，13:50 重启之后就又点了一次。
-        与 ``used_codes_file`` 同理，这是账号级的状态。
+        与 ``used_codes_file``（原账号级、现已全局化）同一个道理：这是**账号级**的状态，
+        每个账号抢的红包各不相同，不能跨账号共享。
         """
         return self.root / "red_packet_settled.json"
 
@@ -188,6 +185,36 @@ class Paths:
         **该账号额外排除**，两者在引擎里取**并集**（见 ``ForwardEngine._rebuild_excludes``）。
         """
         return self.data_dir / "forward_excludes.json"
+
+    @property
+    def forward_used_codes_file(self) -> Path:
+        """转发「已使用注册码拦截」的**配置**，**所有账号共用一份**。
+
+        🔴 **为什么要跨账号共享**：2026-09-30 线上取证 —— 三个账号
+        （小白 / SevenStar / 只想睡觉）的 ``forward.used_codes`` **一字不差完全相同**，
+        同一份策略存了三遍，面板上还得一个账号填一次。用户原话：
+        「将……已使用注册码拦截做成全局，而不是账号级」。
+
+        与 ``forward_excludes_file`` 同类，放 ``data/`` 根下。区别是这里是**替换**
+        而非并集：策略只有一份，不再读账号目录里那份 ``forward.used_codes``
+        （模型里保留该字段只是为了让旧 ``config.json`` 仍能加载，引擎不再用它）。
+        """
+        return self.data_dir / "forward_used_codes.json"
+
+    @property
+    def used_codes_file(self) -> Path:
+        """「已被用掉的注册码」记忆（转发前靠它拦废码），**所有账号共用一份**。
+
+        🔴 **为什么从账号目录移到 ``data/`` 根**：以前它按账号存，理由是
+        ``ttl`` / ``min_visible`` 是账号级配置、共用一份会让 A 的策略去裁剪 B 的记忆。
+        现在配置已改成**全局一份**（见 :meth:`forward_used_codes_file`），那条顾虑消失，
+        而共享记忆恰恰是用户要的：**任一账号**看到「码已使用」的通知，**所有账号**
+        都不该再把这条码转出去 —— 一处学习、全账号生效。
+
+        与 ``dedupe.json`` / ``forward_excludes.json`` 同为"跨账号一份事实"。
+        （账号目录下的旧 ``used_codes.json`` 由一次性迁移脚本并进这一份，不再使用。）
+        """
+        return self.data_dir / "used_codes.json"
 
     def account(self, name: str) -> AccountPaths:
         safe = validate_account_name(name)

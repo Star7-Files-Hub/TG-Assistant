@@ -60,6 +60,7 @@ from pyrogram.types import LinkPreviewOptions
 
 from .client import SessionInvalid, with_flood_retry
 from .forward_excludes import ForwardExcludeStore
+from .forward_used_codes import ForwardUsedCodesStore
 from .metrics import MetricsStore
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
@@ -966,22 +967,32 @@ class ForwardEngine:
             "used_skipped": 0,
         }
         #: 「已被用掉的注册码」记忆（学使用通知 + 转发前比对）。
+        #: 记忆本身也是**跨账号一份**（``data/used_codes.json``）：任一账号看到
+        #: 「码已使用」的通知，所有账号都不该再把这条码转出去。
         self.used_codes = UsedCodeStore(state_path=self._used_codes_path())
+        #: 「已用码拦截」的**全局配置**（``data/forward_used_codes.json``，跨账号一份）。
+        #: 不再读账号级 ``config.forward.used_codes``（那字段只为旧配置能加载而保留）。
+        self._used_codes_cfg = ForwardUsedCodesStore(self._global_used_codes_path())
         self._configure_used_codes()
 
     # ------------------------------------------------------------------ #
     # 已使用注册码（学「使用通知」→ 转发前拦掉废码）
     # ------------------------------------------------------------------ #
     def _used_codes_path(self) -> Optional[Any]:
-        """已用码记忆的落盘位置；没给 store/account（单测 / 离线）时返回 ``None``。
+        """已用码记忆的落盘位置（``data/used_codes.json``，**跨账号一份**）。
 
-        返回 ``None`` 只会退化成**纯内存**，功能照常可用，只是重启就忘。
+        没给 store（单测 / 离线场景）时返回 ``None`` = 退化成**纯内存**，功能照常可用，
+        只是重启就忘、也不跨账号共享（行为与单账号场景一致）。
+
+        🔴 从前这里返回**账号目录**下的路径（每个账号各记各的）。改成全局一份是因为
+        「一个码被用掉」是跨账号的事实：小白看到使用通知，SevenStar 也不该再转这条码。
+        （旧账号目录里的 ``used_codes.json`` 由一次性迁移脚本并进这一份。）
         """
-        if self._store is None or self._account is None:
+        if self._store is None:
             return None
         try:
-            return self._store.paths.account(self._account).used_codes_file
-        except Exception:  # pragma: no cover - 账号名异常时退化为纯内存
+            return self._store.paths.used_codes_file
+        except Exception:  # pragma: no cover - 路径异常时退化为纯内存
             return None
 
     # ------------------------------------------------------------------ #
@@ -1020,12 +1031,29 @@ class ForwardEngine:
             [*global_excludes.exclude_users, *config.forward.exclude_users]
         )
 
-    def _configure_used_codes(self) -> None:
-        """把 ``forward.used_codes`` 灌进记忆体。
+    def _global_used_codes_path(self) -> Optional[Any]:
+        """「已用码拦截」全局配置的位置（``data/forward_used_codes.json``，**跨账号一份**）。
 
-        热重载时也会走这里 —— 改完配置**立刻**生效，不用重启账号。
+        没有 ``store``（单测 / 离线场景）时返回 ``None`` = 退化成纯内存，
+        此时用 ``ForwardUsedCodes`` 的缺省策略（默认开、按默认正则学），行为可预期。
         """
-        guard = self.config.forward.used_codes
+        if self._store is None:
+            return None
+        try:
+            return self._store.paths.forward_used_codes_file
+        except Exception:  # pragma: no cover - 路径异常时退化为纯内存
+            return None
+
+    def _configure_used_codes(self) -> None:
+        """把**全局** ``used_codes`` 配置灌进记忆体。
+
+        🔴 读的是全局那份（``data/forward_used_codes.json``），**不再**读
+        ``self.config.forward.used_codes`` —— 用户要的是"一处配置、全账号一致"。
+        账号配置里那个字段保留只为旧 ``config.json`` 能加载，引擎不看它。
+
+        热重载时也会走这里 —— 面板改完配置**立刻**生效，不用重启账号。
+        """
+        guard = self._used_codes_cfg.load()
         self.used_codes.configure(
             enabled=guard.enabled,
             keywords=guard.notice_keywords,
@@ -1093,7 +1121,11 @@ class ForwardEngine:
             tuple(str(user) for user in self.config.forward.exclude_users),
             # 已使用码拦截的策略也要进指纹：它的正则/TTL 一变，热重载必须承认
             # 「确实变了」，否则会被判定成"没变化"而白改一场（与上面黑名单同理）。
-            self.config.forward.used_codes.model_dump(mode="json"),
+            # 🔴 取的是**全局配置**（``data/forward_used_codes.json``，跨账号一份），
+            # 且用 ``_used_codes_cfg.last_loaded`` —— ``_configure_used_codes`` 会在两次
+            # 取指纹**之间**重新 load 一次，于是 before 拿旧值、after 拿新值，
+            # "只改全局已用码策略"也能被诚实判成变化（与下面全局排除同一手法）。
+            self._used_codes_cfg.last_loaded.model_dump(mode="json"),
             # 「全局排除」名单（``data/forward_excludes.json``，跨账号一份）**在账号配置
             # 之外**：改它不会动 config.json，不进指纹的话热重载会判定"没变化"。
             # ⚠️ 取的是**内存里**那两个集合（只由 ``_rebuild_excludes`` 更新），

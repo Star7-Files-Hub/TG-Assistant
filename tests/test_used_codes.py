@@ -26,6 +26,21 @@ from tg_assistant.used_codes import (
 from .conftest import FakeChat, make_message
 from .test_forwarder import SRC, build_config, drain, src_message
 
+
+def write_global_used_codes(store, **overrides) -> ForwardUsedCodes:
+    """把全局策略写进 ``data/forward_used_codes.json``（拦截已全局化，只有这份算数）。
+
+    从一个**缺省值**出发再覆盖，而不是从零构造：缺省值改了测试要跟着改，
+    否则测的是一份不存在的策略（与上面的 :func:`store` 同一个理由）。
+    """
+    from tg_assistant.forward_used_codes import ForwardUsedCodesStore
+
+    payload = ForwardUsedCodes().model_dump(mode="json")
+    payload.update(overrides)
+    guard = ForwardUsedCodes.model_validate(payload)
+    ForwardUsedCodesStore(store.paths.forward_used_codes_file).save(guard)
+    return guard
+
 #: 线上那条通知的真实形状（见 reg_grab 模块文档）。
 NOTICE = "🎟️ 注册码使用 - jf [7002057019] 使用了 CineTrail-30-Register_gCKH░░░░░░░"
 #: 记下来的 key 就是**可见的那截 token**（小写）。
@@ -383,12 +398,30 @@ class TestSharedCodeSplitting:
 class TestForwarderBlocksUsedCode:
     """端到端：引擎先学通知，再拒绝转发那条完整码。"""
 
+    #: 接真实 store 时用的账号名（只是给路径解析一个合法名字，配置内容不重要）。
+    ACCOUNT = "uc-acct"
+
     def engine(self, client, alog, **guard_overrides):
+        """不接 store 的引擎：全局策略退化成纯内存那份（``ForwardUsedCodes`` 缺省值）。
+
+        ⚠️ ``guard_overrides`` 改的是**账号配置**里的 ``forward.used_codes``。
+        那份已经不再驱动引擎（拦截已全局化），所以只对"验证它确实失效"的用例有意义；
+        "让某个开关真的生效"要走 :meth:`engine_with_global`。
+        """
         config = build_config(match={"mode": "regex", "patterns": [r"Register_[A-Za-z0-9]{10}"]})
         guard = config.forward.used_codes
         for key, value in guard_overrides.items():
             setattr(guard, key, value)
         return ForwardEngine(client, config, alog)
+
+    def engine_with_global(self, store, client, alog) -> ForwardEngine:
+        """接上真实 store 的引擎：全局策略的路径由 store 决定（``data/forward_used_codes.json``）。
+
+        不接 store 时全局策略是纯内存的、永远等于缺省值 —— 那样就测不出
+        "面板改了全局策略、引擎跟着变"这条主线。
+        """
+        config = build_config(match={"mode": "regex", "patterns": [r"Register_[A-Za-z0-9]{10}"]})
+        return ForwardEngine(client, config, alog, store=store, account=self.ACCOUNT)
 
     @pytest.mark.asyncio
     async def test_notice_then_full_code_not_forwarded(self, client, alog):
@@ -444,8 +477,14 @@ class TestForwarderBlocksUsedCode:
         assert engine.stats["used_skipped"] == 0
 
     @pytest.mark.asyncio
-    async def test_guard_can_be_switched_off(self, client, alog):
-        engine = self.engine(client, alog, enabled=False)
+    async def test_guard_can_be_switched_off(self, store, client, alog):
+        """全局策略关掉之后不再学、也不再拦。
+
+        🔴 关它要写**全局**那份（``data/forward_used_codes.json``）——
+        改账号配置里的 ``forward.used_codes`` 已经没有任何效果（见下一个用例）。
+        """
+        write_global_used_codes(store, enabled=False)
+        engine = self.engine_with_global(store, client, alog)
         engine.register()
 
         engine._handle(src_message(NOTICE), edited=False)
@@ -455,6 +494,25 @@ class TestForwarderBlocksUsedCode:
 
         assert len(client.forwarded) == 1
         assert engine.stats["used_learned"] == 0
+
+    @pytest.mark.asyncio
+    async def test_account_level_used_codes_is_ignored(self, store, client, alog):
+        """账号配置里的 ``forward.used_codes`` **不再驱动引擎** —— 全局那份才是唯一来源。
+
+        用户原话：「做成全局，而不是账号级」。这条钉住"老字段彻底失效"：
+        线上三个 ``config.json`` 里那三份旧配置还在，如果不钉住，
+        以后有人改了账号级那份、发现没反应，会以为是 bug 而不是"它已经不看了"。
+        """
+        config = build_config(match={"mode": "regex", "patterns": [r"Register_[A-Za-z0-9]{10}"]})
+        config.forward.used_codes.enabled = False  # 账号级关掉（应当被忽略）
+        store.save_account_config(self.ACCOUNT, config)
+        loaded = store.load_account_config(self.ACCOUNT, create=False)
+
+        engine = ForwardEngine(client, loaded, alog, store=store, account=self.ACCOUNT)
+
+        assert engine.used_codes.enabled is True, (
+            "账号级 used_codes 关掉不该影响引擎 —— 全局那份（缺省 = 开）才是唯一来源"
+        )
 
     @pytest.mark.asyncio
     async def test_blocked_message_does_not_burn_dedupe_slot(self, client, alog):
@@ -482,15 +540,19 @@ class TestForwarderBlocksUsedCode:
         assert snap["used_codes"]["known"] == 1
 
     @pytest.mark.asyncio
-    async def test_hot_reload_applies_new_guard_config(self, client, alog):
-        """改 ``forward.used_codes`` 必须热重载生效（面板改完立刻管用）。"""
-        engine = self.engine(client, alog)
+    async def test_hot_reload_applies_new_guard_config(self, store, client, alog):
+        """改**全局** ``forward_used_codes.json`` 必须热重载生效（面板改完立刻管用）。
+
+        策略不在账号 ``config.json`` 里 —— 如果指纹里不带它，``apply_config`` 会判定
+        "没变化"直接返回，用户在面板上关掉拦截却毫无反应，只能重启账号。
+        """
+        write_global_used_codes(store, enabled=True)
+        engine = self.engine_with_global(store, client, alog)
         engine.register()
         assert engine.used_codes.enabled is True
 
-        config = engine.config.model_copy(deep=True)
-        config.forward.used_codes.enabled = False
-        assert engine.apply_config(config) is True
+        write_global_used_codes(store, enabled=False)
+        assert engine.apply_config(engine.config.model_copy(deep=True)) is True
         assert engine.used_codes.enabled is False
 
     @pytest.mark.asyncio

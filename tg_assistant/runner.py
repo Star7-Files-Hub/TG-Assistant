@@ -577,6 +577,11 @@ class AccountRunner:
         #: 用户改完立刻去群里验证，看到没拦住只会以为功能坏了。
         self._global_excludes_file: Optional[Any] = None
         self._global_excludes_mtime: Optional[float] = None
+        #: 「已用码拦截」的全局配置（``data/forward_used_codes.json``，跨账号一份）的
+        #: 路径与 mtime。同样**不在** config.json 里，必须单独盯一份 mtime ——
+        #: 只盯 config.json 的话，面板改完全局已用码策略不会触发任何重载。
+        self._global_used_codes_file: Optional[Any] = None
+        self._global_used_codes_mtime: Optional[float] = None
 
     @property
     def name(self) -> str:
@@ -713,6 +718,9 @@ class AccountRunner:
                 # 全局排除名单（跨账号一份）：同样留 None，首次检查必读一次盘。
                 self._global_excludes_file = self.store.paths.forward_excludes_file
                 self._global_excludes_mtime = None
+                # 全局已用码策略（跨账号一份）：同理，留 None 首次必读。
+                self._global_used_codes_file = self.store.paths.forward_used_codes_file
+                self._global_used_codes_mtime = None
 
         if not needs_updates:
             self.alog.warning(
@@ -790,9 +798,10 @@ class AccountRunner:
         它们可能读到**不同版本**（用户连点两次保存时），于是三个功能的生效状态
         对不上，排查起来毫无头绪。
 
-        「全局排除」名单（``data/forward_excludes.json``，跨账号一份）也在这里盯 ——
-        它不在账号配置里，只盯 ``config.json`` 的话，面板改完全局名单**不会**触发
-        任何重载，用户改完立刻去群里验证、看到没拦住只会以为功能坏了。
+        「全局排除」名单（``data/forward_excludes.json``）与「全局已用码策略」
+        （``data/forward_used_codes.json``）也在这里盯 —— 两者都跨账号一份、都不在
+        账号配置里，只盯 ``config.json`` 的话，面板改完它们**不会**触发任何重载，
+        用户改完立刻去群里验证、看到没生效只会以为功能坏了。
         """
         if self._config_file is None or self.store is None:
             return False
@@ -804,12 +813,21 @@ class AccountRunner:
         if self._global_excludes_file is not None:
             with contextlib.suppress(OSError):
                 global_mtime = self._global_excludes_file.stat().st_mtime
-        if mtime == self._config_mtime and global_mtime == self._global_excludes_mtime:
+        used_codes_mtime: Optional[float] = None
+        if self._global_used_codes_file is not None:
+            with contextlib.suppress(OSError):
+                used_codes_mtime = self._global_used_codes_file.stat().st_mtime
+        if (
+            mtime == self._config_mtime
+            and global_mtime == self._global_excludes_mtime
+            and used_codes_mtime == self._global_used_codes_mtime
+        ):
             return False
         # 先记下 mtime 再解析：解析失败时不会每一轮都重试同一次坏写，
         # 用户改回一个合法配置就会重新触发（mtime 又变了）。
         self._config_mtime = mtime
         self._global_excludes_mtime = global_mtime
+        self._global_used_codes_mtime = used_codes_mtime
         try:
             config = self.store.load_account_config(self.name, create=False)
         except Exception as exc:

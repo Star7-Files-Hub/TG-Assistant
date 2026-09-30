@@ -51,6 +51,27 @@
         <div class="rules-global-body" id="rules-global-body"></div>
     </div>
 
+    <!-- 全局「已使用注册码拦截」（所有账号共用一份，见 /api/forward-used-codes）。
+         与上面的全局排除名单同一套道理：这份策略原来在每个账号里各存一份
+         （线上三个账号一字不差完全相同），面板上得填三遍。用户原话：
+         「将……已使用注册码拦截做成全局，而不是账号级」。
+         记忆也是全局一份 —— 任一账号看到"码已使用"，所有账号都不再转这条码。 -->
+    <div class="rules-global" id="rules-used-codes-global">
+        <div class="rules-global-header">
+            <div>
+                <h2>全局已使用注册码拦截（所有账号共用）</h2>
+                <p class="text-muted">
+                    码频道会发「码使用 - … 使用了 <code>XXXX-30-Register_f1t░░░░░░░</code>」这类通知，
+                    码尾被遮罩 —— 这种码**已经被人用掉**，再转出去只会让人白折腾。
+                    这里配一次，<strong>所有账号</strong>都从使用通知里学会这些码、命中就不再转发；
+                    任一账号学到的码，其它账号也一起生效。
+                </p>
+            </div>
+            <span class="rules-global-state" id="rules-used-codes-state"></span>
+        </div>
+        <div class="rules-global-body" id="rules-used-codes-body"></div>
+    </div>
+
     <!-- 规则列表：按账号分组渲染，每组的标题栏带该账号的转发总开关与启停 -->
     <div class="rules-list" id="rules-list">
         <div class="rules-empty" id="rules-empty">
@@ -311,6 +332,11 @@
     let globalExcludes = {exclude_chats: [], exclude_users: []};
     // 全局名单文件读失败过几次（>0 = 磁盘上那份没读到，此刻按空名单在跑）。
     let globalExcludesErrors = 0;
+    // 全局「已使用注册码拦截」策略（所有账号共用一份，见 /api/forward-used-codes）。
+    // 与全局排除名单同理：一份策略所有账号一起生效，不再是每个账号各填一遍。
+    let globalUsedCodes = {};
+    // 全局已用码策略文件读失败过几次（>0 = 按**缺省策略**在跑）。
+    let globalUsedCodesErrors = 0;
 
     // Tag input 数据
     const tagInputs = {
@@ -349,6 +375,12 @@
             globalBox.addEventListener('click', onRuleListClick);
             globalBox.addEventListener('keydown', onExcludeListKeydown);
         }
+        // 全局「已使用注册码拦截」区块同样在 #rules-list 外面，单独挂一次委托
+        // （它只有按钮，没有标签输入，所以不需要 keydown）。
+        const usedCodesBox = document.getElementById('rules-used-codes-global');
+        if (usedCodesBox) {
+            usedCodesBox.addEventListener('click', onRuleListClick);
+        }
         // 标签上的删除按钮同理（虽然 field 来自固定列表、index 是数字，
         // 但让「内联 handler 不带数据」这条约束没有例外更省心）
         document.getElementById('rule-modal').addEventListener('click', onModalClick);
@@ -370,6 +402,10 @@
         // 全局排除名单：响应顶层只有一份（所有账号共用），不是每个账号一份。
         globalExcludes = data.global_excludes || {exclude_chats: [], exclude_users: []};
         globalExcludesErrors = globalExcludes.load_errors || 0;
+        // 全局「已使用注册码拦截」策略：同样只有一份（在响应顶层 ``global_used_codes``）。
+        // 老后端不返回这个键时退回空对象，面板用前端兜底默认值填，不至于整页空白。
+        globalUsedCodes = data.global_used_codes || {};
+        globalUsedCodesErrors = globalUsedCodes.load_errors || 0;
         const btn = document.getElementById('btn-add-rule');
         btn.disabled = accounts.length === 0;
         btn.title = accounts.length === 0 ? '还没有账号，先去「账号」页添加' : '';
@@ -473,7 +509,7 @@
             <details class="rules-account-settings"${open ? ' open' : ''}>
                 <summary>
                     <span class="rules-account-settings-title">各账号单独设置</span>
-                    <span class="rules-account-settings-sub">转发总开关 · 账号级排除名单 · 已使用注册码拦截</span>
+                    <span class="rules-account-settings-sub">转发总开关 · 账号级排除名单</span>
                 </summary>
                 <div class="rules-account-settings-body">
                     ${accounts.map(renderAccountGroup).join('')}
@@ -515,7 +551,6 @@
                     </div>
                 </div>
                 ${excludeChatsRow(acc)}
-                ${usedCodesRow(acc)}
             </div>`;
     }
 
@@ -594,6 +629,31 @@
         body.innerHTML = excludeListRow(null, 'exclude-chats', true)
             + excludeListRow(null, 'exclude-users', true);
         renderGlobalState();
+        renderGlobalUsedCodes();
+    }
+
+    // 全局「已使用注册码拦截」区块：只有一份配置，画在页面顶部。
+    function renderGlobalUsedCodes() {
+        const body = document.getElementById('rules-used-codes-body');
+        if (!body) return;
+        body.innerHTML = usedCodesRow(null, true);
+        renderGlobalUsedCodesState();
+    }
+
+    // 顶部那个小状态：把"现在到底配成什么样"写在标题旁边。
+    // 文件读不到时**必须说出来**（此刻是按缺省策略在跑）。
+    function renderGlobalUsedCodesState() {
+        const el = document.getElementById('rules-used-codes-state');
+        if (!el) return;
+        if (globalUsedCodesErrors > 0) {
+            el.className = 'rules-global-state rules-global-state-warn';
+            el.textContent = `⚠ 策略文件读不到，当前按默认策略运行（已失败 ${globalUsedCodesErrors} 次）`;
+            el.title = 'data/forward_used_codes.json 读不到或格式不对。保存一次即可重新写入。';
+            return;
+        }
+        const cfg = Object.assign({}, USED_CODES_DEFAULTS, globalUsedCodes || {});
+        el.className = 'rules-global-state';
+        el.textContent = cfg.enabled ? '生效中（所有账号共用）' : '已关闭';
     }
 
     // 顶部那个小状态：把"现在到底排除了什么"写在标题旁边。
@@ -782,8 +842,9 @@
         // （编辑与删除本来就作用于**所有**监听账号，不需要账号参数）。
         else if (action === 'edit') editRule(ruleId);
         else if (action === 'delete') deleteRule(ruleId);
-        // 「已使用注册码」的保存键同样走委托：它长在按账号渲染出来的行里，
-        // 每渲染一次挂一次监听既啰嗦又容易漏（内联 handler 带数据是被明令禁止的）。
+        // 「已使用注册码」的保存键同样走委托：全局那份长在顶部区块、账号那份长在
+        // 账号分组里，每渲染一次挂一次监听既啰嗦又容易漏（内联 handler 带数据被明令禁止）。
+        // 走哪个端点由行上的作用域决定（data-global vs data-account），见 saveUsedCodes。
         else if (action === 'save-used-codes') saveUsedCodes(account, btn.closest('[data-role="used-codes"]'));
     }
 
@@ -950,15 +1011,17 @@
         }
     }
 
-    // ==================== 已使用注册码拦截（账号级） ====================
+    // ==================== 已使用注册码拦截（全局，所有账号共用一份） ====================
     // 码频道会发「🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░」，
     // 码尾被遮罩。这类码**已经被人用掉了**，再转出去只会让群里的人白折腾一轮 ——
     // 所以让引擎从「使用通知」里学会这些码，之后命中就不再转发。
     //
-    // 和排除名单一样是账号级配置（该账号所有规则通用），所以放在同一个分组标题下面。
-    // 保存走 PUT /api/config/{name}/forward-used-codes。
+    // 🔴 这份策略与它学到的记忆都是**所有账号共用一份**（``data/forward_used_codes.json``
+    // 与 ``data/used_codes.json``），不再按账号各存一份：任一账号看到"码已使用"，
+    // 所有账号都不再转这条码。用户原话：「将……已使用注册码拦截做成全局，而不是账号级」。
+    // 保存走 PUT /api/forward-used-codes。
     //
-    // ⚠️ 核心（config / forwarder）还没部署时 /api/rules 不返回 used_codes，
+    // ⚠️ 核心（config / forwarder）还没部署时 /api/rules 不返回 global_used_codes，
     // 这里必须用一份**和后端 ForwardUsedCodes 默认值一致**的兜底：输入框空着保存
     // 会被后端判 400，用户看到的是"保存失败"却不知道要填什么。
     const USED_CODES_DEFAULTS = {
@@ -970,15 +1033,29 @@
         ttl: 3600
     };
 
-    function usedCodesRow(acc) {
-        const cfg = Object.assign({}, USED_CODES_DEFAULTS, acc.used_codes || {});
+    // 已使用注册码拦截的编辑行。``isGlobal`` 时画在页面顶部的全局区块里
+    // （配置与记忆都所有账号共用一份），否则画在账号分组里（已不再使用，
+    // 保留只为兼容旧调用）。全局那份没有 data-account，保存时走
+    // PUT /api/forward-used-codes（端点里没有账号概念）。
+    function usedCodesRow(acc, isGlobal) {
+        const cfg = Object.assign(
+            {}, USED_CODES_DEFAULTS,
+            (isGlobal ? globalUsedCodes : (acc && acc.used_codes)) || {}
+        );
         const keywords = Array.isArray(cfg.notice_keywords) ? cfg.notice_keywords : [];
         // 数字框只在后端给了 null / 空串时才落到 0（上面 merge 过默认值，
         // "整个字段缺失"走的是默认值那一路）—— 0 在 min_visible 上是非法值，
         // 后端会 400 并把原因显示出来，好过这里假装成 1 悄悄改了用户的配置。
         const num = v => (v === null || v === undefined || v === '' ? 0 : v);
+        // 全局那份只有 data-global，作用域写进 DOM：保存时据此选端点。
+        const scopeAttr = isGlobal
+            ? 'data-global="1"'
+            : `data-account="${escapeHtml(acc.name)}"`;
+        const stats = isGlobal
+            ? globalUsedCodesStats()
+            : (acc && acc.used_code_stats);
         return `
-            <div class="rules-account-exclude" data-role="used-codes" data-account="${escapeHtml(acc.name)}">
+            <div class="rules-account-exclude" data-role="used-codes" ${scopeAttr}>
                 <span class="rules-account-exclude-label"
                       title="被「使用通知」点名用过的注册码不再转发（码尾被遮罩，转出去没人能兑换）">
                     已使用注册码拦截
@@ -1013,12 +1090,25 @@
                            value="${num(cfg.ttl)}" min="0" max="86400" step="60" />
                 </label>
                 <button class="tg-btn tg-btn-sm tg-btn-primary" data-action="save-used-codes"
-                        title="保存该账号的拦截设置">保存</button>
+                        title="${isGlobal ? '保存全局拦截设置（所有账号生效）' : '保存该账号的拦截设置'}">保存</button>
                 <span class="rules-account-exclude-label" data-role="used-codes-stats"
                       title="已记住 = 当前记着的码；已拦截 = 因此没转发的次数；累计学到 = 学习总条数（含已过期的）">
-                    ${usedCodesStatsText(acc.used_code_stats)}
+                    ${usedCodesStatsText(stats)}
                 </span>
             </div>`;
+    }
+
+    // 全局统计：记忆是所有账号共用的一份，但"学到 / 拦截"是**各账号引擎各自的
+    // 计数器**（每个账号只数自己经手的消息）。所以求和才等于全局口径：
+    // 「已记住」取各账号里的最大值（其实同源，取 max 避免某个账号没在跑时显示 0），
+    // 「累计学到 / 已拦截」求和（各账号互不重复地计数）。
+    function globalUsedCodesStats() {
+        const list = accounts
+            .map(a => a.used_code_stats)
+            .filter(st => st && typeof st === 'object');
+        const sum = key => list.reduce((n, st) => n + (Number(st[key]) || 0), 0);
+        const max = key => list.reduce((n, st) => Math.max(n, Number(st[key]) || 0), 0);
+        return {known: max('known'), skipped: sum('skipped'), learned: sum('learned')};
     }
 
     function usedCodesStatsText(st) {
@@ -1033,7 +1123,11 @@
     }
 
     async function saveUsedCodes(name, row) {
-        if (!name || !row) return;
+        if (!row) return;
+        // 作用域由行上的标记决定：全局那份走 /api/forward-used-codes（无账号概念），
+        // 账号那份走 /api/config/{name}/forward-used-codes（旧入口，后端已转发全局）。
+        const isGlobal = row.dataset.global === '1';
+        if (!isGlobal && !name) return;
         const field = role => row.querySelector(`[data-role="${role}"]`);
         const value = role => {
             const el = field(role);
@@ -1062,7 +1156,10 @@
             min_visible: minVisible,
             ttl: ttl
         };
-        const res = await fetch(`/api/config/${encodeURIComponent(name)}/forward-used-codes`, {
+        const url = isGlobal
+            ? '/api/forward-used-codes'
+            : `/api/config/${encodeURIComponent(name)}/forward-used-codes`;
+        const res = await fetch(url, {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(body)
@@ -1074,7 +1171,7 @@
             toast(detailText(data) || '保存失败', false);
             return;
         }
-        toast(`已保存「${name}」的已使用注册码拦截设置`, true);
+        toast(isGlobal ? '已保存全局「已使用注册码拦截」设置' : `已保存「${name}」的已使用注册码拦截设置`, true);
         // 保存成功后重拉：后端会把关键词去空、补默认值，界面要显示**磁盘上的那份**，
         // 而不是"我刚输进去的那份"。
         await loadAll();

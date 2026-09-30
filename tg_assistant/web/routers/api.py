@@ -758,38 +758,22 @@ async def api_set_forward_excludes(
     return {"ok": True, **excludes.model_dump(mode="json")}
 
 
-@router.put("/config/{name}/forward-used-codes")
-async def api_forward_set_used_codes(
-    name: str,
-    payload: dict[str, Any],
-    store=Depends(get_store),
-) -> dict[str, Any]:
-    """「已使用注册码」拦截设置：命中使用通知的注册码不再转发。
+def _save_global_used_codes(store, raw: dict[str, Any]) -> dict[str, Any]:
+    """在**现有全局配置**上做增量，校验后写回 ``data/forward_used_codes.json``。
 
-    这些码频道会发「🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░」，
-    码尾被遮罩 —— 已经用掉的码再转出去，别人拿到的是一串用不了的字符，
-    所以让引擎记住用过的码，命中就不再发。
-
-    请求体两种写法都收：平铺的六个字段，或 ``{"used_codes": {...}}`` ——
-    面板用前者，手搓 curl / 脚本更习惯后者（和 ``rules`` 的 ``{"rule": {...}}`` 一致）。
+    抽出来是因为新的全局端点和旧的账号级兼容端点都要走这同一套逻辑，
+    「同一个判断抄两份」是这个项目踩过的坑。
     """
-    from tg_assistant.config import ForwardConfig, ForwardUsedCodes
+    from tg_assistant.config import ForwardUsedCodes
+    from tg_assistant.forward_used_codes import ForwardUsedCodesStore
     from tg_assistant.matching import compile_user_pattern
 
-    _require_account(store, name)
-    config = store.load_account_config(name, create=False)
-
-    nested = payload.get("used_codes") if isinstance(payload, dict) else None
-    raw: Any = payload if nested is None else nested
     if not isinstance(raw, dict):
         raise HTTPException(status_code=400, detail="used_codes 必须是对象")
 
     # 正则**先**单独编译一次，为的是错误信息：pydantic 会把校验失败糊成一大段
     # 英文（还带 input_value / type 之类），而这一项恰恰是用户手写、最容易写错的。
-    # 只判「能不能编译」；**范围**（min_visible / ttl）留给模型判，不在路由里
-    # 手写第二份阈值 —— 「同一个判断抄两份」是这个项目踩过的坑。
-    # 模型自己也校验这个字段（``ForwardUsedCodes._check_pattern``），flags 不影响
-    # 合法性，所以两处不会给出"这里放行、引擎那边报错"的分歧。
+    # 范围（min_visible / ttl）留给模型判，不在路由里手写第二份阈值。
     candidate = raw.get("notice_pattern")
     if isinstance(candidate, str) and candidate:
         try:
@@ -797,27 +781,65 @@ async def api_forward_set_used_codes(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"通知正则表达式无效：{exc}") from exc
 
-    # 🔴 在**现有值**上做增量，而不是拿 payload 从零构造：面板只暴露 5 个控件
-    # （没有 persist），从零构造会把没传的字段悄悄打回默认值 —— 用户改个时长，
-    # 落盘开关就被重置了，而且毫无提示。顺带也支持「只改一个字段」的写法。
-    current = getattr(config.forward, "used_codes", None)
-    base = current.model_dump() if current is not None else {}
+    used_store = ForwardUsedCodesStore(store.paths.forward_used_codes_file)
+    current = used_store.load()
+    # 🔴 在**现有值**上做增量，而不是拿 payload 从零构造：面板不一定把 persist 等
+    # 每个字段都传上来，从零构造会把没传的字段悄悄打回默认值。顺带支持「只改一个字段」。
+    base = current.model_dump()
     try:
         parsed = ForwardUsedCodes.model_validate({**base, **raw})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"已使用注册码配置校验失败：{exc}") from exc
+    used_store.save(parsed)
+    return parsed.model_dump(mode="json")
 
-    # 和「排除频道 / 黑名单」同一套写法：整体重建 forward 再校验。
-    # 这样 rules / exclude_* 一个都不会被这次保存带走（有回归用例钉着）。
-    try:
-        config.forward = ForwardConfig.model_validate(
-            {**config.forward.model_dump(), "used_codes": parsed.model_dump()}
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"已使用注册码配置校验失败：{exc}") from exc
 
-    store.save_account_config(name, config)
-    return {"ok": True, "used_codes": parsed.model_dump(mode="json")}
+@router.put("/forward-used-codes")
+async def api_set_forward_used_codes(
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """**全局**「已使用注册码」拦截设置（所有账号共用一份）。
+
+    用户原话：「将……已使用注册码拦截做成全局，而不是账号级」。
+
+    这些码频道会发「🎟️ 注册码使用 - jf [7002057019] 使用了 MSKY-30-Register_f1t░░░░░░░」，
+    码尾被遮罩 —— 已经用掉的码再转出去，别人拿到的是一串用不了的字符。让引擎记住
+    用过的码、命中就不再发；且**任一账号**认出的已用码，**所有账号**都不再转。
+
+    🔴 **为什么跨账号一份**：2026-09-30 线上取证 —— 三个账号（小白 / SevenStar /
+    只想睡觉）的这份策略**一字不差完全相同**，同一份策略存了三遍。写在
+    ``data/forward_used_codes.json``，与「全局排除名单」同类。**不再**读账号级
+    ``forward.used_codes``（那字段只为旧配置能加载而保留）。
+
+    请求体两种写法都收：平铺字段，或 ``{"used_codes": {...}}``。
+    """
+    nested = payload.get("used_codes") if isinstance(payload, dict) else None
+    raw: Any = payload if nested is None else nested
+    saved = _save_global_used_codes(store, raw)
+    return {"ok": True, "used_codes": saved}
+
+
+@router.put("/config/{name}/forward-used-codes")
+async def api_forward_set_used_codes(
+    name: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """【已弃用·转全局】账号级「已使用注册码」拦截设置的旧入口。
+
+    「已用码拦截」已改成**全局一份**（见 :func:`api_set_forward_used_codes`）。
+    这个带 ``{name}`` 的旧端点保留只为兼容老前端 / 老脚本：它**忽略账号名**、
+    把配置写进全局那份 ``data/forward_used_codes.json`` —— 语义正是用户要的
+    「一处配置、全账号一致」，不会再各写各的。返回体里带 ``scope="global"`` 提示。
+    """
+    # 账号名仍校验一下，好让"账号不存在"这类明显笔误照旧 404（而不是静默写全局）。
+    _require_account(store, name)
+
+    nested = payload.get("used_codes") if isinstance(payload, dict) else None
+    raw: Any = payload if nested is None else nested
+    saved = _save_global_used_codes(store, raw)
+    return {"ok": True, "scope": "global", "used_codes": saved}
 
 
 # --------------------------------------------------------------------------- #
@@ -911,6 +933,12 @@ async def api_rules_overview(
     响应里就不会出现「两个接口的数据对不上」的瞬间。
     """
     status = {item["name"]: item for item in runtime.account_status()}
+    # 「已使用注册码」拦截策略：**所有账号共用一份**（``data/forward_used_codes.json``），
+    # 放在循环外只读一次盘。读失败时回退 ``ForwardUsedCodes`` 缺省值（= 启用 + 默认正则）。
+    from tg_assistant.forward_used_codes import ForwardUsedCodesStore
+
+    used_codes_store = ForwardUsedCodesStore(store.paths.forward_used_codes_file)
+    global_used_codes = used_codes_store.load()
     accounts: list[dict[str, Any]] = []
     for record in store.load_registry().accounts:
         config = store.load_account_config(record.name, create=False)
@@ -927,9 +955,6 @@ async def api_rules_overview(
         # 两种形状都认：顶层键读不到就退回嵌套快照，都取不到才是 0 ——
         # 「已记住」永远显示 0 时，用户会以为拦截没用（其实只是名字对不上）。
         used_store = forward_stats.get("used_codes") or {}
-        # 同理：配置字段由核心提供，读不到就退回空 dict（面板自己会填默认值），
-        # 不让「规则总览」因为一个还没上线的功能挂掉。
-        used_codes_cfg = getattr(config.forward, "used_codes", None)
         accounts.append(
             {
                 "name": record.name,
@@ -941,11 +966,10 @@ async def api_rules_overview(
                 "forward_enabled": config.forward.enabled,
                 "exclude_chats": list(config.forward.exclude_chats),
                 "exclude_users": list(config.forward.exclude_users),
-                "used_codes": (
-                    used_codes_cfg.model_dump(mode="json")
-                    if used_codes_cfg is not None
-                    else {}
-                ),
+                # 「已用码拦截」已全局化，这里回填的也是**那份全局配置**（不是账号级）。
+                # 保留这个键只为兼容老前端 / 老测试：它读到的就是实际生效的策略，
+                # 语义上没有撒谎。新面板读的是响应顶层 ``global_used_codes``。
+                "used_codes": global_used_codes.model_dump(mode="json"),
                 # learned = 累计学到多少条（只增）；known = **当前**还记着多少条
                 # （会因 TTL 到期而减少）。两者的名字很像，别配反了。
                 "used_code_stats": {
@@ -967,6 +991,9 @@ async def api_rules_overview(
 
     exclude_store = ForwardExcludeStore(store.paths.forward_excludes_file)
     global_excludes = exclude_store.load()
+    # 「已使用注册码」拦截策略：同样**所有账号共用一份**（``data/forward_used_codes.json``，
+    # 已在上面读过一次）。放在响应顶层、与 ``global_excludes`` 并列 —— 面板把它渲染成
+    # 页面顶部一个区块，不再一个账号一份。
     return {
         "accounts": accounts,
         "global_excludes": {
@@ -974,6 +1001,11 @@ async def api_rules_overview(
             # 读文件失败过几次。>0 说明磁盘上那份名单没读到，此刻是**按空名单**在跑 ——
             # 面板据此提示，而不是让用户对着一个"看起来配好了"的界面发呆。
             "load_errors": exclude_store.load_errors,
+        },
+        "global_used_codes": {
+            **global_used_codes.model_dump(mode="json"),
+            # 同理：>0 说明磁盘上那份策略没读到，此刻是**按缺省策略**在跑。
+            "load_errors": used_codes_store.load_errors,
         },
     }
 
@@ -1376,6 +1408,248 @@ async def api_reg_grab_test_extract(payload: dict[str, Any]) -> dict[str, Any]:
     except re.error as exc:
         # 正则写错是用户最常见的输入错误，要给一句能看懂的话而不是 500。
         return {"matched": False, "error": f"正则表达式无效: {exc}", "code": None}
+
+
+# --------------------------------------------------------------------------- #
+# 抢注任务：任务维度（跨账号）
+# --------------------------------------------------------------------------- #
+#: 一条抢注任务在哪些账号里有副本。
+#:
+#: 与 :func:`_rule_owners` 同一个道理：任务的 id 是主键，面板改成任务维度之后
+#: 「这条任务被写给了谁」必须由配置本身回答，而不是靠页面记住"当前账号"。
+def _reg_grab_task_owners(store: Any, task_id: str) -> list[str]:
+    owners: list[str] = []
+    for record in store.load_registry().accounts:
+        config = store.load_account_config(record.name, create=False)
+        if any(task.id == task_id for task in config.reg_grab.tasks):
+            owners.append(record.name)
+    return owners
+
+
+def _validate_reg_grab_task(
+    payload: dict[str, Any],
+    *,
+    taken: set[str] | None = None,
+    fallback_id: str | None = None,
+) -> Any:
+    """校验请求里的抢注任务，并给**留空的 id** 补一个。
+
+    id 的生成规则在 :meth:`RegGrabConfig._assign_ids` 里 —— 只有父模型同时看得见
+    所有任务，才能保证「同一次保存里生成的那些互不重复」。这里借它生成一个，
+    而不是在 api.py 里再写一遍「名称取 ASCII 片段、否则随机」：两套规则迟早漂移，
+    然后前端按一套猜、服务端按另一套存。
+
+    ``taken`` 是**目标账号里已被占用的 id**（占用者用占位任务塞进父模型，让生成
+    规则自己避让）。不传的话，同名的第二条任务会生成同一个 id，接着被判成"已存在"
+    回 409 —— 用户看到的就是一句莫名其妙的"都已存在"。
+
+    ``fallback_id`` 给 PUT 用：URL 里的 id 就是这条任务的身份，body 里留空时直接用
+    它，不能另生成一个（那等于悄悄改名）。
+
+    PUT 的 body 允许两种写法：``{task: {...}}``（与 POST 一致，页面对称）
+    或整个 body 就是任务本身（``{id: ..., steps: [...]}``）。
+    """
+    from tg_assistant.config import RegGrabConfig, RegGrabTask
+
+    raw = payload.get("task")
+    if not isinstance(raw, dict):
+        raw = payload
+    # GET 会在任务上多塞 ready / problem / in_window，页面把卡片原样回传时它们会跟着
+    # 回来；``RegGrabTask`` 是 extra="forbid" 的，不丢就 400。
+    body = {key: value for key, value in raw.items() if key not in _REG_GRAB_TASK_READONLY}
+    if fallback_id is not None and not str(body.get("id") or "").strip():
+        body = {**body, "id": fallback_id}
+    try:
+        task = RegGrabTask.model_validate(body)
+        if not task.id:
+            placeholders = [RegGrabTask(id=each) for each in sorted(taken or ())]
+            task = RegGrabConfig(tasks=[*placeholders, task]).tasks[-1]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"任务校验失败：{exc}") from exc
+    return task
+
+
+@router.get("/reg_grab/overview")
+async def api_reg_grab_overview(
+    store=Depends(get_store),
+    runtime=Depends(get_runtime),
+) -> dict[str, Any]:
+    """所有账号的抢注配置总览，供「任务维度」列表一次渲染完。
+
+    页面不再有"当前账号"之后，逐账号拉配置不只是多几个请求：账号 A 已经落盘、
+    账号 B 还没落盘时，页面会把**写了一半的状态**当成一份快照渲染出来。一次给全
+    就没有这个中间态（与 ``GET /api/rules`` 同一个考虑）。
+    """
+    status = {item["name"]: item for item in runtime.account_status()}
+    accounts: list[dict[str, Any]] = []
+    for record in store.load_registry().accounts:
+        config = store.load_account_config(record.name, create=False)
+        info = status.get(record.name, {})
+        reg_grab = config.reg_grab
+        tasks: list[dict[str, Any]] = []
+        for task in reg_grab.tasks:
+            item = task.model_dump(mode="json")
+            # 面板要按任务显示「配好了没有」「此刻在不在时段内」，不用自己重复一遍
+            # 判断逻辑；时段随时间跳变 ⇒ 每次 GET 现算，不落盘。
+            item["ready"] = task.ready
+            item["problem"] = task.problem
+            item["in_window"] = task.in_window
+            tasks.append(item)
+        accounts.append(
+            {
+                "name": record.name,
+                "username": record.username,
+                "display_name": record.display_name,
+                "enabled": record.enabled,
+                "running": bool(info.get("running")),
+                "session_exists": bool(info.get("session_exists")),
+                # 账号级开关与并发：字段名带前缀，免得和上面的账号自身 enabled 混淆
+                "reg_grab_enabled": reg_grab.enabled,
+                "max_concurrency": reg_grab.max_concurrency,
+                "tasks": tasks,
+            }
+        )
+    return {
+        "accounts": accounts,
+        # 时间框里填的是服务端时区（Asia/Shanghai），跟哪个账号无关 ⇒ 顶层一份。
+        "server_now": datetime.now().strftime("%H:%M"),
+    }
+
+
+@router.post("/reg_grab/tasks")
+async def api_reg_grab_task_create(
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """新增抢注任务；``accounts`` 为空表示写入**全部账号**（扇出）。
+
+    同 id 已存在的账号会被**跳过**而不是整单失败 —— 否则「把这条任务发给全部
+    账号」在某个账号里已经手工加过时就完全用不了了。全都冲突才返回 409。
+    """
+    targets = _resolve_rule_accounts(store, payload.get("accounts"))
+    if not targets:
+        raise HTTPException(status_code=400, detail="还没有任何账号，无法保存抢注任务")
+    # 目标账号里已占用的 id 交给生成规则避让（见 _validate_reg_grab_task 的 taken）。
+    # 空 id 不算"占用"：它本身就会被配置层的生成规则补上。
+    taken: set[str] = set()
+    for name in targets:
+        taken.update(
+            task.id
+            for task in store.load_account_config(name, create=False).reg_grab.tasks
+            if task.id
+        )
+    task = _validate_reg_grab_task(payload, taken=taken)
+
+    saved: list[str] = []
+    conflicts: list[str] = []
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        if any(existing.id == task.id for existing in config.reg_grab.tasks):
+            conflicts.append(name)
+            continue
+        config.reg_grab.tasks.append(task)
+        store.save_account_config(name, config)
+        saved.append(name)
+
+    if not saved:
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务 id {task.id!r} 在这些账号里都已存在：{'、'.join(conflicts)}",
+        )
+    return {
+        "ok": True,
+        "saved": saved,
+        "conflicts": conflicts,
+        "task": task.model_dump(mode="json"),
+    }
+
+
+@router.put("/reg_grab/tasks/{task_id}")
+async def api_reg_grab_task_update(
+    task_id: str,
+    payload: dict[str, Any],
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """覆盖一条抢注任务；改的是**所有拥有它的账号**里的那一份。
+
+    卡片上的启停开关走这里。为什么不发 N 个 per-account PUT：第 3 个账号失败时
+    前 2 个已经落盘了 —— 用户看到报错，却有一半账号已经变了，界面与磁盘不一致。
+    （与 ``PUT /api/rules/{id}`` 同一个语义。）
+    """
+    task = _validate_reg_grab_task(payload, fallback_id=task_id)
+    owners = _reg_grab_task_owners(store, task_id)
+    if not owners:
+        raise HTTPException(status_code=404, detail=f"抢注任务 {task_id!r} 不存在")
+
+    # 改 id 等于换一条任务：新 id 在该账号里已被占用时直接拒绝。写出重复 id 的后果
+    # 不是「多一条任务」而是**同一条消息被处理两次**。
+    if task.id != task_id:
+        for name in owners:
+            config = store.load_account_config(name, create=False)
+            if any(existing.id == task.id for existing in config.reg_grab.tasks):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"账号 {name} 里已存在 id {task.id!r} 的抢注任务，无法改名",
+                )
+
+    updated: list[str] = []
+    missing: list[str] = []
+    for name in owners:
+        config = store.load_account_config(name, create=False)
+        index = next(
+            (i for i, existing in enumerate(config.reg_grab.tasks) if existing.id == task_id),
+            None,
+        )
+        if index is None:
+            missing.append(name)
+            continue
+        config.reg_grab.tasks[index] = task
+        store.save_account_config(name, config)
+        updated.append(name)
+
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"抢注任务 {task_id!r} 不存在")
+    return {
+        "ok": True,
+        "updated": updated,
+        "missing": missing,
+        "task": task.model_dump(mode="json"),
+    }
+
+
+@router.delete("/reg_grab/tasks/{task_id}")
+async def api_reg_grab_task_delete(
+    task_id: str,
+    accounts: str | None = Query(
+        None, description="只从这些账号删除（逗号分隔）；缺省 = 所有拥有它的账号"
+    ),
+    store=Depends(get_store),
+) -> dict[str, Any]:
+    """删除抢注任务；``accounts`` 缺省表示从**所有拥有它的账号**里删掉。
+
+    面板上的「删除」= 全删（与规则页一致），只想让某个账号不跑这条任务时用
+    卡片上的「监听账号」取消那一个账号。
+    """
+    if accounts:
+        targets = _resolve_rule_accounts(store, accounts)
+    else:
+        targets = _reg_grab_task_owners(store, task_id)
+
+    removed: list[str] = []
+    missing: list[str] = []
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        before = len(config.reg_grab.tasks)
+        config.reg_grab.tasks = [task for task in config.reg_grab.tasks if task.id != task_id]
+        if len(config.reg_grab.tasks) == before:
+            missing.append(name)
+            continue
+        store.save_account_config(name, config)
+        removed.append(name)
+
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"抢注任务 {task_id!r} 不存在")
+    return {"ok": True, "removed": removed, "missing": missing}
 
 
 # --------------------------------------------------------------------------- #
