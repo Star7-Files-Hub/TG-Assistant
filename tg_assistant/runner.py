@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import signal
 import time
 from dataclasses import dataclass
@@ -43,9 +44,10 @@ from .config import (
     mask_phone,
     utc_now_iso,
 )
-from .bot_commands import StatusCommand, StatusData
+from .bot_commands import ProbeResult, RuleHit, StatusCommand, StatusData
 from .forwarder import CrossAccountDedupe, ForwardEngine
 from .logging_setup import get_logger
+from .matching import CompiledMatcher, compile_user_pattern
 from .notify import BotNotifier, NotifyTask
 from .paths import Paths
 from .proxy import resolve_proxy
@@ -687,6 +689,9 @@ class AccountRunner:
                 bot_token=self.config.notify.bot_token,
                 gather=self._status_snapshot,
                 send=self._reply_status,
+                # 正则测试的试跑接线：读实时 config、用引擎同一个匹配器，
+                # 结果只回私聊（绝不转发）。
+                probe=self._probe_text,
                 alog=self.alog,
                 # 回话要发给**本账号自己**：账号会话里和 bot 的私聊，chat.id 是 bot
                 # 自己的 id，而 Bot API 认的是对方的 user id。少了它就会 403
@@ -1006,12 +1011,17 @@ class AccountRunner:
                 data.metrics = self.metrics.totals()
         return data
 
-    async def _reply_status(self, chat_id: int, text: str) -> None:
-        """把面板文本**只**发回发起的那个私聊。
+    async def _reply_status(
+        self, chat_id: int, text: str, reply_markup: Optional[dict[str, Any]] = None
+    ) -> None:
+        """把面板/菜单/测试结果**只**发回发起的那个私聊。
 
         复用 :class:`BotNotifier` 的底层 ``_call`` —— 拿到它的代理/重试/429 处理，
-        但**绕开** ``submit``：``submit`` 会广播给所有配置的通知对象，而 ``/status``
-        的语义是「谁问，回给谁」，只能发这一个 chat_id。
+        但**绕开** ``submit``：``submit`` 会广播给所有配置的通知对象，而这里的语义是
+        「谁问，回给谁」，只能发这一个 chat_id。
+
+        ``reply_markup`` 是**按钮菜单**（回复键盘）的 Bot API 原生 dict，由
+        :mod:`tg_assistant.bot_commands` 直接给出，这里不做任何转换。
 
         🔴 必须自己看 ``_call`` 的返回值：它**不抛异常**，只返回 ``(ok, 错误, result)``。
         不看就等于把失败彻底吞掉 —— 线上实测过一次：回话被 Bot API 403 拒了，
@@ -1019,21 +1029,65 @@ class AccountRunner:
         """
         if self.notifier is None:
             return
-        ok, description, _ = await self.notifier._call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "link_preview_options": {"is_disabled": True},
-            },
-        )
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        ok, description, _ = await self.notifier._call("sendMessage", payload)
         if not ok:
             self.alog.warning(
                 "回复 /status 失败",
                 chat_id=chat_id,
                 error=description or "未知错误",
             )
+
+    def _probe_text(self, text: str, pattern: Optional[str] = None) -> ProbeResult:
+        """正则测试：在**本地**跑一遍匹配，只回答「会不会命中」。
+
+        - 规则部分用引擎同一个 :class:`CompiledMatcher`（连 ``MatchConfig`` 都是
+          规则自己的那一份），所以「测试器说命中」和「真转发时命中」不可能不一致。
+        - 自定义正则用引擎同一个 :func:`compile_user_pattern`（同样的
+          ``MULTILINE | IGNORECASE``），避免用户按 Python 默认口径试出假结果。
+        - 只读配置、只算匹配：**不发消息、不写 used_codes、不转发**。
+        """
+        result = ProbeResult(sample=text, custom_pattern=pattern)
+        rules = list(self.config.forward.rules)
+        result.enabled_rules = sum(1 for rule in rules if rule.enabled)
+        for rule in rules:
+            if not rule.enabled:
+                continue
+            try:
+                outcome = CompiledMatcher(rule.match).match_text(text)
+            except Exception as exc:  # 单条规则炸了不能连累其它规则
+                self.alog.warning(
+                    "正则试跑时规则出错",
+                    rule=rule.id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                continue
+            if outcome.matched:
+                result.hits.append(
+                    RuleHit(
+                        rule_id=str(rule.id),
+                        rule_name=getattr(rule, "name", None),
+                        pattern=outcome.keyword or "",
+                        groups=[g for g in outcome.groups if g],
+                    )
+                )
+        if pattern:
+            try:
+                found = compile_user_pattern(pattern, ignore_case=True).search(text)
+            except re.error as exc:
+                result.custom_error = str(exc)
+            else:
+                result.custom_matched = found is not None
+                if found is not None:
+                    result.custom_groups = [g for g in found.groups() if g]
+        return result
 
 
 # --------------------------------------------------------------------------- #

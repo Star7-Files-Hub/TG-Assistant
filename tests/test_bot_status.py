@@ -13,11 +13,22 @@ from typing import Any
 import pytest
 
 from tg_assistant.bot_commands import (
+    BTN_HIDE,
+    BTN_PANEL,
+    BTN_TEST,
+    RE_PREFIX,
     STATUS_HANDLER_GROUP,
+    ProbeResult,
+    RuleHit,
     StatusCommand,
     StatusData,
     bot_id_from_token,
+    build_hide_markup,
+    build_menu_markup,
+    build_probe_text,
     build_status_text,
+    build_test_hint_text,
+    is_own_bot_dm,
     is_status_command,
 )
 
@@ -155,13 +166,13 @@ class Recorder:
     """记录 send 被调用的参数（替代真实 BotNotifier._call）。"""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[int, str]] = []
+        self.sent: list[tuple[int, str, Any]] = []
 
-    async def __call__(self, chat_id: int, text: str) -> None:
-        self.sent.append((chat_id, text))
+    async def __call__(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
+        self.sent.append((chat_id, text, reply_markup))
 
 
-def make_command(alog, send=None, gather=None, self_id=ME_ID) -> StatusCommand:
+def make_command(alog, send=None, gather=None, self_id=ME_ID, probe=None) -> StatusCommand:
     return StatusCommand(
         bot_token=BOT_TOKEN,
         gather=gather or (lambda: StatusData(account_label="小白", running=True)),
@@ -169,6 +180,7 @@ def make_command(alog, send=None, gather=None, self_id=ME_ID) -> StatusCommand:
         alog=alog,
         # 本账号自己的 user id —— 回话真正要用的 chat_id（见下）。
         self_id=self_id,
+        probe=probe,
     )
 
 
@@ -215,10 +227,17 @@ class TestStatusCommandDispatch:
         cmd = make_command(alog, send=rec)
         await cmd._on_message(FakeClient(), status_msg())
         assert len(rec.sent) == 1
-        chat_id, text = rec.sent[0]
+        chat_id, text, markup = rec.sent[0]
         assert chat_id == ME_ID
         assert chat_id != BOT_ID
         assert "小白" in text and "🟢运行中" in text
+        # 面板回话必须**带着按钮菜单**（用户明确要的「回复下面加上按钮菜单」）。
+        assert markup is not None
+        assert [btn["text"] for row in markup["keyboard"] for btn in row] == [
+            BTN_PANEL,
+            BTN_TEST,
+            BTN_HIDE,
+        ]
 
     @pytest.mark.asyncio
     async def test_falls_back_to_chat_id_without_self_id(self, alog) -> None:
@@ -226,7 +245,7 @@ class TestStatusCommandDispatch:
         rec = Recorder()
         cmd = make_command(alog, send=rec, self_id=None)
         await cmd._on_message(FakeClient(), status_msg())
-        assert [chat_id for chat_id, _ in rec.sent] == [BOT_ID]
+        assert [chat_id for chat_id, _, _ in rec.sent] == [BOT_ID]
 
     @pytest.mark.asyncio
     async def test_ignores_non_status(self, alog) -> None:
@@ -237,7 +256,8 @@ class TestStatusCommandDispatch:
         assert rec.sent == []
 
     @pytest.mark.asyncio
-    async def test_gather_error_does_not_send_or_raise(self, alog) -> None:
+    async def test_gather_error_replies_with_notice_not_silence(self, alog) -> None:
+        """取数炸了也要**有回音** —— 「没回复」正是这次被投诉的症状。"""
         rec = Recorder()
 
         def boom() -> StatusData:
@@ -245,11 +265,12 @@ class TestStatusCommandDispatch:
 
         cmd = make_command(alog, send=rec, gather=boom)
         await cmd._on_message(FakeClient(), status_msg())  # 不应抛
-        assert rec.sent == []
+        assert len(rec.sent) == 1
+        assert "取面板数据失败" in rec.sent[0][1]
 
     @pytest.mark.asyncio
     async def test_send_error_is_swallowed(self, alog) -> None:
-        async def boom(chat_id: int, text: str) -> None:
+        async def boom(chat_id: int, text: str, markup=None) -> None:
             raise RuntimeError("发送炸了")
 
         cmd = make_command(alog, send=boom)
@@ -327,3 +348,291 @@ class TestReplyStatusChecksResult:
         stub = SimpleNamespace(notifier=None, alog=alog)
         await AccountRunner._reply_status(stub, ME_ID, "面板")  # 不应抛
         assert alog.warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# 按钮菜单（回复键盘）
+# --------------------------------------------------------------------------- #
+class TestMenuMarkup:
+    def test_menu_carries_the_three_buttons(self) -> None:
+        markup = build_menu_markup()
+        assert [btn["text"] for row in markup["keyboard"] for btn in row] == [
+            BTN_PANEL,
+            BTN_TEST,
+            BTN_HIDE,
+        ]
+        assert markup["resize_keyboard"] is True
+
+    def test_hide_markup_removes_keyboard(self) -> None:
+        assert build_hide_markup() == {"remove_keyboard": True}
+
+
+class TestIsOwnBotDm:
+    def test_true_for_own_outgoing_dm_with_this_bot(self) -> None:
+        assert is_own_bot_dm(status_msg(), bot_id=BOT_ID) is True
+
+    def test_false_for_other_chat_incoming_group_and_missing_bot_id(self) -> None:
+        assert is_own_bot_dm(status_msg(chat=FakeChat(999)), bot_id=BOT_ID) is False
+        assert is_own_bot_dm(status_msg(outgoing=False), bot_id=BOT_ID) is False
+        assert is_own_bot_dm(status_msg(), bot_id=None) is False
+        assert (
+            is_own_bot_dm(status_msg(chat=FakeChat(BOT_ID, chat_type="supergroup")), bot_id=BOT_ID)
+            is False
+        )
+
+
+class TestMenuRouting:
+    """按钮点一下 = 客户端发一条普通文本，所以路由就是按文本分发（没有 callback）。"""
+
+    @pytest.mark.asyncio
+    async def test_test_button_arms_test_mode(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=lambda text, pattern: ProbeResult(sample=text))
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        assert len(rec.sent) == 1
+        _, text, markup = rec.sent[0]
+        assert "正则测试" in text and "不会转发" in text
+        assert markup is not None  # 菜单继续挂着，方便连着测
+
+    @pytest.mark.asyncio
+    async def test_sample_text_is_probed_in_this_session_only(self, alog) -> None:
+        rec = Recorder()
+        calls: list[tuple[str, str | None]] = []
+
+        def probe(text: str, pattern: str | None) -> ProbeResult:
+            calls.append((text, pattern))
+            return ProbeResult(
+                sample=text,
+                hits=[RuleHit(rule_id="1", pattern="预告", groups=["abc"])],
+                enabled_rules=2,
+            )
+
+        cmd = make_command(alog, send=rec, probe=probe)
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        await cmd._on_message(FakeClient(), status_msg("🎁 预告 abc"))
+        assert calls == [("🎁 预告 abc", None)]
+        # 回话只回到这个会话（self_id），内容里给出命中结论
+        chat_id, text, _ = rec.sent[-1]
+        assert chat_id == ME_ID
+        assert "会被转发" in text and "预告" in text
+
+    @pytest.mark.asyncio
+    async def test_text_outside_test_mode_stays_silent(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=lambda text, pattern: ProbeResult(sample=text))
+        await cmd._on_message(FakeClient(), status_msg("随便一句话"))
+        assert rec.sent == []
+
+    @pytest.mark.asyncio
+    async def test_panel_button_exits_test_mode(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=lambda text, pattern: ProbeResult(sample=text))
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        await cmd._on_message(FakeClient(), status_msg(BTN_PANEL))
+        assert "运行中" in rec.sent[-1][1]
+        sent = len(rec.sent)
+        await cmd._on_message(FakeClient(), status_msg("随便一句话"))
+        assert len(rec.sent) == sent  # 已退出测试模式 → 不再当样本
+
+    @pytest.mark.asyncio
+    async def test_hide_button_removes_keyboard(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=lambda text, pattern: ProbeResult(sample=text))
+        await cmd._on_message(FakeClient(), status_msg(BTN_HIDE))
+        assert rec.sent[-1][2] == {"remove_keyboard": True}
+
+    @pytest.mark.asyncio
+    async def test_re_sets_and_clears_custom_pattern(self, alog) -> None:
+        rec = Recorder()
+        seen: list[str | None] = []
+
+        def probe(text: str, pattern: str | None) -> ProbeResult:
+            seen.append(pattern)
+            return ProbeResult(sample=text, custom_pattern=pattern)
+
+        cmd = make_command(alog, send=rec, probe=probe)
+        await cmd._on_message(FakeClient(), status_msg(f"{RE_PREFIX} \\d+"))
+        await cmd._on_message(FakeClient(), status_msg("abc123"))
+        await cmd._on_message(FakeClient(), status_msg(RE_PREFIX))  # 清空
+        await cmd._on_message(FakeClient(), status_msg("abc123"))
+        assert seen == ["\\d+", None]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_still_replies(self, alog) -> None:
+        rec = Recorder()
+
+        def boom(text: str, pattern: str | None) -> ProbeResult:
+            raise RuntimeError("试跑炸了")
+
+        cmd = make_command(alog, send=rec, probe=boom)
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        await cmd._on_message(FakeClient(), status_msg("样本"))  # 不应抛
+        assert "试跑失败" in rec.sent[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_probe_not_wired_replies_hint(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=None)
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        await cmd._on_message(FakeClient(), status_msg("样本"))
+        assert "没接线" in rec.sent[-1][1]
+
+
+# --------------------------------------------------------------------------- #
+# 试跑结果的渲染
+# --------------------------------------------------------------------------- #
+class TestBuildProbeText:
+    def test_hit_shows_rule_pattern_and_groups(self) -> None:
+        text = build_probe_text(
+            ProbeResult(
+                sample="🎁 预告 abc",
+                hits=[RuleHit(rule_id="1", rule_name="主规则", pattern="预告", groups=["abc"])],
+                enabled_rules=3,
+            )
+        )
+        assert "会被转发" in text and "命中 1 条规则" in text
+        assert "主规则" in text and "预告" in text and "abc" in text
+
+    def test_miss_reports_enabled_rule_count(self) -> None:
+        text = build_probe_text(ProbeResult(sample="hello", enabled_rules=2))
+        assert "不会转发" in text and "2 条启用规则都没命中" in text
+
+    def test_no_enabled_rules_is_distinguished_from_miss(self) -> None:
+        text = build_probe_text(ProbeResult(sample="hello", enabled_rules=0))
+        assert "没有启用任何转发规则" in text
+
+    def test_custom_regex_hit_groups_and_invalid_pattern(self) -> None:
+        ok = build_probe_text(
+            ProbeResult(
+                sample="a1",
+                custom_pattern="\\d",
+                custom_matched=True,
+                custom_groups=["1"],
+                enabled_rules=1,
+            )
+        )
+        assert "✅ 命中" in ok and "捕获组" in ok
+        bad = build_probe_text(
+            ProbeResult(
+                sample="a1",
+                custom_pattern="([",
+                custom_error="missing ), unterminated subpattern",
+                enabled_rules=1,
+            )
+        )
+        assert "⚠️ 无效" in bad
+
+    def test_html_is_escaped(self) -> None:
+        text = build_probe_text(
+            ProbeResult(
+                sample="<b>粗体</b> & 样本",
+                hits=[RuleHit(rule_id="<script>", pattern="<i>", groups=["<x>"])],
+                enabled_rules=1,
+            )
+        )
+        assert "<b>粗体</b>" not in text
+        assert "&lt;b&gt;" in text and "&amp;" in text
+        assert "<script>" not in text and "<i>" not in text
+
+    def test_long_sample_is_clipped(self) -> None:
+        text = build_probe_text(ProbeResult(sample="x" * 500, enabled_rules=1))
+        assert "…" in text
+
+
+# --------------------------------------------------------------------------- #
+# runner._probe_text：必须和引擎用同一套匹配
+# --------------------------------------------------------------------------- #
+class TestRunnerProbeUsesEngine:
+    """试跑要是自己另写一套 ``re``，就会和真转发给出不同答案 —— 用户只会信测试器。"""
+
+    @staticmethod
+    def _runner_like(rules: list[Any]):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            config=SimpleNamespace(forward=SimpleNamespace(rules=rules)), alog=_FakeAlog()
+        )
+
+    @staticmethod
+    def _rule(**kwargs: Any):
+        from types import SimpleNamespace
+
+        from tg_assistant.config import MatchConfig
+
+        base: dict[str, Any] = {
+            "id": "1",
+            "name": None,
+            "enabled": True,
+            "match": MatchConfig(mode="regex", patterns=["预告"]),
+        }
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    def test_reports_hit_rule_and_captured_groups(self) -> None:
+        from tg_assistant.config import MatchConfig
+        from tg_assistant.runner import AccountRunner
+
+        rule = self._rule(
+            name="主规则",
+            match=MatchConfig(mode="regex", patterns=["预告[:：]\\s*([A-Za-z0-9]+)"]),
+        )
+        result = AccountRunner._probe_text(self._runner_like([rule]), "🎁 预告：abc123")
+        assert result.enabled_rules == 1
+        assert [hit.rule_id for hit in result.hits] == ["1"]
+        assert result.hits[0].groups == ["abc123"]
+        assert result.hits[0].rule_name == "主规则"
+
+    def test_disabled_rule_is_ignored(self) -> None:
+        from tg_assistant.config import MatchConfig
+        from tg_assistant.runner import AccountRunner
+
+        rule = self._rule(enabled=False, match=MatchConfig(mode="regex", patterns=["预告"]))
+        result = AccountRunner._probe_text(self._runner_like([rule]), "预告")
+        assert result.hits == [] and result.enabled_rules == 0
+
+    def test_exclude_pattern_vetoes_like_the_engine(self) -> None:
+        from tg_assistant.config import MatchConfig
+        from tg_assistant.runner import AccountRunner
+
+        rule = self._rule(
+            match=MatchConfig(
+                mode="regex", patterns=["预告"], exclude_patterns=["千万别抽"]
+            )
+        )
+        result = AccountRunner._probe_text(
+            self._runner_like([rule]), "预告 机器人测试器 正常用户千万别抽"
+        )
+        assert result.hits == []  # 排除项是整条消息的一票否决，和引擎一致
+
+    def test_custom_pattern_uses_engine_flags(self) -> None:
+        """引擎是 ``MULTILINE | IGNORECASE``：``^`` 要能匹配第二行、大小写要忽略。"""
+        from tg_assistant.runner import AccountRunner
+
+        result = AccountRunner._probe_text(
+            self._runner_like([]), "第一行\nT.ME/SomeBot", "^t\\.me/somebot$"
+        )
+        assert result.custom_matched is True
+
+    def test_bad_custom_pattern_reports_error_without_raising(self) -> None:
+        from tg_assistant.runner import AccountRunner
+
+        result = AccountRunner._probe_text(self._runner_like([]), "abc", "([")
+        assert result.custom_error and result.custom_matched is False
+
+    def test_broken_rule_does_not_hide_other_rules(self) -> None:
+        """某条规则在**匹配期**炸掉时，其余规则照样要给答案。
+
+        注意：非法正则在配置校验阶段就被 pydantic 挡掉了（进不了 config），
+        所以这里用桩对象模拟「匹配期异常」，覆盖的是 _probe_text 里的兜底分支。
+        """
+        from tg_assistant.config import MatchConfig
+        from tg_assistant.runner import AccountRunner
+
+        class _ExplodingMatch:
+            def __getattr__(self, item: str) -> Any:
+                raise RuntimeError("匹配期炸了")
+
+        broken = self._rule(id="坏", match=_ExplodingMatch())
+        good = self._rule(id="好", match=MatchConfig(mode="regex", patterns=["预告"]))
+        result = AccountRunner._probe_text(self._runner_like([broken, good]), "预告")
+        assert [hit.rule_id for hit in result.hits] == ["好"]
