@@ -19,7 +19,7 @@ from tg_assistant.bot_commands import (
     RE_PREFIX,
     STATUS_HANDLER_GROUP,
     ProbeResult,
-    RuleHit,
+    RuleProbe,
     StatusCommand,
     StatusData,
     bot_id_from_token,
@@ -285,9 +285,13 @@ class _FakeAlog:
 
     def __init__(self) -> None:
         self.warnings: list[tuple[str, dict[str, Any]]] = []
+        self.infos: list[tuple[str, dict[str, Any]]] = []
 
     def warning(self, message: str, **kwargs: Any) -> None:
         self.warnings.append((message, kwargs))
+
+    def info(self, message: str, **kwargs: Any) -> None:
+        self.infos.append((message, kwargs))
 
 
 class _FakeNotifier:
@@ -403,7 +407,7 @@ class TestMenuRouting:
             calls.append((text, pattern))
             return ProbeResult(
                 sample=text,
-                hits=[RuleHit(rule_id="1", pattern="预告", groups=["abc"])],
+                rules=[RuleProbe(rule_id="1", matched=True, pattern="预告", groups=["abc"])],
                 enabled_rules=2,
             )
 
@@ -486,7 +490,15 @@ class TestBuildProbeText:
         text = build_probe_text(
             ProbeResult(
                 sample="🎁 预告 abc",
-                hits=[RuleHit(rule_id="1", rule_name="主规则", pattern="预告", groups=["abc"])],
+                rules=[
+                    RuleProbe(
+                        rule_id="1",
+                        rule_name="主规则",
+                        matched=True,
+                        pattern="预告",
+                        groups=["abc"],
+                    )
+                ],
                 enabled_rules=3,
             )
         )
@@ -526,7 +538,7 @@ class TestBuildProbeText:
         text = build_probe_text(
             ProbeResult(
                 sample="<b>粗体</b> & 样本",
-                hits=[RuleHit(rule_id="<script>", pattern="<i>", groups=["<x>"])],
+                rules=[RuleProbe(rule_id="<script>", matched=True, pattern="<i>", groups=["<x>"])],
                 enabled_rules=1,
             )
         )
@@ -550,7 +562,9 @@ class TestRunnerProbeUsesEngine:
         from types import SimpleNamespace
 
         return SimpleNamespace(
-            config=SimpleNamespace(forward=SimpleNamespace(rules=rules)), alog=_FakeAlog()
+            name="小白",
+            config=SimpleNamespace(forward=SimpleNamespace(rules=rules)),
+            alog=_FakeAlog(),
         )
 
     @staticmethod
@@ -636,3 +650,164 @@ class TestRunnerProbeUsesEngine:
         good = self._rule(id="好", match=MatchConfig(mode="regex", patterns=["预告"]))
         result = AccountRunner._probe_text(self._runner_like([broken, good]), "预告")
         assert [hit.rule_id for hit in result.hits] == ["好"]
+
+
+class TestProbeExplainsWhyItDidNotMatch:
+    """「明明转发过、现在测却不命中」几乎都是排除项后来才加上的 —— 必须说清楚。"""
+
+    def test_blocked_by_exclude_is_spelled_out(self) -> None:
+        text = build_probe_text(
+            ProbeResult(
+                sample="🎰 机器人测试器，正常用户千万别抽\n\n🎁 奖品内容",
+                rules=[
+                    RuleProbe(
+                        rule_id="1",
+                        matched=False,
+                        reason="命中排除规则",
+                        blocked_by=["机器人测试器|正常用户千万别抽"],
+                    )
+                ],
+                enabled_rules=1,
+            )
+        )
+        assert "不会转发" in text
+        assert "命中排除规则" in text
+        assert "机器人测试器|正常用户千万别抽" in text
+
+    def test_plain_miss_shows_engine_reason(self) -> None:
+        text = build_probe_text(
+            ProbeResult(
+                sample="无关文本",
+                rules=[RuleProbe(rule_id="1", matched=False, reason="所有正则均未命中")],
+                enabled_rules=1,
+            )
+        )
+        assert "所有正则均未命中" in text
+        assert "排除项" not in text  # 没有排除项就别提，免得误导
+
+    def test_hit_does_not_dump_miss_detail(self) -> None:
+        """命中时不必摊开「为什么没命中」，免得回话变噪音。"""
+        text = build_probe_text(
+            ProbeResult(
+                sample="预告",
+                rules=[RuleProbe(rule_id="1", matched=True, pattern="预告")],
+                enabled_rules=2,
+            )
+        )
+        assert "会被转发" in text
+
+
+class TestRunnerProbeReportsBlockingExclude:
+    @staticmethod
+    def _runner_like(rules: list[Any], alog: Any = None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name="小白",
+            config=SimpleNamespace(forward=SimpleNamespace(rules=rules)),
+            alog=alog or _FakeAlog(),
+        )
+
+    def test_exclude_veto_names_the_pattern(self) -> None:
+        from types import SimpleNamespace
+
+        from tg_assistant.config import MatchConfig
+        from tg_assistant.runner import AccountRunner
+
+        rule = SimpleNamespace(
+            id="1",
+            name=None,
+            enabled=True,
+            match=MatchConfig(
+                mode="regex", patterns=["预告"], exclude_patterns=["千万别抽"]
+            ),
+        )
+        result = AccountRunner._probe_text(
+            self._runner_like([rule]), "预告 机器人测试器 正常用户千万别抽"
+        )
+        assert result.hits == []
+        assert result.rules[0].reason == "命中排除规则"
+        assert result.rules[0].blocked_by == ["千万别抽"]
+
+    def test_probe_is_logged_with_sample_and_reasons(self) -> None:
+        """试跑必须留日志 —— 否则用户来问「刚才那条为什么没命中」就是无头案。"""
+        from tg_assistant.runner import AccountRunner
+
+        alog = _FakeAlog()
+        AccountRunner._probe_text(self._runner_like([], alog), "样本文本" * 100)
+        assert [item[0] for item in alog.infos] == ["正则试跑"]
+        assert alog.infos[0][1]["sample_len"] == 400
+        assert len(alog.infos[0][1]["sample"]) <= 121  # 日志里截断，别灌满磁盘
+
+    def test_exception_rule_is_reported_not_hidden(self) -> None:
+        """某条规则试跑炸了也要在明细里露出来，不能悄悄少一条。"""
+        from types import SimpleNamespace
+
+        from tg_assistant.runner import AccountRunner
+
+        class _ExplodingMatch:
+            def __getattr__(self, item: str) -> Any:
+                raise RuntimeError("匹配期炸了")
+
+        rule = SimpleNamespace(id="坏", name=None, enabled=True, match=_ExplodingMatch())
+        result = AccountRunner._probe_text(self._runner_like([rule]), "预告")
+        assert result.hits == []
+        assert "试跑异常" in result.rules[0].reason
+
+
+class TestProbeNamesTheAccount:
+    """每个账号的规则是各自独立的，回话必须说清是在哪个账号上试跑的。"""
+
+    def test_account_label_is_in_the_header(self) -> None:
+        text = build_probe_text(
+            ProbeResult(sample="预告", account_label="SevenStar", enabled_rules=2)
+        )
+        assert "SevenStar" in text
+
+    def test_account_label_is_filled_from_runner(self) -> None:
+        from types import SimpleNamespace
+
+        from tg_assistant.runner import AccountRunner
+
+        runner = SimpleNamespace(
+            name="SevenStar",
+            config=SimpleNamespace(forward=SimpleNamespace(rules=[])),
+            alog=_FakeAlog(),
+        )
+        result = AccountRunner._probe_text(runner, "预告")
+        assert result.account_label == "SevenStar"
+
+
+class TestCaptionIsReadLikeTheEngine:
+    """带图消息的正文在 caption 里，而引擎的 fields=['text','caption'] 两者都看。
+
+    只读 text 的话，用户转发一张带文字的图来测，测的就是**空字符串** —— 线上
+    实测踩过这个坑，症状正是「明明转发过，测出来却没命中」。
+    """
+
+    @pytest.mark.asyncio
+    async def test_caption_text_is_used_as_sample(self, alog) -> None:
+        rec = Recorder()
+        seen: list[str] = []
+
+        def probe(text: str, pattern: str | None) -> ProbeResult:
+            seen.append(text)
+            return ProbeResult(sample=text)
+
+        cmd = make_command(alog, send=rec, probe=probe)
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        # text=None + caption=...：正是「转发带说明文字的图片」的样子
+        await cmd._on_message(FakeClient(), status_msg(None, caption="🎁 预告 abc"))
+        assert seen == ["🎁 预告 abc"]
+
+    @pytest.mark.asyncio
+    async def test_media_without_any_text_still_replies(self, alog) -> None:
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, probe=lambda text, pattern: ProbeResult(sample=text))
+        await cmd._on_message(FakeClient(), status_msg(BTN_TEST))
+        await cmd._on_message(FakeClient(), status_msg(None))  # 纯图片，什么都没有
+        assert "样本是空的" in rec.sent[-1][1]
+
+    def test_empty_sample_notice_in_render(self) -> None:
+        text = build_probe_text(ProbeResult(sample="", enabled_rules=2))
+        assert "样本是空的" in text

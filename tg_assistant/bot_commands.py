@@ -59,7 +59,7 @@ __all__ = [
     "BTN_TEST",
     "BTN_HIDE",
     "ProbeResult",
-    "RuleHit",
+    "RuleProbe",
     "StatusData",
     "bot_id_from_token",
     "build_hide_markup",
@@ -249,13 +249,24 @@ def build_hide_markup() -> dict[str, Any]:
 # 正则测试
 # --------------------------------------------------------------------------- #
 @dataclass
-class RuleHit:
-    """一条命中的转发规则。"""
+class RuleProbe:
+    """**一条**启用规则的试跑明细（命中和没命中的都记）。
+
+    ``reason`` 直接来自引擎的 :class:`~tg_assistant.matching.MatchResult` ——
+    它才是回答「这条为什么没被转发」的关键：是**所有正则都没命中**，还是
+    **本来能命中但被排除项挡了**（``blocked_by`` 给出是哪几条）。只回一句
+    「未命中」，用户除了再问一次什么也做不了。
+    """
 
     rule_id: str
     rule_name: Optional[str] = None
+    matched: bool = False
+    reason: str = ""
+    #: 命中的那条正则原文（``matched`` 为真时有意义）。
     pattern: str = ""
     groups: list[str] = field(default_factory=list)
+    #: 挡下这条消息的排除项原文（``reason == "命中排除规则"`` 时有值）。
+    blocked_by: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -267,15 +278,23 @@ class ProbeResult:
     """
 
     sample: str = ""
+    #: 在**哪个账号**上试跑。每个账号的规则是各自独立的（例如「宸澄」只挂在
+    #: SevenStar 上），不写清楚就会出现「在小白这边测 SevenStar 转发过的消息」这种
+    #: 白忙一场的误会。
+    account_label: str = ""
     #: 用户用 ``/re`` 设的自定义正则（没设就是 None）。
     custom_pattern: Optional[str] = None
     custom_error: Optional[str] = None
     custom_matched: bool = False
     custom_groups: list[str] = field(default_factory=list)
-    #: 命中的规则（只含**启用**的规则）。
-    hits: list[RuleHit] = field(default_factory=list)
+    #: 每条**启用**规则的试跑明细（含没命中的，用来解释原因）。
+    rules: list[RuleProbe] = field(default_factory=list)
     #: 当前启用的规则总数 —— 用来区分「没命中」和「压根没启用规则」。
     enabled_rules: int = 0
+
+    @property
+    def hits(self) -> list[RuleProbe]:
+        return [item for item in self.rules if item.matched]
 
 
 def _clip(value: Any, limit: int = 160) -> str:
@@ -307,10 +326,17 @@ def build_test_hint_text(custom_pattern: Optional[str] = None) -> str:
 def build_probe_text(result: ProbeResult) -> str:
     """把试跑结果渲成回话（HTML）。"""
     lines = [
-        "🔍 <b>正则测试</b>（仅本会话，未转发）",
+        f"🔍 <b>正则测试</b> · {_clip(result.account_label or '本账号', 30)}（仅本会话，未转发）",
         f"📄 样本：<code>{_clip(result.sample, 300)}</code>",
-        "",
     ]
+    if not result.sample.strip():
+        # 空样本几乎总是「这条消息没有正文」：纯图片/贴纸/文件，或说明文字没取到。
+        # 不明说，用户只会看到「没命中」，然后来问为什么。
+        lines.append(
+            "⚠️ <b>样本是空的</b>：这条消息没有正文/说明文字（纯图片、贴纸、文件？），"
+            "空文本当然什么都匹配不到。请把**文字**发过来。"
+        )
+    lines.append("")
     if result.custom_pattern:
         if result.custom_error:
             lines.append(
@@ -328,22 +354,37 @@ def build_probe_text(result: ProbeResult) -> str:
                 )
         lines.append("")
 
-    if result.hits:
-        lines.append(f"📤 <b>会被转发</b>：命中 {len(result.hits)} 条规则")
-        for hit in result.hits[:5]:
+    hits = result.hits
+    if hits:
+        lines.append(f"📤 <b>会被转发</b>：命中 {len(hits)} 条规则")
+        for hit in hits[:5]:
             name = f"（{_clip(hit.rule_name, 40)}）" if hit.rule_name else ""
             lines.append(f"• 规则 <b>{_clip(hit.rule_id, 40)}</b>{name}")
             if hit.pattern:
                 lines.append(f"   正则：<code>{_clip(hit.pattern, 120)}</code>")
             if hit.groups:
                 lines.append(f"   捕获组：<code>{_group_list(hit.groups)}</code>")
-        if len(result.hits) > 5:
-            lines.append(f"…另有 {len(result.hits) - 5} 条")
+        if len(hits) > 5:
+            lines.append(f"…另有 {len(hits) - 5} 条")
     elif result.enabled_rules == 0:
         lines.append("📤 <b>不会转发</b>：本账号当前没有启用任何转发规则")
     else:
         lines.append(f"📤 <b>不会转发</b>：{result.enabled_rules} 条启用规则都没命中")
-    lines += ["", "（口径与引擎一致：忽略大小写 + 多行；只读配置，不转发）"]
+        # 没命中时把「为什么」摊开 —— 尤其要指出**是不是被排除项挡的**：
+        # 这正是「明明转发过、现在测却不命中」最常见的原因（规则后来加了排除）。
+        for miss in result.rules[:5]:
+            name = f"（{_clip(miss.rule_name, 40)}）" if miss.rule_name else ""
+            lines.append(f"   • 规则 <b>{_clip(miss.rule_id, 40)}</b>{name}")
+            lines.append(f"     原因：{_clip(miss.reason or '未命中', 100)}")
+            if miss.blocked_by:
+                lines.append(
+                    f"     挡下它的排除项：<code>{_group_list(miss.blocked_by, 3)}</code>"
+                )
+    lines += [
+        "",
+        "（正则口径与引擎一致：忽略大小写 + 多行。只读配置，不转发。）",
+        "（注意：这里只测**文本**，不含来源群/发送者/已用码/去重这些转发时的门槛。）",
+    ]
     return "\n".join(lines)
 
 
@@ -442,7 +483,13 @@ class StatusCommand:
                 chat_id=chat_id,
                 hint="runner 应从 get_me() 传入 self_id",
             )
-        text = (getattr(message, "text", None) or "").strip()
+        # 🔴 必须和引擎一样读「正文 **或** 说明文字」：带图消息的正文在 ``caption``
+        # 里（``text`` 是 None），而引擎的 ``fields=['text','caption']`` 两者都看。
+        # 只读 text 的话，用户转发一张带文字的图来测，测的就是**空字符串**，
+        # 结果当然是「没命中」—— 实测踩过这个坑。
+        text = str(
+            getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        ).strip()
         is_status = is_status_command(
             message, bot_id=self.bot_id, bot_username=self.bot_username
         )

@@ -461,3 +461,31 @@ class TestHelpers:
     def test_truncate_default_limit_is_safe_for_telegram(self):
         long_text = "字" * 5000
         assert len(truncate(long_text)) <= 4096
+
+
+class TestExcludeHits:
+    """``exclude_hits`` 只用于**解释**「为什么没转发」，判定仍走 ``_exclude_hit``。"""
+
+    def test_regex_mode_names_every_hitting_exclude(self) -> None:
+        matcher = CompiledMatcher(
+            MatchConfig(mode="regex", patterns=["预告"], exclude_patterns=["抽奖", "千万别抽"])
+        )
+        assert matcher.exclude_hits("正常用户千万别抽") == ["千万别抽"]
+        assert matcher.exclude_hits("抽奖 千万别抽") == ["抽奖", "千万别抽"]
+        assert matcher.exclude_hits("预告") == []
+
+    def test_contains_mode_respects_ignore_case(self) -> None:
+        matcher = CompiledMatcher(
+            MatchConfig(mode="contains", patterns=["预告"], exclude_patterns=["Test"])
+        )
+        assert matcher.exclude_hits("这是 test 消息") == ["Test"]
+        strict = CompiledMatcher(
+            MatchConfig(
+                mode="contains", patterns=["预告"], exclude_patterns=["Test"], ignore_case=False
+            )
+        )
+        assert strict.exclude_hits("这是 test 消息") == []
+
+    def test_no_excludes_is_empty(self) -> None:
+        matcher = CompiledMatcher(MatchConfig(mode="regex", patterns=["预告"]))
+        assert matcher.exclude_hits("预告") == []

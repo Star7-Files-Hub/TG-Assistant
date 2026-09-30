@@ -44,7 +44,7 @@ from .config import (
     mask_phone,
     utc_now_iso,
 )
-from .bot_commands import ProbeResult, RuleHit, StatusCommand, StatusData
+from .bot_commands import ProbeResult, RuleProbe, StatusCommand, StatusData
 from .forwarder import CrossAccountDedupe, ForwardEngine
 from .logging_setup import get_logger
 from .matching import CompiledMatcher, compile_user_pattern
@@ -1050,34 +1050,55 @@ class AccountRunner:
 
         - 规则部分用引擎同一个 :class:`CompiledMatcher`（连 ``MatchConfig`` 都是
           规则自己的那一份），所以「测试器说命中」和「真转发时命中」不可能不一致。
+        - 每条规则都记下引擎给的 ``reason``，被排除项挡下时再用
+          :meth:`CompiledMatcher.exclude_hits` 指出**是哪几条** —— 「明明转发过、
+          现在测却不命中」几乎都是这个原因（规则后来加了排除），只回一句
+          「未命中」用户没法自查。
         - 自定义正则用引擎同一个 :func:`compile_user_pattern`（同样的
           ``MULTILINE | IGNORECASE``），避免用户按 Python 默认口径试出假结果。
         - 只读配置、只算匹配：**不发消息、不写 used_codes、不转发**。
+        - 同时打一条 INFO 日志。曾经这里不打日志，用户来问「刚才那条为什么没命中」
+          时我连他测的是什么文本都看不到 —— 盲点必须堵上。
         """
-        result = ProbeResult(sample=text, custom_pattern=pattern)
+        result = ProbeResult(sample=text, custom_pattern=pattern, account_label=self.name)
         rules = list(self.config.forward.rules)
         result.enabled_rules = sum(1 for rule in rules if rule.enabled)
         for rule in rules:
             if not rule.enabled:
                 continue
             try:
-                outcome = CompiledMatcher(rule.match).match_text(text)
+                matcher = CompiledMatcher(rule.match)
+                outcome = matcher.match_text(text)
+                blocked = (
+                    matcher.exclude_hits(text)
+                    if outcome.reason == "命中排除规则"
+                    else []
+                )
             except Exception as exc:  # 单条规则炸了不能连累其它规则
                 self.alog.warning(
                     "正则试跑时规则出错",
                     rule=rule.id,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                continue
-            if outcome.matched:
-                result.hits.append(
-                    RuleHit(
+                result.rules.append(
+                    RuleProbe(
                         rule_id=str(rule.id),
                         rule_name=getattr(rule, "name", None),
-                        pattern=outcome.keyword or "",
-                        groups=[g for g in outcome.groups if g],
+                        reason=f"试跑异常：{type(exc).__name__}: {exc}",
                     )
                 )
+                continue
+            result.rules.append(
+                RuleProbe(
+                    rule_id=str(rule.id),
+                    rule_name=getattr(rule, "name", None),
+                    matched=outcome.matched,
+                    reason=outcome.reason,
+                    pattern=outcome.keyword or "",
+                    groups=[g for g in outcome.groups if g],
+                    blocked_by=blocked,
+                )
+            )
         if pattern:
             try:
                 found = compile_user_pattern(pattern, ignore_case=True).search(text)
@@ -1087,6 +1108,14 @@ class AccountRunner:
                 result.custom_matched = found is not None
                 if found is not None:
                     result.custom_groups = [g for g in found.groups() if g]
+        self.alog.info(
+            "正则试跑",
+            sample=text[:120],
+            sample_len=len(text),
+            custom_pattern=pattern,
+            hits=[item.rule_id for item in result.hits],
+            reasons={item.rule_id: item.reason for item in result.rules},
+        )
         return result
 
 

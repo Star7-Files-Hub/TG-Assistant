@@ -278,16 +278,26 @@ class CompiledMatcher:
         return MatchResult(False, reason=f"所有关键词均未命中（mode={config.mode}）")
 
     def _exclude_hit(self, text: str) -> bool:
+        return bool(self.exclude_hits(text))
+
+    def exclude_hits(self, text: str) -> list[str]:
+        """命中的排除项**原文**列表（可能多条）。
+
+        判定本身仍然只认 :meth:`_exclude_hit` 的布尔结果；这里额外把「是哪一条」
+        报出来，是为了让面板/私聊里的测试器能回答用户真正会问的那句
+        「这条为什么没被转发」—— 只说「命中排除规则」等于什么都没说。
+        比较逻辑与 ``_exclude_hit`` 共用一份，避免两处口径漂移。
+        """
         if not self._excludes:
-            return False
+            return []
         if self.config.mode == "regex":
-            return any(pattern.search(text) for _, pattern in self._excludes)  # type: ignore[union-attr]
+            return [raw for raw, pattern in self._excludes if pattern.search(text)]  # type: ignore[union-attr]
         haystack = text.lower() if self.config.ignore_case else text
-        for raw, _ in self._excludes:
-            needle = raw.lower() if self.config.ignore_case else raw
-            if needle in haystack:
-                return True
-        return False
+        return [
+            raw
+            for raw, _ in self._excludes
+            if (raw.lower() if self.config.ignore_case else raw) in haystack
+        ]
 
 
 #: 用户写的正则一律按**逐行**语义编译（``re.MULTILINE``）。
