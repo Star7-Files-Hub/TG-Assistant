@@ -15,6 +15,14 @@ Bot API 拉取类调用都不发。
 做判断，命中就用**现成的** :class:`~tg_assistant.notify.BotNotifier` 把面板文本
 发回**这个私聊**。全程只是「收自己发的消息 + 回一条消息」，不碰任何全局状态。
 
+🔴 **回话的 chat_id 不能用 ``message.chat.id``**：账号会话里和 bot 的私聊，
+``chat.id`` 是 **bot 自己的 id**（判定条件本身就是 ``chat.id == bot_id``）。
+可回复是走 **Bot API** 发的 —— 对 bot 而言那个 id 就是它自己，实测被拒：
+
+    403 Forbidden: the bot can't send messages to the bot
+
+Bot API 要的是**对方**（= 本账号）的 user id，所以必须用注入的 ``self_id``。
+
 🔴 **为什么只认 /status、其它一律沉默**：同一个 bot 还挂着别的项目。只要有一丁点
 「顺手也支持一下 /start /help」的想法，就会和别的项目抢命令、互相覆盖回复。
 所以匹配不上时**什么都不做**（只留一行 debug），绝不注册第二个命令、绝不回默认话术。
@@ -184,6 +192,9 @@ class StatusCommand:
       现成的 :class:`~tg_assistant.notify.BotNotifier` 上，复用其代理/重试/限速，
       而且**只发回发起的那个会话**（不用 ``BotNotifier.submit`` —— 那个会广播给所有
       通知对象）。
+    - ``self_id``：**本账号自己的 user id**（runner 从 ``get_me()`` 拿到）。它是回话
+      真正要用的 chat_id —— 见模块开头「回话的 chat_id 不能用 ``message.chat.id``」。
+      拿不到时退回 ``message.chat.id``（旧行为，会 403，但至少不会把异常吞了）。
     """
 
     def __init__(
@@ -194,12 +205,14 @@ class StatusCommand:
         send: Callable[[int, str], Awaitable[None]],
         alog: Any,
         bot_username: Optional[str] = None,
+        self_id: Optional[int] = None,
     ) -> None:
         self.bot_id = bot_id_from_token(bot_token)
         self.gather = gather
         self.send = send
         self.alog = alog
         self.bot_username = bot_username
+        self.self_id = self_id
         self._handlers: list[tuple[Any, int]] = []
 
     def register(self, client: Any) -> None:
@@ -211,7 +224,14 @@ class StatusCommand:
         # 剩下的「是不是自己发的、文本对不对、是不是这个 bot」交给 is_status_command。
         handler = MessageHandler(self._on_message, filters.private)
         self._handlers.append(client.add_handler(handler, group=STATUS_HANDLER_GROUP))
-        self.alog.info("已注册 /status 指令", bot_id=self.bot_id, group=STATUS_HANDLER_GROUP)
+        # 把 self_id 一起打出来：它是回话真正的目标，错了会 403 静默失效。
+        # 打出来才能在**不发消息**的前提下核对「这个账号的 /status 会回到哪」。
+        self.alog.info(
+            "已注册 /status 指令",
+            bot_id=self.bot_id,
+            self_id=self.self_id,
+            group=STATUS_HANDLER_GROUP,
+        )
 
     def unregister(self, client: Any) -> None:
         for handler, group in self._handlers:
@@ -231,6 +251,18 @@ class StatusCommand:
         chat_id = getattr(getattr(message, "chat", None), "id", None)
         if chat_id is None:
             return
+        # 🔴 回话目标不能直接用 chat_id：这里的 chat_id 是**账号视角**的会话 id，
+        # 也就是 bot 自己的 id（判定条件就是 chat.id == bot_id）。可回复走 Bot API，
+        # 对 bot 而言那是它自己 —— 实测 403 "the bot can't send messages to the bot"。
+        # Bot API 要的是对方（= 本账号）的 user id，所以优先用注入的 self_id。
+        target = self.self_id if self.self_id is not None else chat_id
+        if self.self_id is None:
+            self.alog.warning(
+                "拿不到本账号 user id，/status 回话可能失败",
+                bot_id=self.bot_id,
+                chat_id=chat_id,
+                hint="runner 应从 get_me() 传入 self_id",
+            )
         try:
             text = build_status_text(self.gather())
         except Exception as exc:  # 取数/渲染出错绝不能把账号的更新循环带崩
@@ -239,7 +271,7 @@ class StatusCommand:
             )
             return
         try:
-            await self.send(chat_id, text)
+            await self.send(target, text)
         except Exception as exc:
             self.alog.warning(
                 "回复 /status 失败", error=f"{type(exc).__name__}: {exc}"

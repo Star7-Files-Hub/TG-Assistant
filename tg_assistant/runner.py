@@ -688,6 +688,10 @@ class AccountRunner:
                 gather=self._status_snapshot,
                 send=self._reply_status,
                 alog=self.alog,
+                # 回话要发给**本账号自己**：账号会话里和 bot 的私聊，chat.id 是 bot
+                # 自己的 id，而 Bot API 认的是对方的 user id。少了它就会 403
+                # "the bot can't send messages to the bot"（线上实测静默失效过）。
+                self_id=getattr(self.bundle, "me_id", None),
             )
             self.status_command.register(self.client)
 
@@ -1008,10 +1012,14 @@ class AccountRunner:
         复用 :class:`BotNotifier` 的底层 ``_call`` —— 拿到它的代理/重试/429 处理，
         但**绕开** ``submit``：``submit`` 会广播给所有配置的通知对象，而 ``/status``
         的语义是「谁问，回给谁」，只能发这一个 chat_id。
+
+        🔴 必须自己看 ``_call`` 的返回值：它**不抛异常**，只返回 ``(ok, 错误, result)``。
+        不看就等于把失败彻底吞掉 —— 线上实测过一次：回话被 Bot API 403 拒了，
+        用户界面上「没有回复」，日志里也一片安静，排查只能靠翻更底层的 ERROR 行。
         """
         if self.notifier is None:
             return
-        await self.notifier._call(
+        ok, description, _ = await self.notifier._call(
             "sendMessage",
             {
                 "chat_id": chat_id,
@@ -1020,6 +1028,12 @@ class AccountRunner:
                 "link_preview_options": {"is_disabled": True},
             },
         )
+        if not ok:
+            self.alog.warning(
+                "回复 /status 失败",
+                chat_id=chat_id,
+                error=description or "未知错误",
+            )
 
 
 # --------------------------------------------------------------------------- #

@@ -161,12 +161,14 @@ class Recorder:
         self.sent.append((chat_id, text))
 
 
-def make_command(alog, send=None, gather=None) -> StatusCommand:
+def make_command(alog, send=None, gather=None, self_id=ME_ID) -> StatusCommand:
     return StatusCommand(
         bot_token=BOT_TOKEN,
         gather=gather or (lambda: StatusData(account_label="小白", running=True)),
         send=send or Recorder(),
         alog=alog,
+        # 本账号自己的 user id —— 回话真正要用的 chat_id（见下）。
+        self_id=self_id,
     )
 
 
@@ -199,14 +201,32 @@ class TestStatusCommandRegistration:
 
 class TestStatusCommandDispatch:
     @pytest.mark.asyncio
-    async def test_replies_only_to_originating_chat(self, alog) -> None:
+    async def test_replies_to_account_itself_not_to_bot_id(self, alog) -> None:
+        """回话必须发给**本账号的 user id**。
+
+        账号会话里 ``chat.id`` 是 **bot 自己的 id**（判定条件就是 chat.id == bot_id），
+        拿它去调 Bot API 等于让 bot 发给自己 —— 线上实测被拒：
+
+            403 Forbidden: the bot can't send messages to the bot
+
+        所以目标必须是 self_id（本账号 user id），而不是 BOT_ID。
+        """
         rec = Recorder()
         cmd = make_command(alog, send=rec)
         await cmd._on_message(FakeClient(), status_msg())
         assert len(rec.sent) == 1
         chat_id, text = rec.sent[0]
-        assert chat_id == BOT_ID
+        assert chat_id == ME_ID
+        assert chat_id != BOT_ID
         assert "小白" in text and "🟢运行中" in text
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_chat_id_without_self_id(self, alog) -> None:
+        """拿不到本账号 id 时退回旧行为（会 403，但绝不该静默什么都不发）。"""
+        rec = Recorder()
+        cmd = make_command(alog, send=rec, self_id=None)
+        await cmd._on_message(FakeClient(), status_msg())
+        assert [chat_id for chat_id, _ in rec.sent] == [BOT_ID]
 
     @pytest.mark.asyncio
     async def test_ignores_non_status(self, alog) -> None:
@@ -234,3 +254,76 @@ class TestStatusCommandDispatch:
 
         cmd = make_command(alog, send=boom)
         await cmd._on_message(FakeClient(), status_msg())  # 不应抛
+
+
+# --------------------------------------------------------------------------- #
+# 回话失败**不能静默**（runner._reply_status）
+# --------------------------------------------------------------------------- #
+class _FakeAlog:
+    """只记 warning 的假日志：真实的 account_logger 要落盘，断言起来太重。"""
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, message: str, **kwargs: Any) -> None:
+        self.warnings.append((message, kwargs))
+
+
+class _FakeNotifier:
+    """假 BotNotifier：``_call`` 只返回元组，绝不抛异常（与真实实现一致）。"""
+
+    def __init__(self, ok: bool, description: str | None = None) -> None:
+        self.ok = ok
+        self.description = description
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _call(self, method: str, payload: dict[str, Any], **kwargs: Any):
+        self.calls.append((method, payload))
+        return self.ok, self.description, None
+
+
+class TestReplyStatusChecksResult:
+    """``notify._call`` 不抛异常、只返回 ``(ok, 错误, result)``。
+
+    线上实测过：回话被 403 拒了，因为没人看返回值，用户界面上「没有回复」、
+    日志里也一片安静。所以这里必须自己把失败喊出来。
+    """
+
+    @pytest.mark.asyncio
+    async def test_logs_warning_when_bot_api_rejects(self) -> None:
+        from types import SimpleNamespace
+
+        from tg_assistant.runner import AccountRunner
+
+        alog = _FakeAlog()
+        notifier = _FakeNotifier(
+            False, "Forbidden: the bot can't send messages to the bot"
+        )
+        stub = SimpleNamespace(notifier=notifier, alog=alog)
+        await AccountRunner._reply_status(stub, ME_ID, "面板")
+        assert notifier.calls[0][0] == "sendMessage"
+        assert notifier.calls[0][1]["chat_id"] == ME_ID
+        assert [item[0] for item in alog.warnings] == ["回复 /status 失败"]
+        assert "Forbidden" in alog.warnings[0][1]["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_ok(self) -> None:
+        from types import SimpleNamespace
+
+        from tg_assistant.runner import AccountRunner
+
+        alog = _FakeAlog()
+        stub = SimpleNamespace(notifier=_FakeNotifier(True), alog=alog)
+        await AccountRunner._reply_status(stub, ME_ID, "面板")
+        assert alog.warnings == []
+
+    @pytest.mark.asyncio
+    async def test_no_notifier_is_a_noop(self) -> None:
+        from types import SimpleNamespace
+
+        from tg_assistant.runner import AccountRunner
+
+        alog = _FakeAlog()
+        stub = SimpleNamespace(notifier=None, alog=alog)
+        await AccountRunner._reply_status(stub, ME_ID, "面板")  # 不应抛
+        assert alog.warnings == []
