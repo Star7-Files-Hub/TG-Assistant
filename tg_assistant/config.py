@@ -283,7 +283,13 @@ class MatchConfig(StrictModel):
 class ForwardRule(StrictModel):
     """一条转发规则：来源 + 匹配 + 目标。"""
 
-    id: str
+    #: 规则主键。**允许留空** —— 留空时由 :class:`ForwardConfig` 自动生成一个
+    #: （见 :func:`_auto_task_id`）。和红包/抢注的任务 id 一个道理：它是内部主键，
+    #: 让用户先编一个英文 id 是纯负担（用户原话：「ID 不要必填」）。
+    #:
+    #: 已存在的规则 id **永不改动**（生成只发生在「这条规则还没有 id」时），
+    #: 所以事件日志里的 ``rule`` 字段、面板卡片、历史统计都还是对得上的。
+    id: str = ""
     name: Optional[str] = None
     enabled: bool = True
 
@@ -325,13 +331,25 @@ class ForwardRule(StrictModel):
     #: 目标消息静音发送。
     silent: bool = False
 
-    @field_validator("id")
+    @field_validator("id", mode="before")
     @classmethod
-    def _check_id(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("规则 id 不能为空")
-        return cleaned
+    def _normalize_id(cls, value: Any) -> str:
+        """只做归一化，**不**在这里生成 id。
+
+        🔴 生成必须放在 :class:`ForwardConfig` 那层：字段校验器看不到兄弟规则，
+        用户「复制一条规则改改名字」时两条都会走到这里，各自取到同一个名称片段、
+        生成出**同一个** id，接着撞上唯一性校验 —— 用户只看到「保存失败」，
+        根本猜不到是名字重了。能同时看到所有规则 id 的地方只有父模型的
+        ``model_validator``。
+
+        ``None`` 当成空串（前端 JSON 里 null 与 "" 都会出现），非字符串直接报错：
+        静默 ``str()`` 会把 ``id: 123`` 这种前端 bug 藏起来。
+        """
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("规则 id 必须是字符串")
+        return value.strip()
 
     @field_validator(
         "sources", "exclude_sources", "targets", "from_users", "exclude_users", mode="before"
@@ -535,6 +553,20 @@ class ForwardConfig(StrictModel):
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "ForwardConfig":
+        """给留空的 id 补一个，再查唯一性。
+
+        先生成、再查重 —— 用户手打的重复 id 依旧是错误（那是他该改的），而自动
+        生成的那些保证互不重复。生成只能在这里做：字段校验器看不到兄弟规则
+        （见 :func:`_auto_task_id`）。
+        """
+        taken = {rule.id for rule in self.rules if rule.id}
+        for rule in self.rules:
+            if rule.id:
+                continue
+            # 赋值走的是 ``ForwardRule`` 的 validate_assignment，只归一化这一个字段。
+            rule.id = _auto_task_id(rule.name, taken)
+            taken.add(rule.id)
+
         seen: set[str] = set()
         for rule in self.rules:
             if rule.id in seen:
@@ -1528,14 +1560,19 @@ def _ascii_slug(name: str) -> Optional[str]:
 
 
 def _auto_task_id(name: Optional[str], taken: set[str]) -> str:
-    """给「没填 id」的抢注任务生成一个 id：优先用名称里的 ASCII 片段，否则短随机。
+    """给「没填 id」的对象生成一个 id：优先用名称里的 ASCII 片段，否则短随机。
+
+    三处共用：抢注任务（``RegGrabConfig``）、抢红包任务（``RedPacketConfig``）、
+    转发规则（``ForwardConfig``）—— 用户对这三处的要求是同一句话：
+    「ID 不要必填，名称填了就行」。
 
     ``taken`` 必须包含**同一次保存里所有已知 id**（含本次刚生成的）：复制一条任务
     再改改是常规操作，两条同名任务若各自生成同一个 id，撞上唯一性校验后用户只会
     看到「保存失败」。撞名时追加 ``-2`` / ``-3`` …，比再随机一个更好认。
 
-    id 一旦写进 config.json 就不再变化 —— 生成只发生在「这条任务还没有 id」时，
-    所以重新加载配置天然稳定（面板刷新看到的还是同一个）。
+    id 一旦写进 config.json 就不再变化 —— 生成只发生在「这条还没有 id」时，
+    所以重新加载配置天然稳定（面板刷新看到的还是同一个），事件日志里的
+    ``rule`` 字段也不会因为改个名字就对不上。
     """
     base = _ascii_slug(name or "")
     if base is not None:

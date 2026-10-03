@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -180,6 +182,67 @@ class TestForwardRule:
     def test_text_mode_requires_template_or_default(self):
         rule = ForwardRule(id="r", targets=["me"], mode="text", match={"mode": "all"})
         assert rule.mode == "text"
+
+
+class TestAutoRuleId:
+    """转发规则的 id 也不必填（用户原话：「ID 不要必填」）。
+
+    和红包/抢注共用同一个 ``_auto_task_id``；**已存在的规则 id 永不改动**
+    （生成只发生在「这条还没有 id」时），所以事件日志里的 ``rule`` 字段、
+    面板卡片、历史统计都还对得上。
+    """
+
+    @staticmethod
+    def _rule(**overrides) -> dict:
+        base = {"targets": [-1001234567890], "match": {"mode": "all"}}
+        base.update(overrides)
+        return base
+
+    def test_blank_id_is_generated_from_the_name(self):
+        config = ForwardConfig(rules=[self._rule(name="Main Rule")])
+        assert config.rules[0].id == "main-rule", "名称里的 ASCII 片段要拿来做 id"
+
+    def test_missing_id_key_also_generates(self):
+        """「缺省」也得能用：面板新增一条规则时发上来的就是不带 id 的对象。"""
+        config = ForwardConfig(rules=[self._rule()])
+        assert config.rules[0].id
+
+    def test_chinese_name_falls_back_to_a_short_random_id(self):
+        config = ForwardConfig(rules=[self._rule(name="卷毛鼠")])
+        assert re.fullmatch(r"task-[0-9a-f]{8}", config.rules[0].id), config.rules[0].id
+
+    def test_explicit_id_wins(self):
+        config = ForwardConfig(rules=[self._rule(id="404", name="别的名字")])
+        assert config.rules[0].id == "404"
+
+    def test_same_name_twice_does_not_collide(self):
+        """复制一条规则改改是常规操作：两条同名规则不能生成同一个 id。"""
+        first, second = ForwardConfig(
+            rules=[self._rule(name="Main"), self._rule(name="Main")]
+        ).rules
+        assert first.id == "main"
+        assert second.id != first.id and second.id.startswith("main")
+
+    def test_generated_id_avoids_an_explicit_one(self):
+        config = ForwardConfig(rules=[self._rule(id="main"), self._rule(name="Main")])
+        assert config.rules[1].id != "main"
+
+    def test_survives_a_dump_validate_round_trip(self):
+        """🔴 重新加载后必须**不变**：生成只在「这条规则还没有 id」时发生。"""
+        config = ForwardConfig(rules=[self._rule(name="主群"), self._rule(name="备用群")])
+        ids = [rule.id for rule in config.rules]
+        again = ForwardConfig.model_validate(config.model_dump(mode="json"))
+        assert [rule.id for rule in again.rules] == ids
+
+    def test_duplicate_explicit_ids_are_still_rejected(self):
+        """自动生成不能顺手把「用户手打的重复 id」也放过去。"""
+        with pytest.raises(ValidationError, match="重复"):
+            ForwardConfig(rules=[self._rule(id="same"), self._rule(id="same")])
+
+    def test_id_is_trimmed_and_must_be_a_string(self):
+        assert ForwardConfig(rules=[self._rule(id="  padded  ")]).rules[0].id == "padded"
+        with pytest.raises(ValidationError):
+            ForwardConfig(rules=[self._rule(id=123)])
 
 
 class TestForwardConfig:

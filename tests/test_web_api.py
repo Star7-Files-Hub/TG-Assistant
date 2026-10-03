@@ -995,6 +995,65 @@ def test_global_rules_create_rejects_invalid_payload(client, app, two_accounts) 
     assert client.post("/api/rules", json={"rule": {"id": "x"}}).status_code == 400
 
 
+def test_global_rules_create_generates_a_missing_id(client, app, two_accounts) -> None:
+    """规则 id 不必填（用户原话：「ID 不要必填」）。
+
+    🔴 这条路径**必须**在入口补 id：它只单独校验一条规则（``ForwardRule``），不经过
+    ``ForwardConfig`` 的校验器；而 ``rules.append(...)`` 是列表原地修改，父模型的
+    ``validate_assignment`` 也不会被触发。少了这一步，空 id 会直接落盘 ——
+    面板的规则卡片按 ``rule.id`` 跨账号合并，空 id 会让它们挤成同一张卡。
+    """
+    payload = {**_rule_payload(), "name": "Main Rule"}
+    payload.pop("id")
+
+    resp = client.post("/api/rules", json={"rule": payload})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rule"]["id"] == "main-rule", "名称里的 ASCII 片段要拿来做 id"
+    for name in (NAME, NAME2):
+        ids = [r["id"] for r in client.get(f"/api/config/{name}/rules").json()["rules"]]
+        assert ids == ["main-rule"], f"{name} 没拿到自动生成的 id"
+
+
+def test_generated_rule_id_avoids_ids_in_every_target_account(
+    client, app, two_accounts
+) -> None:
+    """生成要看**所有目标账号**里的已有 id。
+
+    只看一个账号的话，扇出到另一个账号会被「已存在」逻辑跳过，用户看到"只写进去
+    一半" —— 而这正是面板默认行为（不勾账号 = 写给全部）。
+    """
+    occupied = {**_rule_payload(rule_id="main-rule"), "name": "占位"}
+    assert client.post("/api/rules", json={"rule": occupied, "accounts": [NAME2]}).status_code == 200
+
+    payload = {**_rule_payload(), "name": "Main Rule"}
+    payload.pop("id")
+    resp = client.post("/api/rules", json={"rule": payload})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["saved"] == [NAME, NAME2], "两个账号都要写进去"
+    assert resp.json()["rule"]["id"] == "main-rule-2", "撞名时追加序号，别复用已占用的"
+
+
+def test_rule_update_with_a_blank_id_keeps_the_path_id(client, app, two_accounts) -> None:
+    """空 id 的「改一改」要用**路径里的 id**。
+
+    面板把 id 输入框锁住了，但真发上来空 id 时若照单全收，就把这条规则的主键抹成
+    空串：卡片合并、事件日志里的 ``rule`` 字段、按 id 的增删改全对不上。
+    """
+    assert client.post("/api/rules", json={"rule": _rule_payload()}).status_code == 200
+
+    payload = {**_rule_payload(), "id": "", "name": "改过的名字"}
+    resp = client.put("/api/rules/r1", json={"rule": payload})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rule"]["id"] == "r1"
+    for name in (NAME, NAME2):
+        rules = client.get(f"/api/config/{name}/rules").json()["rules"]
+        assert [r["id"] for r in rules] == ["r1"], f"{name} 的主键被抹掉了"
+        assert rules[0]["name"] == "改过的名字"
+
+
 def test_global_rules_create_skips_accounts_that_already_have_the_id(
     client, app, two_accounts
 ) -> None:

@@ -1442,6 +1442,21 @@ def test_red_packet_page_new_task_inherits_the_account_window() -> None:
     assert "defaultWin.enabled" in modal, "开关也要继承，不能硬编码成关闭"
 
 
+def test_rules_page_does_not_block_a_blank_rule_id() -> None:
+    """规则 ID 也不必填（用户原话：「ID 不要必填」）—— 面板不许再拦。
+
+    生成同样在后端入口做（``POST /api/rules`` 只单独校验一条规则，不经过
+    ``ForwardConfig`` 的校验器），前端自己编 id 会让同名规则互相撞车。
+    """
+    html = (_WEB_DIR / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    assert "规则 ID（可留空，自动生成）" in html
+    assert "请输入规则 ID" not in html, "前端不该再拦 id 必填"
+    assert '规则 ID <span class="required">*</span>' not in html, "id 不该再带必填星号"
+    save = _js_function_body(html, "saveRule")
+    assert "if (!id)" not in save, "id 留空时保存路径不能提前 return"
+
+
 # --------------------------------------------------------------------------- #
 # 规则页：「全局排除」区块（所有账号共用一份）
 # --------------------------------------------------------------------------- #

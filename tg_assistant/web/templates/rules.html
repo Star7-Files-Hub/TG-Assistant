@@ -107,8 +107,8 @@
                     <h3>基本信息</h3>
                     <div class="form-grid">
                         <div class="tg-input-group">
-                            <label>规则 ID <span class="required">*</span></label>
-                            <input id="rule-id" type="text" placeholder="如 rule-1、forward-btc" />
+                            <label>规则 ID（可留空，自动生成）</label>
+                            <input id="rule-id" type="text" placeholder="留空按名称自动生成，如 rule-1" />
                         </div>
                         <div class="tg-input-group">
                             <label>规则名称</label>
@@ -1564,8 +1564,10 @@
 
     async function saveRule() {
         if (accounts.length === 0) { toast('还没有账号', false); return; }
+        // id 不再是必填：留空交给后端按名称自动生成（见 _auto_task_id）。
+        // 前端**不**自己编一个 —— 那样两条同名规则会各自编出同一个 id，
+        // 后端查重后用户只看到一句「保存失败」，根本猜不到是名字重了。
         const id = document.getElementById('rule-id').value.trim();
-        if (!id) { toast('请输入规则 ID', false); return; }
         if (tagInputs.targets.length === 0) { toast('请至少添加一个转发目标', false); return; }
         const mode = document.getElementById('match-mode').value;
         if (mode !== 'all' && tagInputs.patterns.length === 0) { toast('请至少添加一个匹配规则', false); return; }

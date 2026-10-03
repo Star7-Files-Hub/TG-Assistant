@@ -400,6 +400,9 @@ async def api_rules_add(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
 
+    # 留空 id 就在这里补一个（见 _assign_rule_id）。
+    _assign_rule_id(rule, {existing.id for existing in config.forward.rules if existing.id})
+
     if any(existing.id == rule.id for existing in config.forward.rules):
         raise HTTPException(status_code=409, detail=f"规则 id {rule.id!r} 已存在")
 
@@ -424,6 +427,11 @@ async def api_rules_update(
         updated = ForwardRule.model_validate(payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
+
+    # 面板把 id 输入框锁住了，正常不会空；真空了要用**路径里的 id** —— 否则一次
+    # 「改一改」就把这条规则的主键抹成空串，卡片合并、事件日志的 rule 字段全对不上。
+    if not updated.id:
+        updated.id = rule_id
 
     for index, rule in enumerate(config.forward.rules):
         if rule.id == rule_id:
@@ -876,6 +884,27 @@ def _validate_rule(body: dict[str, Any]) -> Any:
         raise HTTPException(status_code=400, detail=f"规则校验失败：{exc}") from exc
 
 
+def _assign_rule_id(rule: Any, taken: set[str]) -> Any:
+    """给留空的规则 id 补一个（用户原话：「ID 不要必填」）。
+
+    🔴 必须在**入口**补，不能只靠 ``ForwardConfig`` 的 ``model_validator``：
+    这些路由都只**单独**校验一条规则（``ForwardRule.model_validate``），根本没
+    经过父模型；而 ``config.forward.rules.append(rule)`` 是列表原地修改，
+    ``validate_assignment`` 也不会被触发。少了这一步，空 id 会直接落盘 ——
+    面板的规则卡片是按 ``rule.id`` 跨账号合并的，空 id 会把所有这类规则挤成
+    同一张卡，编辑一条等于改一片。
+
+    ``taken`` 要包含**所有会写到**的账号里已有的 id（扇出写多个账号时尤其重要）：
+    只按一个账号生成，扇出到别的账号会被当成「已存在」而跳过，用户看到
+    "只写进去一半"。
+    """
+    if not rule.id:
+        from tg_assistant.config import _auto_task_id
+
+        rule.id = _auto_task_id(rule.name, taken)
+    return rule
+
+
 def _resolve_rule_accounts(store: Any, raw: Any) -> list[str]:
     """把请求里的 ``accounts`` 解析成账号名列表。
 
@@ -1025,6 +1054,14 @@ async def api_rules_create_global(
         raise HTTPException(status_code=400, detail="还没有任何账号，无法保存转发规则")
     rule = _validate_rule(_rule_body(payload))
 
+    # 留空 id：按名称生成一个，且要保证在**所有目标账号**里都不撞 —— 只看一个
+    # 账号的话，扇出到别的账号时会被当成「已存在」而跳过，用户看到"只写进去一半"。
+    taken: set[str] = set()
+    for name in targets:
+        config = store.load_account_config(name, create=False)
+        taken.update(existing.id for existing in config.forward.rules if existing.id)
+    _assign_rule_id(rule, taken)
+
     saved: list[str] = []
     conflicts: list[str] = []
     for name in targets:
@@ -1068,6 +1105,11 @@ async def api_rules_update_global(
         if not targets:
             raise HTTPException(status_code=404, detail=f"规则 {rule_id!r} 不存在")
     rule = _validate_rule(_rule_body(payload))
+
+    # 留空 id 用**路径里的 id**：这条路由的语义是「改这条规则」，把主键改成空串
+    # 等于把它在面板卡片合并、事件日志 rule 字段里的身份抹掉。
+    if not rule.id:
+        rule.id = rule_id
 
     # 先整体校验、再统一落盘：边检查边写的话，第 3 个账号撞车时前 2 个已经写完了，
     # 留下一个「只改了一半」的配置 —— 用户看到报错，却有一半账号已经变了。
