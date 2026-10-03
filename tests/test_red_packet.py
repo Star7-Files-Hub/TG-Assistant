@@ -1086,6 +1086,126 @@ class TestGlobalWindow:
         assert snap["settled"] == 0
 
 
+class TestPerTaskWindow:
+    """动手时段改成**任务级**（2026-10-02 用户纠正：「窗口期应该根据任务来，而不是全局」）。
+
+    账号级 ``window`` 只剩两个作用：旧配置的迁移来源、新任务的默认值。
+    引擎判定必须走**每条任务自己的** window —— 比如 A 频道只在白天抢、B 频道全天抢。
+    """
+
+    CHAT_NIGHT = -1007777777777
+    CHAT_DAY = -1008888888888
+
+    @staticmethod
+    def multi(*tasks: dict, window: dict | None = None) -> AccountConfig:
+        """多条任务的账号配置，可选带账号级 ``window``。
+
+        ⚠️ 不能用 :func:`rp_config`：它的 base 里带着旧扁平字段（strategy/delay/…），
+        而只要 payload 里出现了 ``tasks`` 键，旧配置迁移就整体跳过 —— 那些顶层字段
+        会直接撞上 ``extra="forbid"``，测试连构造都过不去。
+        """
+        base = {"success": {"wait_timeout": 0.05}}
+        payload: dict = {"enabled": True, "tasks": [{**base, **task} for task in tasks]}
+        if window is not None:
+            payload["window"] = window
+        return AccountConfig.model_validate({"red_packet": payload})
+
+    def test_task_without_window_inherits_account_default(self):
+        """线上就是这么一份配置：账号级 08:00~23:00 + 一条没有 window 的任务。
+
+        迁移必须把时段填进任务里，否则「半夜不抢」这个保护会**静默消失**。
+        """
+        config = rp_config(window={"enabled": True, "start": "08:00", "end": "23:00"})
+        task = config.red_packet.tasks[0]
+        assert task.window is not None
+        assert task.window.describe() == "08:00~23:00"
+        assert task.in_window == task.window.contains()
+
+    def test_explicit_task_window_wins(self):
+        config = self.multi(
+            {"id": "a", "window": {"enabled": True, "start": "20:00", "end": "23:00"}},
+        )
+        config.red_packet.window = TimeWindow(enabled=True, start="09:00", end="18:00")
+        assert config.red_packet.tasks[0].window.describe() == "20:00~23:00"
+
+    def test_account_default_does_not_overwrite_task_window(self):
+        """账号默认值只负责「填空」，不许覆盖任务自己写的时段。"""
+        config = self.multi(
+            {"id": "a", "window": {"enabled": True, "start": "20:00", "end": "23:00"}},
+            window={"enabled": True, "start": "09:00", "end": "18:00"},
+        )
+        assert config.red_packet.tasks[0].window.describe() == "20:00~23:00"
+        assert config.red_packet.window.describe() == "09:00~18:00"
+
+    def test_inherited_windows_are_independent_copies(self):
+        """深拷贝：两条任务不能共享同一个（可赋值的）模型实例。"""
+        config = self.multi(
+            {"id": "a"},
+            {"id": "b"},
+            window={"enabled": True, "start": "09:00", "end": "18:00"},
+        )
+        first, second = config.red_packet.tasks
+        assert first.window is not second.window
+        first.window = TimeWindow(enabled=True, start="01:00", end="02:00")
+        assert second.window.describe() == "09:00~18:00", "改一条不能连带改另一条"
+
+    def test_aggregate_in_window_is_any_active_task(self):
+        inside = window_around_now()
+        outside = window_after_now()
+        config = self.multi(
+            {"id": "night", "window": {"enabled": True, "start": outside[0], "end": outside[1]}},
+            {"id": "day", "window": {"enabled": True, "start": inside[0], "end": inside[1]}},
+        )
+        assert config.red_packet.tasks[0].in_window is False
+        assert config.red_packet.tasks[1].in_window is True
+        assert config.red_packet.in_window is True, "只要有一条任务能动，账号就还在动手"
+
+    def test_bare_task_without_window_is_all_day(self):
+        """单独 new 出来的任务 ``window`` 是 None —— 属性不能抛 AttributeError。"""
+        assert RedPacketTask(id="x").in_window is True
+
+    @pytest.mark.asyncio
+    async def test_each_task_uses_its_own_window(self, alog):
+        """两条任务两个频道：时段外那条不动手，时段内那条照抢。"""
+        inside = window_around_now()
+        outside = window_after_now()
+        client = FakeClient(callback_answer="🧧 抢到 50 积分！")
+        hunter = RedPacketHunter(
+            client,
+            self.multi(
+                {
+                    "id": "night",
+                    "chats": [self.CHAT_NIGHT],
+                    "window": {"enabled": True, "start": outside[0], "end": outside[1]},
+                },
+                {
+                    "id": "day",
+                    "chats": [self.CHAT_DAY],
+                    "window": {"enabled": True, "start": inside[0], "end": inside[1]},
+                },
+            ),
+            alog,
+        )
+        await hunter.register()
+
+        hunter._dispatch(
+            rp_message("🧧", markup=grab_button(), chat=FakeChat(self.CHAT_NIGHT, title="夜间群")),
+            edited=True,
+        )
+        await asyncio.sleep(0)
+        assert client.callbacks == [], "时段外的那条任务不该点按钮"
+        assert hunter.task_stats["night"]["outside_window"] == 1
+        assert hunter.task_stats["day"]["outside_window"] == 0, "别把别的任务的账记到它头上"
+
+        hunter._dispatch(
+            rp_message("🧧", markup=grab_button(), chat=FakeChat(self.CHAT_DAY, title="白天群")),
+            edited=True,
+        )
+        await asyncio.gather(*list(hunter._tasks))
+        assert hunter.stats["success"] == 1
+        assert hunter.task_stats["day"]["detected"] == 1
+
+
 class TestTimeWindowReuse:
     """抢注与抢红包共用同一个时段模型，别再各写一份。"""
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import datetime
 import os
 import random
 import time
@@ -459,6 +460,14 @@ class RedPacketHunter:
         del client
         self._dispatch(message, edited=True)
 
+    def _now(self) -> datetime:
+        """当前本地时间；抽成方法以便测试注入固定时刻。"""
+        return datetime.now()
+
+    def _in_window(self, task: PreparedTask) -> bool:
+        """此刻是否允许这条任务动手；关闭时段则全天允许。"""
+        return task.config.window.contains(self._now())
+
     def _edit_age(self, task: PreparedTask, message: Any) -> Optional[float]:
         """这条编辑事件对应的消息有多老（秒）；**不该处理**就返回年龄，否则 ``None``。
 
@@ -544,7 +553,7 @@ class RedPacketHunter:
 
         _, _, chat_title = chat_identity(message)
 
-        if not self.config.in_window:
+        if not self._in_window(task):
             # 时段外：看得见，但不动手。
             # **不**计入 ``detected`` —— 那个数字的含义是"真正要抢的红包有几个"，
             # 把夜里的包混进去它就失去意义了（这也是抢注那边的口径）。
@@ -558,7 +567,7 @@ class RedPacketHunter:
                 chat=chat_title or chat_id,
                 message_id=message_id,
                 button=button.get("text") if button else "-",
-                window=self.config.window.describe(),
+                window=task.config.window.describe(),
                 outside_window=self.stats["outside_window"],
             )
             return
@@ -1292,8 +1301,7 @@ class RedPacketHunter:
             "tasks": len(self.config.tasks),
             "active_tasks": len(self.prepared),
             "per_task": {k: dict(v) for k, v in self.task_stats.items()},
-            # 全局动手时段：``in_window`` 是"现在动不动手"，面板与心跳都靠它回答
-            # 「为什么没动静」。
+            # ``window`` 保留账号级默认值供面板与心跳展示；``in_window`` 是启用任务的聚合结果。
             "window": self.config.window.describe(),
             "in_window": self.config.in_window,
         }

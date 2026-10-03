@@ -37,17 +37,6 @@
             </div>
         </div>
 
-        <!-- 全局动手时段：账号级，所有任务共用 —— 半夜还在精准点按钮是最像脚本的特征 -->
-        <div class="rp-toolbar">
-            <label class="tg-checkbox"><input id="rp-window-enabled" type="checkbox" onchange="saveWindow()" /><span class="tg-checkmark"></span><span>只在指定时段内动手</span></label>
-            <div class="rp-toolbar-right">
-                <input id="rp-window-start" type="time" value="08:00" onchange="saveWindow()" />
-                <span>~</span>
-                <input id="rp-window-end" type="time" value="23:00" onchange="saveWindow()" />
-                <span class="rp-hint" id="rp-window-hint"></span>
-            </div>
-        </div>
-
         <div class="rp-task-list" id="rp-task-list"></div>
     </div>
 
@@ -214,6 +203,33 @@
                 </div>
             </div>
 
+            <!-- 抢包时段 -->
+            <div class="form-section">
+                <h3>抢包时段</h3>
+                <label class="tg-checkbox">
+                    <input id="rp-window-enabled" type="checkbox" />
+                    <span class="tg-checkmark"></span>
+                    <span>只在指定时段内动手（其余时间看着不动）</span>
+                </label>
+                <div class="rp-grid" style="margin-top:12px;">
+                    <div class="rp-input-group">
+                        <label>开始</label>
+                        <input id="rp-window-start" type="time" value="08:00" />
+                    </div>
+                    <div class="rp-input-group">
+                        <label>结束</label>
+                        <input id="rp-window-end" type="time" value="23:00" />
+                    </div>
+                </div>
+                <p class="rp-hint" id="rp-window-hint"></p>
+                <p class="rp-hint">
+                    抢红包是秒级响应的行为，<b>半夜三点还能精准抢到包</b>是脚本最好认的特征之一。
+                    把动手时间限制在人类活动时段，能明显降低被识别的概率。<br />
+                    时间用<b>服务端时区</b>（北京时间）；开始晚于结束表示<b>跨零点</b>（如 22:00 ~ 06:00）。
+                    想全天可抢就别勾这个开关。
+                </p>
+            </div>
+
             <!-- 高级设置 -->
             <div class="form-section">
                 <h3>高级设置</h3>
@@ -291,6 +307,11 @@
         tagFields.forEach(f => { tagInputs[f] = []; initTagInput(f); });
         document.getElementById('rp-strategy').addEventListener('change', syncStrategyVisibility);
         document.getElementById('rp-reply-enabled').addEventListener('change', syncReplyVisibility);
+        ['rp-window-enabled', 'rp-window-start', 'rp-window-end'].forEach(domId => {
+            const el = document.getElementById(domId);
+            el.addEventListener('change', renderWindow);
+            el.addEventListener('input', renderWindow);
+        });
         loadAccounts();
     }
 
@@ -374,14 +395,9 @@
         document.getElementById('rp-enabled').checked = !!rpData.enabled;
         document.getElementById('rp-max-concurrency').value = rpData.max_concurrency || 3;
 
-        // 全局动手时段。服务端时区是 Asia/Shanghai，用户本地时区不一致时
-        // 光看两个时间框是发现不了的 —— 所以服务端把「现在几点」也带下来了。
-        const win = rpData.window || {};
+        // 服务端时区是 Asia/Shanghai，用户本地时区不一致时
+        // 光看时间框是发现不了的 —— 所以服务端把「现在几点」也带下来了。
         rpServerNow = rpData.server_now || '';
-        document.getElementById('rp-window-enabled').checked = !!win.enabled;
-        document.getElementById('rp-window-start').value = win.start || '08:00';
-        document.getElementById('rp-window-end').value = win.end || '23:00';
-        renderWindow();
 
         renderTasks();
     }
@@ -425,11 +441,18 @@
         document.getElementById('rp-task-list').innerHTML = tasks.map(renderTaskCard).join('');
     }
 
+    function windowText(task) {
+        const win = task.window || {};
+        if (!win.enabled) return '全天';
+        return `${win.start || '08:00'}~${win.end || '23:00'}`;
+    }
+
     function renderTaskCard(task) {
         const stats = (rpStats.per_task || {})[task.id] || {};
         const bits = [
             STRATEGY_LABEL[task.strategy] || task.strategy,
             (task.chats || []).length ? `监听 ${task.chats.length} 个频道` : '监听全部频道',
+            windowText(task),
             (task.reply || {}).enabled ? `回复 ${((task.reply || {}).texts || []).length} 条` : '不回复',
         ];
         if (stats.detected) bits.push(`发现 ${stats.detected} · 抢到 ${stats.success || 0}`);
@@ -524,6 +547,15 @@
 
         syncStrategyVisibility();
         syncReplyVisibility();
+
+        const win = (task && task.window) || {};
+        document.getElementById('rp-window-enabled').checked = win.enabled !== undefined ? !!win.enabled : false;
+        // 如果是新建任务，使用账号全局默认的 window 值 rpData.window 作为初值继承，避免硬编码 08:00 / 23:00
+        const defaultWin = rpData.window || {};
+        document.getElementById('rp-window-start').value = win.start || defaultWin.start || '08:00';
+        document.getElementById('rp-window-end').value = win.end || defaultWin.end || '23:00';
+        renderWindow();
+
         document.getElementById('rp-modal').classList.add('active');
     }
 
@@ -580,6 +612,11 @@
             include_edited: document.getElementById('rp-include-edited').checked,
             // 分钟 → 秒（配置单位是秒）。负数/空值当 0 = 关掉闸门。
             edit_max_age: Math.max(0, numOr(document.getElementById('rp-edit-max-age').value, 30)) * 60,
+            window: {
+                enabled: document.getElementById('rp-window-enabled').checked,
+                start: document.getElementById('rp-window-start').value || '08:00',
+                end: document.getElementById('rp-window-end').value || '23:00',
+            },
         };
     }
 
@@ -592,23 +629,33 @@
     }
 
     async function saveConfig(tasks) {
+        // 🔴 顶层 window 仍要原样放进 PUT payload（取 rpData.window，不能丢）：
+        // RedPacketConfig.window 在模型里保留着（extra="forbid"，删了旧配置直接加载失败），
+        // 语义是「账号级默认值 / 旧配置的迁移来源」—— 面板不再显示它，但**不能**因为
+        // 不显示就把它写成默认空值，否则账号默认时段会被静默重置。
+        // 兜底值与模型默认（TimeWindow：enabled=false = 全天）保持一致。
+        const defaultWindow = rpData.window || {
+            enabled: false,
+            start: '08:00',
+            end: '23:00'
+        };
+
         const payload = {
             enabled: document.getElementById('rp-enabled').checked,
             max_concurrency: parseInt(document.getElementById('rp-max-concurrency').value) || 3,
-            // 全局动手时段跟着一起存 —— 它和并发上限一样是账号级设置。
-            // 两个时间填成一样模型会报错，所以先在前端拦下来，别让用户对着
-            // 一句 400 猜自己错在哪。
-            window: {
-                enabled: document.getElementById('rp-window-enabled').checked,
-                start: document.getElementById('rp-window-start').value || '08:00',
-                end: document.getElementById('rp-window-end').value || '23:00',
-            },
+            window: defaultWindow,
             tasks: tasks.map(cleanTask),
         };
-        if (payload.window.enabled && payload.window.start === payload.window.end) {
-            toast('动手时段的开始和结束不能相同', false);
-            return false;
+
+        // 校验：现在动手时段移到了任务级别，需要逐条任务校验「enabled 且 start === end 才报错」
+        for (const task of payload.tasks) {
+            const win = task.window || {};
+            if (win.enabled && win.start === win.end) {
+                toast('动手时段的开始和结束不能相同', false);
+                return false;
+            }
         }
+
         const res = await fetch(`/api/config/${currentAccount}/red_packet`, {
             method: 'PUT', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload),
@@ -654,12 +701,7 @@
         await saveConfig(rpData.tasks || []);
     }
 
-    async function saveWindow() {
-        // 先刷新提示文案（「不在时段内，不会动手」这类），再整份保存。
-        // 时间填成一样时 saveConfig 会拦下来并 toast，不用用户对着 400 猜。
-        renderWindow();
-        await saveConfig(rpData.tasks || []);
-    }
+
 
     async function toggleRedPacket() {
         const enabled = document.getElementById('rp-enabled').checked;

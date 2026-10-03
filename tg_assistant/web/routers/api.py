@@ -1158,11 +1158,12 @@ async def api_rules_test_global(payload: dict[str, Any]) -> dict[str, Any]:
 #:
 #: 不丢的话 ``RedPacketTask`` 是 ``extra="forbid"`` 的，把 GET 的结果原样
 #: PUT 回来会 400「Extra inputs are not permitted」，用户只看到"保存失败"。
-_RED_PACKET_TASK_READONLY = ("ready", "problem")
+# in_window 是运行时只读字段，必须过滤，否则 GET 原样 PUT 会触发 extra="forbid"。
+_RED_PACKET_TASK_READONLY = ("ready", "problem", "in_window")
 
 #: GET 会在**顶层**多塞的只读字段：PUT 时丢掉。
 #:
-#: ``in_window`` 是「此刻在不在全局动手时段内」，``server_now`` 是「服务端现在几点」
+#: ``in_window`` 是「此刻是否至少有一条启用任务在自己的时段内」，``server_now`` 是「服务端现在几点」
 #: —— 两者都随时间跳变，每次 GET 现算、不落盘；``RedPacketConfig`` 是
 #: ``extra="forbid"`` 的，不丢就 400。
 _RED_PACKET_READONLY = ("in_window", "server_now")
@@ -1173,12 +1174,15 @@ async def api_red_packet_get(name: str, store=Depends(get_store)) -> dict[str, A
     _require_account(store, name)
     config = store.load_account_config(name, create=False).red_packet
     data = config.model_dump(mode="json")
-    # 面板要按任务显示「配好了没有」，不用自己重复一遍判断逻辑。
+    # 面板要按任务显示「配好了没有」和「这条现在动不动手」，不用自己重复一遍判断逻辑。
     for item, task in zip(data["tasks"], config.tasks):
         item["ready"] = task.ready
         item["problem"] = task.problem
-    # 全局时段：面板要能直接回答「为什么一晚上没动静」，以及给时间框一个
-    # 「服务端现在几点」的对照（面板填的是服务端时区 Asia/Shanghai）。
+        # 时段改成任务级之后，卡片上要能逐条回答「为什么这条没动静」。
+        # 它是只读的运行时字段，PUT 回来会被 _RED_PACKET_TASK_READONLY 丢掉。
+        item["in_window"] = task.in_window
+    # 顶层 ``in_window`` 是**聚合**结果（至少有一条启用任务在时段内），给心跳和
+    # 「为什么一晚上没动静」用；``server_now`` 是给时间框的对照（服务端时区 Asia/Shanghai）。
     data["in_window"] = config.in_window
     data["server_now"] = datetime.now().strftime("%H:%M")
     return data

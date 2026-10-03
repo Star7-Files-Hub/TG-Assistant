@@ -940,6 +940,8 @@ class RedPacketTask(StrictModel):
     id: str
     name: Optional[str] = None
     enabled: bool = True
+    #: 这条任务自己的动手时段；为空时由账号级旧配置/默认值迁移填充。
+    window: Optional[TimeWindow] = None
 
     #: 监听的会话；为空表示所有会话。
     chats: list[ChatRef] = Field(default_factory=list)
@@ -991,6 +993,16 @@ class RedPacketTask(StrictModel):
     @property
     def label(self) -> str:
         return self.name or self.id
+
+    @property
+    def in_window(self) -> bool:
+        """此刻这条任务是否在动手时段内。
+
+        ``window`` 是 ``Optional``，但正常情况下走 :class:`RedPacketConfig` 校验时
+        一定会被填上（见那里的迁移）；单独 new 出来的任务才会是 ``None`` —— 那种
+        情况按「没配时段 = 全天」处理，别让一个属性抛 AttributeError。
+        """
+        return self.window is None or self.window.contains()
 
     @property
     def ready(self) -> bool:
@@ -1070,12 +1082,7 @@ class RedPacketConfig(StrictModel):
     tasks: list[RedPacketTask] = Field(default_factory=list)
     #: 同一账号并发抢包上限。这是账号级的资源限制，不属于任何单条任务。
     max_concurrency: int = Field(default=3, ge=1, le=20)
-    #: **全局动手时段**：所有任务共用一个 —— 到点才动手，其余时间只看着。
-    #:
-    #: 为什么是账号级而不是任务级：抢红包被识别成脚本的首要特征就是"半夜三点
-    #: 还在精准点按钮"，这是**账号整体的行为模式**，不该由某一条任务决定；
-    #: 用户的心智也是"这个号几点之后不抢了"。（抢注那边时段挂在任务上，
-    #: 因为每条任务的码源活跃时间差别很大。）
+    #: 账号级默认值及旧配置迁移来源；实际引擎判定使用每条任务的 window。
     window: TimeWindow = Field(default_factory=TimeWindow)
 
     @model_validator(mode="before")
@@ -1090,12 +1097,15 @@ class RedPacketConfig(StrictModel):
             if task.id in seen:
                 raise ValueError(f"抢红包任务 id 重复: {task.id}")
             seen.add(task.id)
+            if task.window is None:
+                # 旧配置只有账号级 window；深拷贝避免多条任务共享可赋值的模型实例。
+                task.window = self.window.model_copy(deep=True)
         return self
 
     @property
     def in_window(self) -> bool:
-        """当前是否落在全局动手时段内（未启用时段时恒为 True）。"""
-        return self.window.contains()
+        """当前是否至少有一条启用任务处于自己的动手时段内。"""
+        return any(task.in_window for task in self.active_tasks)
 
     @property
     def active_tasks(self) -> list[RedPacketTask]:
