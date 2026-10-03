@@ -1412,6 +1412,36 @@ def test_red_packet_page_edit_age_is_filled_in_minutes_stored_in_seconds() -> No
     assert "* 60" in collect
 
 
+def test_red_packet_page_does_not_block_a_blank_task_id() -> None:
+    """任务 ID 不是必填（用户原话：「不是说了ID不要必填吗」）—— 面板不许再拦。
+
+    自动生成必须在**后端**做：前端自己编一个的话，两条同名任务会各自编出同一个 id，
+    后端查重后用户只看到一句「保存失败」，根本猜不到是名字重了。
+    """
+    html = (_WEB_DIR / "templates" / "red_packet.html").read_text(encoding="utf-8")
+
+    assert "任务 ID（可留空，自动生成）" in html
+    assert "任务 ID 不能为空" not in html, "前端不该再拦 id 必填"
+    assert '任务 ID <span class="required">*</span>' not in html, "id 不该再带必填星号"
+    save = _js_function_body(html, "saveTask")
+    assert "if (!task.id)" not in save, "id 留空时保存路径不能提前 return"
+    assert "task.id &&" in save, "留空时不该拿空串去撞「ID 已存在」"
+
+
+def test_red_packet_page_new_task_inherits_the_account_window() -> None:
+    """新建任务的时段初值来自账号级默认值，**包括那个开关**。
+
+    只继承起止时间、开关却默认关闭的话，账号默认的「08:00~23:00 才动手」对每条新
+    任务都等于白设：用户新建一条就得到「全天抢包」，而半夜精准点按钮正是最像脚本的
+    特征 —— 这种失效是静默的，所以钉住它。
+    """
+    html = (_WEB_DIR / "templates" / "red_packet.html").read_text(encoding="utf-8")
+
+    modal = _js_function_body(html, "openTaskModal")
+    assert "defaultWin" in modal, "新建任务要拿账号级 window 当初值"
+    assert "defaultWin.enabled" in modal, "开关也要继承，不能硬编码成关闭"
+
+
 # --------------------------------------------------------------------------- #
 # 规则页：「全局排除」区块（所有账号共用一份）
 # --------------------------------------------------------------------------- #

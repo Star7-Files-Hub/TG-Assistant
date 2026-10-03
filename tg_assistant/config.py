@@ -937,7 +937,11 @@ class RedPacketTask(StrictModel):
     B 频道用关键词策略，C 频道抢到后要回复、D 频道不要。
     """
 
-    id: str
+    #: 任务主键。**允许留空** —— 留空时由 :class:`RedPacketConfig` 自动生成一个
+    #: （见 :func:`_auto_task_id`）。用户原话：「ID 不要必填，名称填了就行」：
+    #: 这条 id 只是内部主键，让每个只想抢个红包的人先编一个英文 id 是纯负担。
+    #: （抢注那边早就是这样，两边对齐。）
+    id: str = ""
     name: Optional[str] = None
     enabled: bool = True
     #: 这条任务自己的动手时段；为空时由账号级旧配置/默认值迁移填充。
@@ -973,13 +977,25 @@ class RedPacketTask(StrictModel):
     #: 消息再被编辑，绝不可能是新红包**。``0`` = 关掉这个闸门（不限制年龄）。
     edit_max_age: float = Field(default=1800.0, ge=0.0)
 
-    @field_validator("id")
+    @field_validator("id", mode="before")
     @classmethod
-    def _check_id(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("任务 id 不能为空")
-        return cleaned
+    def _normalize_id(cls, value: Any) -> str:
+        """只做归一化，**不**在这里生成 id。
+
+        🔴 生成必须放在 :class:`RedPacketConfig` 那层：字段校验器看不到兄弟任务，
+        用户把一条任务「复制一份改改名字」时两条都会走到这里，各自取到同一个名称
+        片段、生成出**同一个** id，接着撞上唯一性校验 —— 用户只看到「保存失败」，
+        根本猜不到是"名字重了"。能同时看到所有任务 id 的地方只有父模型的
+        ``model_validator``。
+
+        ``None`` 当成空串（前端 JSON 里 null 与 "" 都会出现），非字符串直接报错：
+        静默 ``str()`` 会把 ``id: 123`` 这种前端 bug 藏起来。
+        """
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("抢红包任务 id 必须是字符串")
+        return value.strip()
 
     @field_validator("chats", "exclude_chats", mode="before")
     @classmethod
@@ -1092,6 +1108,22 @@ class RedPacketConfig(StrictModel):
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "RedPacketConfig":
+        """给留空的 id 补一个、查唯一性，并把账号级时段填进没配时段的任务。
+
+        几件事在**同一个校验器**里做，是因为它们看到的必须是同一份事实：先生成、
+        再查重 —— 用户手打的重复 id 依旧是错误（那是他该改的），而自动生成的那些
+        保证互不重复。生成只能在这里做：字段校验器看不到兄弟任务（见
+        :func:`_auto_task_id`）。
+        """
+        taken = {task.id for task in self.tasks if task.id}
+        for task in self.tasks:
+            if task.id:
+                continue
+            # 赋值走的是 ``RedPacketTask`` 的 validate_assignment，只归一化这一个字段，
+            # 不会反过来触发「必须有 chats/detect」之类的完整性校验（那是 ready 的事）。
+            task.id = _auto_task_id(task.name, taken)
+            taken.add(task.id)
+
         seen: set[str] = set()
         for task in self.tasks:
             if task.id in seen:

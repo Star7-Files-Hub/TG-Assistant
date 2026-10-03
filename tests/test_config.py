@@ -307,9 +307,19 @@ class TestRedPacketTask:
         with pytest.raises(ValidationError):
             RedPacketTask(id="t", success={"success_patterns": ["(("]})
 
-    def test_blank_id_rejected(self):
+    def test_blank_id_is_normalized_not_rejected(self):
+        """id 不再必填（用户纠正：「ID 不要必填，名称填了就行」）。
+
+        这一层只管**归一化**：``"   "``/``None`` 都变成空串，交给
+        ``RedPacketConfig`` 按名称自动生成一个（见 ``TestAutoTaskId``）——
+        字段校验器看不到兄弟任务，生成必须放在父模型里，否则两条同名任务会
+        生成同一个 id 再撞唯一性校验。
+        """
+        assert RedPacketTask(id="   ").id == ""
+        assert RedPacketTask(id=None).id == ""
+        assert RedPacketTask().id == ""
         with pytest.raises(ValidationError):
-            RedPacketTask(id="   ")
+            RedPacketTask(id=123)
 
     def test_label_falls_back_to_id(self):
         assert RedPacketTask(id="a").label == "a"

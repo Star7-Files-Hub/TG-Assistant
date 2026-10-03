@@ -65,8 +65,8 @@
                 <h3>基本信息</h3>
                 <div class="rp-grid">
                     <div class="rp-input-group">
-                        <label>任务 ID <span class="required">*</span></label>
-                        <input id="rp-task-id" type="text" placeholder="如 main、channel-a" />
+                        <label>任务 ID（可留空，自动生成）</label>
+                        <input id="rp-task-id" type="text" placeholder="留空按名称自动生成，如 main" />
                     </div>
                     <div class="rp-input-group">
                         <label>任务名称</label>
@@ -548,10 +548,14 @@
         syncStrategyVisibility();
         syncReplyVisibility();
 
+        // 时段：编辑时用这条任务自己的；**新建**时整体继承账号级默认值
+        // （rpData.window）—— 包括那个开关。只继承起止时间、开关却默认关闭的话，
+        // 账号默认的「08:00~23:00 才动手」对每条新任务都等于白设，
+        // 用户会莫名其妙得到一条全天抢包的任务（半夜抢是最像脚本的特征）。
         const win = (task && task.window) || {};
-        document.getElementById('rp-window-enabled').checked = win.enabled !== undefined ? !!win.enabled : false;
-        // 如果是新建任务，使用账号全局默认的 window 值 rpData.window 作为初值继承，避免硬编码 08:00 / 23:00
         const defaultWin = rpData.window || {};
+        document.getElementById('rp-window-enabled').checked =
+            win.enabled !== undefined ? !!win.enabled : !!defaultWin.enabled;
         document.getElementById('rp-window-start').value = win.start || defaultWin.start || '08:00';
         document.getElementById('rp-window-end').value = win.end || defaultWin.end || '23:00';
         renderWindow();
@@ -671,8 +675,10 @@
     }
 
     async function saveTask() {
+        // id 不再是必填：留空就交给后端按名称自动生成（见 _auto_task_id）。
+        // 前端**不**自己编一个 —— 那样两条同名任务会各自编出同一个 id，
+        // 后端查重后用户只看到一句「保存失败」，根本猜不到是名字重了。
         const task = collectTask();
-        if (!task.id) { toast('任务 ID 不能为空', false); return; }
         const tasks = [...(rpData.tasks || [])];
 
         if (editingTaskId) {
@@ -680,7 +686,11 @@
             if (at < 0) { toast('任务已不存在，请刷新', false); return; }
             tasks[at] = task;
         } else {
-            if (tasks.some(t => t.id === task.id)) { toast('任务 ID 已存在', false); return; }
+            // 只有用户手打了 id 才查重；留空时后端会生成一个不与任何任务冲突的。
+            if (task.id && tasks.some(t => t.id === task.id)) {
+                toast('任务 ID 已存在', false);
+                return;
+            }
             tasks.push(task);
         }
         if (await saveConfig(tasks)) closeTaskModal();

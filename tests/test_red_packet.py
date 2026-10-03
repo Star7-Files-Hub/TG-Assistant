@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +14,7 @@ from pyrogram.errors import BotResponseTimeout, QueryIdInvalid
 
 from tg_assistant.config import (
     AccountConfig,
+    RedPacketConfig,
     RedPacketSuccess,
     RedPacketTask,
     TimeWindow,
@@ -1204,6 +1206,75 @@ class TestPerTaskWindow:
         await asyncio.gather(*list(hunter._tasks))
         assert hunter.stats["success"] == 1
         assert hunter.task_stats["day"]["detected"] == 1
+
+
+class TestAutoTaskId:
+    """任务 ID 不必填：留空/缺省自动生成、落盘稳定、同名不撞车。
+
+    用户原话：「不是说了ID不要必填吗」—— 抢注那边（``RegGrabConfig``）早就是这样，
+    这次把红包对齐；两边的生成逻辑共用同一个 :func:`_auto_task_id`。
+    """
+
+    def test_blank_id_is_generated_from_the_name(self):
+        config = RedPacketConfig(tasks=[{"name": "主群 Register #1"}])
+        assert config.tasks[0].id == "register-1", "名称里的 ASCII 片段要拿来做 id"
+
+    def test_missing_id_key_also_generates(self):
+        """「缺省」也得能用：面板新增一条任务时发上来的就是不带 id 的对象。"""
+        config = RedPacketConfig(tasks=[{}])
+        assert config.tasks[0].id
+
+    def test_chinese_name_falls_back_to_a_short_random_id(self):
+        config = RedPacketConfig(tasks=[{"name": "白嫖分享社"}])
+        assert re.fullmatch(r"task-[0-9a-f]{8}", config.tasks[0].id), config.tasks[0].id
+
+    def test_explicit_id_wins(self):
+        config = RedPacketConfig(tasks=[{"id": "mine", "name": "别的名字"}])
+        assert config.tasks[0].id == "mine"
+
+    def test_same_name_twice_does_not_collide(self):
+        """🔴 复制一条任务改改是常规操作：两条同名任务不能生成同一个 id。
+
+        生成若放在 ``RedPacketTask`` 自己的校验器里（看不到兄弟任务），这里就会撞上
+        唯一性校验，用户只看到「保存失败」——所以生成必须在父模型里做。
+        """
+        first, second = RedPacketConfig(tasks=[{"name": "Main"}, {"name": "Main"}]).tasks
+        assert first.id == "main"
+        assert second.id != first.id and second.id.startswith("main")
+
+    def test_generated_id_avoids_an_explicit_one(self):
+        config = RedPacketConfig(tasks=[{"id": "main"}, {"name": "Main"}])
+        assert config.tasks[1].id != "main"
+
+    def test_two_chinese_names_get_two_ids(self):
+        ids = [t.id for t in RedPacketConfig(tasks=[{"name": "群一"}, {"name": "群二"}]).tasks]
+        assert len(set(ids)) == 2, ids
+
+    def test_survives_a_dump_validate_round_trip(self):
+        """🔴 重新加载后必须**不变**：生成只在「这条任务还没有 id」时发生。"""
+        config = RedPacketConfig(tasks=[{"name": "主群"}, {"name": "备用群"}])
+        ids = [t.id for t in config.tasks]
+        again = RedPacketConfig.model_validate(config.model_dump(mode="json"))
+        assert [t.id for t in again.tasks] == ids
+
+    def test_duplicate_explicit_ids_are_still_rejected(self):
+        """自动生成不能顺手把「用户手打的重复 id」也放过去。"""
+        with pytest.raises(ValidationError, match="重复"):
+            RedPacketConfig(tasks=[{"id": "same"}, {"id": "same"}])
+
+    def test_id_is_trimmed_and_must_be_a_string(self):
+        assert RedPacketConfig(tasks=[{"id": "  padded  "}]).tasks[0].id == "padded"
+        with pytest.raises(ValidationError):
+            RedPacketConfig(tasks=[{"id": 123}])
+
+    def test_blank_id_still_gets_the_account_window(self):
+        """补 id 与时段迁移在同一个校验器里 —— 别为了补 id 把迁移跳过了。"""
+        config = RedPacketConfig(
+            window={"enabled": True, "start": "09:00", "end": "18:00"},
+            tasks=[{"name": "主群"}],
+        )
+        assert config.tasks[0].id
+        assert config.tasks[0].window.describe() == "09:00~18:00"
 
 
 class TestTimeWindowReuse:
