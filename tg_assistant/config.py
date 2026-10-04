@@ -305,6 +305,8 @@ class ForwardRule(StrictModel):
     #: 发送者白名单/黑名单；支持 id、@username、``me``。
     from_users: list[ChatRef] = Field(default_factory=list)
     exclude_users: list[ChatRef] = Field(default_factory=list)
+    #: 是否只处理机器人发送的消息；关闭时保持原有规则行为。
+    only_from_bots: bool = False
     ignore_self: bool = True
     #: 是否处理编辑后的消息（默认不处理，避免同一条消息重复转发）。
     include_edited: bool = False

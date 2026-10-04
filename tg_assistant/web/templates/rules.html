@@ -168,6 +168,14 @@
                             <p class="form-hint">只能填数字 ID 或 @username；人名 / 中文昵称匹配不到。</p>
                         </div>
                     </div>
+                    <div style="margin-top: 12px;">
+                        <label class="tg-checkbox">
+                            <input id="rule-only-bots" type="checkbox" />
+                            <span class="tg-checkmark"></span>
+                            <span>只抓取机器人消息</span>
+                        </label>
+                        <p class="form-hint" style="margin-top: 4px;">只处理机器人发来的消息；<strong>频道消息不算机器人</strong>（频道帖子会被一起跳过）；默认关闭。</p>
+                    </div>
                 </div>
 
                 <!-- 目标 -->
@@ -743,12 +751,13 @@
                         </div>
                     </div>
                     ${patterns.length > 0 ? renderRulePatterns(match, patterns) : ''}
-                    ${(rule.from_users || []).length || (rule.exclude_users || []).length ? `
+                    ${(rule.from_users || []).length || (rule.exclude_users || []).length || rule.only_from_bots ? `
                     <div class="rule-match">
                         <div class="rule-match-label">
                             <span class="badge-mode">发送者</span>
                         </div>
                         <div class="rule-patterns">
+                            ${rule.only_from_bots ? `<span class="rule-tag">仅机器人</span>` : ''}
                             ${(rule.from_users || []).length ? `<span class="rule-tag">白名单 ${(rule.from_users || []).length}</span>` : ''}
                             ${(rule.exclude_users || []).length ? `<span class="rule-tag rule-tag-block">黑名单 ${(rule.exclude_users || []).length}</span>` : ''}
                         </div>
@@ -1481,6 +1490,7 @@
         document.getElementById('rule-id').disabled = false;
         document.getElementById('rule-name').value = '';
         document.getElementById('rule-enabled').checked = true;
+        document.getElementById('rule-only-bots').checked = false;
         document.getElementById('match-mode').value = 'regex';
         document.getElementById('match-fields').value = 'text-caption';
         document.getElementById('ignore-case').checked = true;
@@ -1523,6 +1533,7 @@
         document.getElementById('rule-id').disabled = true;
         document.getElementById('rule-name').value = rule.name || '';
         document.getElementById('rule-enabled').checked = rule.enabled;
+        document.getElementById('rule-only-bots').checked = !!rule.only_from_bots;
         document.getElementById('match-mode').value = rule.match?.mode || 'regex';
         document.getElementById('ignore-case').checked = rule.match?.ignore_case !== false;
         document.getElementById('forward-mode').value = rule.mode || 'copy';
@@ -1588,6 +1599,7 @@
             targets: tagInputs.targets,
             from_users: tagInputs.from_users,
             exclude_users: tagInputs.exclude_users,
+            only_from_bots: document.getElementById('rule-only-bots').checked,
             match: {
                 mode: mode,
                 patterns: tagInputs.patterns,

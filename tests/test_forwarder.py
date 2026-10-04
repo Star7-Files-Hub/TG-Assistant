@@ -260,6 +260,16 @@ class TestPreparedRule:
         prepared = PreparedRule.build(build_config().forward.rules[0])
         assert not prepared.sender_allowed(1, None, True)[0]
 
+    @pytest.mark.parametrize("is_bot", [True, False])
+    def test_only_from_bots_sender_filter(self, is_bot):
+        prepared = PreparedRule.build(
+            build_config(only_from_bots=True).forward.rules[0]
+        )
+        allowed, reason = prepared.sender_allowed(1, None, False, is_bot=is_bot)
+        assert allowed is is_bot
+        if not is_bot:
+            assert "only_from_bots" in reason
+
     def test_min_interval(self, monkeypatch):
         prepared = PreparedRule.build(build_config(min_interval=10).forward.rules[0])
         assert prepared.interval_ok(100.0)[0]
@@ -282,6 +292,62 @@ class TestForwardEngine:
         assert call["from_chat_id"] == SRC
         assert call["message_ids"] == 100
         assert engine.stats["forwarded"] == 1
+
+    @pytest.mark.asyncio
+    async def test_only_from_bots_forwards_bot_sender(self, client, alog):
+        engine = ForwardEngine(client, build_config(only_from_bots=True), alog)
+        engine.register()
+        engine._handle(
+            src_message("关键词123", sender=FakeUser(777, is_bot=True)), edited=False
+        )
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert engine.rules[0].stats["bot_rejected"] == 0
+
+    @pytest.mark.asyncio
+    async def test_only_from_bots_rejects_human_sender_and_counts(self, client, alog):
+        engine = ForwardEngine(client, build_config(only_from_bots=True), alog)
+        engine.register()
+        engine._handle(
+            src_message("关键词123", sender=FakeUser(777, is_bot=False)), edited=False
+        )
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.rules[0].stats["skipped"] == 1
+        assert engine.rules[0].stats["bot_rejected"] == 1
+        assert engine.rules[0].stats["matched"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_bot", [True, False])
+    async def test_only_from_bots_disabled_keeps_sender_behavior(self, client, alog, is_bot):
+        engine = ForwardEngine(client, build_config(), alog)
+        engine.register()
+        engine._handle(
+            src_message("关键词123", sender=FakeUser(777, is_bot=is_bot)), edited=False
+        )
+        await drain(engine)
+
+        assert len(client.forwarded) == 1
+        assert engine.rules[0].stats["bot_rejected"] == 0
+
+    @pytest.mark.asyncio
+    async def test_only_from_bots_rejects_channel_sender_chat(self, client, alog):
+        engine = ForwardEngine(client, build_config(only_from_bots=True, sources=[CH_SRC]), alog)
+        engine.register()
+        # 频道消息没有 from_user；sender_of 回退 sender_chat，并将 is_bot 设为 False。
+        message = make_message(
+            "关键词123",
+            chat=FakeChat(CH_SRC, title="来源频道", chat_type="channel"),
+            sender=None,
+            sender_chat=FakeChat(CH_SRC, title="发布频道", chat_type="channel"),
+        )
+        engine._handle(message, edited=False)
+        await drain(engine)
+
+        assert client.forwarded == []
+        assert engine.rules[0].stats["bot_rejected"] == 1
 
     @pytest.mark.asyncio
     async def test_no_forward_on_miss(self, client, alog):

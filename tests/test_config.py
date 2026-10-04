@@ -183,6 +183,13 @@ class TestForwardRule:
         rule = ForwardRule(id="r", targets=["me"], mode="text", match={"mode": "all"})
         assert rule.mode == "text"
 
+    def test_only_from_bots_defaults_false_and_accepts_true(self):
+        base = ForwardRule(id="r", targets=["me"], match={"mode": "all"})
+        assert base.only_from_bots is False
+        assert ForwardRule(
+            id="r2", targets=["me"], match={"mode": "all"}, only_from_bots=True
+        ).only_from_bots is True
+
 
 class TestAutoRuleId:
     """转发规则的 id 也不必填（用户原话：「ID 不要必填」）。

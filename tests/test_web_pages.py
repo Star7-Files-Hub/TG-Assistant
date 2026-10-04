@@ -1457,6 +1457,23 @@ def test_rules_page_does_not_block_a_blank_rule_id() -> None:
     assert "if (!id)" not in save, "id 留空时保存路径不能提前 return"
 
 
+def test_rules_page_exposes_only_from_bots() -> None:
+    """转发规则可以**可选**地只抓机器人消息（用户要求）。
+
+    字段名必须是 ``only_from_bots``、且放在规则对象**顶层**：后端是
+    ``extra="forbid"``，名字写错或塞进 ``match`` 里都会直接 400。
+    编辑时要能回填（老规则没这个字段按未勾选），新建时要复位成不勾 ——
+    少了复位，上一条规则勾过之后新建的规则会"继承"这个开关。
+    """
+    html = (_WEB_DIR / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    assert 'id="rule-only-bots"' in html
+    assert "只抓取机器人消息" in html
+    assert "only_from_bots" in _js_function_body(html, "saveRule"), "保存时要带进 payload"
+    assert "only_from_bots" in _js_function_body(html, "editRule"), "编辑时要回填"
+    assert "rule-only-bots" in _js_function_body(html, "openAddRule"), "新建时要复位"
+
+
 # --------------------------------------------------------------------------- #
 # 规则页：「全局排除」区块（所有账号共用一份）
 # --------------------------------------------------------------------------- #

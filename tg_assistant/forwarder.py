@@ -739,6 +739,7 @@ class PreparedRule:
     exclude_sources: RefSet
     from_users: RefSet
     exclude_users: RefSet
+    only_from_bots: bool
     #: 转发目标集合。**只用于"目标不能当来源"的防循环判断**，不参与其它筛选。
     targets: RefSet
     last_fired: float = 0.0
@@ -751,6 +752,8 @@ class PreparedRule:
             #: 会话层就被拒的次数（来源不匹配 / 被排除 / 私聊 / 命中「目标不能当来源」）。
             #: 规则配了却不生效时，这个数字是线上**唯一**能一眼看出问题的信号。
             "chat_rejected": 0,
+            #: only_from_bots 拒绝的人类消息数，便于 status 解释规则为何没有转发。
+            "bot_rejected": 0,
         }
     )
 
@@ -763,6 +766,7 @@ class PreparedRule:
             exclude_sources=RefSet(rule.exclude_sources),
             from_users=RefSet(rule.from_users),
             exclude_users=RefSet(rule.exclude_users),
+            only_from_bots=rule.only_from_bots,
             targets=RefSet(rule.targets),
         )
 
@@ -810,10 +814,20 @@ class PreparedRule:
         return True, ""
 
     def sender_allowed(
-        self, sender_id: Optional[int], username: Optional[str], is_self: bool
+        self,
+        sender_id: Optional[int],
+        username: Optional[str],
+        is_self: bool,
+        is_bot: bool = False,
     ) -> tuple[bool, str]:
         if self.rule.ignore_self and is_self:
             return False, "忽略自己发送的消息（ignore_self）"
+        # sender_of 对频道消息只能回退到 sender_chat，并明确标为非 bot；因此开启此项时频道消息会跳过。
+        if self.only_from_bots and not is_bot:
+            # 计数器**就地** +1：调用方只拿得到 (allowed, reason)，让它去比对原因字符串
+            # 会变成「改一句文案就静默失效」的隐患。
+            self.stats["bot_rejected"] += 1
+            return False, "只抓取机器人消息（only_from_bots）"
         if self.exclude_users and self.exclude_users.matches(sender_id, username, is_self=is_self):
             return False, "发送者在 exclude_users 中"
         if self.from_users and not self.from_users.matches(sender_id, username, is_self=is_self):
@@ -1318,7 +1332,9 @@ class ForwardEngine:
 
         is_service = bool(getattr(message, "service", None))
         kind = chat_kind(message)
-        sender_id, sender_username, is_self, _is_bot = sender_of(message)
+        # sender_of 从 from_user 提供 is_bot；频道无 from_user 时回退 sender_chat 并为 False，
+        # 这是 only_from_bots 下跳过频道消息的预期语义。
+        sender_id, sender_username, is_self, is_bot = sender_of(message)
         now = time.monotonic()
 
         # 顺带学「哪些码已经被用掉了」—— 只读正文，不改任何转发路径。
@@ -1381,8 +1397,9 @@ class ForwardEngine:
                     message_id=message_id,
                 )
                 continue
-            allowed, reason = prepared.sender_allowed(sender_id, sender_username, is_self)
+            allowed, reason = prepared.sender_allowed(sender_id, sender_username, is_self, is_bot)
             if not allowed:
+                # bot_rejected 由 sender_allowed 自己计（它才知道是哪条分支拒的）。
                 prepared.stats["skipped"] += 1
                 self.alog.debug(
                     "跳过消息", rule=prepared.label, reason=reason, chat=chat_title, message_id=message_id
