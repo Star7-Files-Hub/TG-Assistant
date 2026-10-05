@@ -218,6 +218,11 @@ class FakeClient:
         self.chat_lookups: list[Any] = []
         #: 让 ``get_chat`` 抛错用。
         self.get_chat_error: Optional[BaseException] = None
+        #: ``get_messages`` 的「message_id → 消息对象」登记表（踩踏清理轮询读 reaction 用）。
+        #: 查不到（不在表里）就返回 ``None``，与真实客户端「消息已被删掉」一致。
+        self.messages: dict[int, Any] = {}
+        #: 让 ``get_messages`` 抛错用（测「整批失败不能让轮询循环挂掉」）。
+        self.get_messages_error: Optional[BaseException] = None
 
     # --- handler 管理 ---
     def add_handler(self, handler: Any, group: int = 0) -> tuple[Any, int]:
@@ -280,6 +285,19 @@ class FakeClient:
         self.calls.append(("delete_messages", kwargs))
         ids = kwargs.get("message_ids")
         return len(ids) if isinstance(ids, (list, tuple)) else 1
+
+    async def get_messages(self, chat_id: Any, message_ids: Any = None, **kwargs: Any) -> Any:
+        """读消息替身 —— 踩踏清理的轮询靠它读 reaction 计数。
+
+        传列表就回列表（与真实客户端一致），查不到的位置给 ``None``
+        （真实客户端对「已被删掉的消息」就是这么回的）。
+        """
+        if self.get_messages_error is not None:
+            raise self.get_messages_error
+        self.calls.append(("get_messages", {"chat_id": chat_id, "message_ids": message_ids}))
+        if isinstance(message_ids, (list, tuple)):
+            return [self.messages.get(int(i)) for i in message_ids]
+        return self.messages.get(int(message_ids))
 
     async def get_chat(self, chat_id: Any) -> Any:
         """会话解析替身。

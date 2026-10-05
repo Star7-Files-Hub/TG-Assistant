@@ -1474,6 +1474,31 @@ def test_rules_page_exposes_only_from_bots() -> None:
     assert "rule-only-bots" in _js_function_body(html, "openAddRule"), "新建时要复位"
 
 
+def test_rules_page_exposes_trash_cleanup() -> None:
+    """规则面板要能配「被踩 💩 达到人数就删」（用户要求）。
+
+    三个字段同样必须在规则对象**顶层**且名字精确（后端 ``extra="forbid"``）。
+    另外两点容易漏：阈值必须是**数字**（发字符串会被 pydantic 拒掉），
+    老规则缺字段时回填要跟后端默认值一致 —— 否则用户打开编辑器再点保存，
+    就把默认的「开启 / 💩 / 2」改成别的东西了。
+    """
+    html = (_WEB_DIR / "templates" / "rules.html").read_text(encoding="utf-8")
+
+    for element_id in ("rule-trash-cleanup", "rule-trash-emoji", "rule-trash-threshold"):
+        assert f'id="{element_id}"' in html, f"缺少 {element_id} 控件"
+
+    save = _js_function_body(html, "saveRule")
+    for field in ("trash_cleanup", "trash_emoji", "trash_threshold"):
+        assert field in save, f"保存时要带 {field}"
+    assert "parseInt" in save, "阈值必须是数字，不能把字符串发上去"
+
+    edit = _js_function_body(html, "editRule")
+    assert "trash_cleanup" in edit and "trash_threshold" in edit, "编辑时要回填"
+
+    add = _js_function_body(html, "openAddRule")
+    assert "rule-trash-cleanup" in add and "rule-trash-threshold" in add, "新建时要复位成默认值"
+
+
 # --------------------------------------------------------------------------- #
 # 规则页：「全局排除」区块（所有账号共用一份）
 # --------------------------------------------------------------------------- #

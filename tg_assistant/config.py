@@ -332,6 +332,26 @@ class ForwardRule(StrictModel):
     notify: bool = True
     #: 目标消息静音发送。
     silent: bool = False
+    #: 是否启用「被踩够人数就删」（默认 >= 2 个**不同用户**点了 :attr:`trash_emoji`）。
+    #: 用户原话：「当有大于2用户点💩删信息，并将原文链接一同删除」，口径定为「含 2」。
+    #: 删的是**目标频道**里那条转发 + 它下方补发的 🔗原文链接，源频道原消息不动。
+    trash_cleanup: bool = True
+    trash_emoji: str = "💩"
+    #: ``<= 0`` 表示永不删除（面板最小给 1）。
+    trash_threshold: int = 2
+
+    @field_validator("trash_emoji", mode="before")
+    @classmethod
+    def _normalize_trash_emoji(cls, value: Any) -> str:
+        """留空就回落到 💩。
+
+        空串会让匹配**永远不成立**（reaction 里不可能有空表情），而面板上又看不出
+        哪里不对 —— 属于典型的静默失效，宁可直接给默认值。
+        """
+        if value is None:
+            return "💩"
+        text = str(value).strip()
+        return text or "💩"
 
     @field_validator("id", mode="before")
     @classmethod

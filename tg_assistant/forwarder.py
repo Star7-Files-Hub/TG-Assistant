@@ -62,6 +62,7 @@ from .client import SessionInvalid, with_flood_retry
 from .forward_excludes import ForwardExcludeStore
 from .forward_used_codes import ForwardUsedCodesStore
 from .metrics import MetricsStore
+from .trash_cleanup import TrashWatchStore, should_delete
 from .config import AccountConfig, ChatRef, ForwardRule
 from .logging_setup import AccountLogger
 from .matching import (
@@ -950,6 +951,14 @@ class ForwardEngine:
         self._last_reload_check = 0.0
         self._handlers: list[tuple[Any, int]] = []
         self._tasks: set[asyncio.Task[None]] = set()
+        trash_path = None
+        if store is not None and account is not None:
+            try:
+                trash_path = store.paths.account(account).root / "trash_watch.json"
+            except Exception:
+                trash_path = None
+        self._trash_store = TrashWatchStore(trash_path)
+        self._trash_task: asyncio.Task[None] | None = None
         self._media_groups: dict[tuple[int, str], MediaGroupBuffer] = {}
         self._lock = asyncio.Lock()
         self.stats = {
@@ -979,6 +988,7 @@ class ForwardEngine:
             #: 因为内容里的码**已经被用掉**而没转发的次数。
             #: 只统计"本来真要发出去"的：认通知是全量的，不能拿它刷数字。
             "used_skipped": 0,
+            "trash_deleted": 0,
         }
         #: 「已被用掉的注册码」记忆（学使用通知 + 转发前比对）。
         #: 记忆本身也是**跨账号一份**（``data/used_codes.json``）：任一账号看到
@@ -1250,6 +1260,83 @@ class ForwardEngine:
                     chats.append(source)
         return chats
 
+    async def _poll_trash_once(self) -> None:
+        """批量轮询目标频道 reaction，达到阈值就删。
+
+        🔴 为什么是轮询而不是事件回调：kurigram 2.2.25 的 layer 里**没有**
+        ``UpdateChannelMessageReactions``，频道里的 reaction 计数更新根本解不出来
+        （pyrogram 的 ``on_message_reaction_count`` 对应的是 ``UpdateBotMessageReactions``，
+        只有 bot 账号收得到）。批量 ``getMessages`` 一次能问 100 条，成本可以忽略。
+
+        只删**目标频道这两条**（那条转发 + 它下方补发的 🔗原文链接），源频道里的原消息不动。
+        """
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for item in self._trash_store.items():
+            grouped.setdefault(int(item["chat_id"]), []).append(item)
+        for chat_id, items in grouped.items():
+            for start in range(0, len(items), 100):
+                batch = items[start:start + 100]
+                try:
+                    messages = await self.client.get_messages(
+                        chat_id=chat_id, message_ids=[int(x["message_id"]) for x in batch]
+                    )
+                    if not isinstance(messages, (list, tuple)):
+                        messages = [messages]
+                    for item, message in zip(batch, messages):
+                        if not message:
+                            # 已经被人手动删了：记录没有意义，清掉。
+                            self._trash_store.forget(chat_id, int(item["message_id"]))
+                            continue
+                        rule = next((r.rule for r in self.rules if r.id == item.get("rule_id")), None)
+                        if rule is None or not rule.trash_cleanup:
+                            self._trash_store.forget(chat_id, int(item["message_id"]))
+                            continue
+                        reactions = getattr(getattr(message, "reactions", None), "reactions", None)
+                        if should_delete(reactions, rule.trash_threshold, rule.trash_emoji):
+                            # delete_ids 是相册整组（单条消息时就是它自己）；链接那条单独补。
+                            ids = [int(i) for i in (item.get("delete_ids") or [item["message_id"]])]
+                            if item.get("link_message_id") is not None:
+                                ids.append(int(item["link_message_id"]))
+                            ids = list(dict.fromkeys(ids))
+                            try:
+                                # ⚠️ 一律用关键字调用：仓库里的假客户端（tests/conftest.py）
+                                # 就是 ``async def delete_messages(self, **kwargs)``，
+                                # 传位置参数会 TypeError，而这里又把异常吞掉 ⇒ 删除**静默失败**。
+                                await self.client.delete_messages(chat_id=chat_id, message_ids=ids)
+                                self.stats["trash_deleted"] += 1
+                                self.alog.info(
+                                    "踩到阈值，删除目标频道的转发与原文链接",
+                                    chat_id=chat_id,
+                                    message_ids=ids,
+                                    rule=rule.label,
+                                )
+                                self._trash_store.forget(chat_id, int(item["message_id"]))
+                            except Exception as exc:
+                                # 删除失败**保留记录**，下一轮还会重试（权限/限流都可能是一时的）。
+                                self.alog.warning(
+                                    "删除踩踏转发失败，保留记录重试",
+                                    chat_id=chat_id,
+                                    error=f"{type(exc).__name__}: {exc}",
+                                )
+                except Exception as exc:
+                    # 整批失败（没权限 / 限流 / 会话抖动）不能让轮询循环挂掉。
+                    self.alog.warning(
+                        "轮询踩踏 reaction 失败",
+                        chat_id=chat_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+
+    async def _trash_cleanup_loop(self) -> None:
+        while True:
+            try:
+                await self._poll_trash_once()
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.alog.warning("踩踏清理循环异常，继续运行", error=f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(60)
+
     def register(self) -> None:
         """注册消息处理器。必须在 client 启动前或启动后立即调用。"""
         if not self.enabled:
@@ -1266,6 +1353,11 @@ class ForwardEngine:
             message_filter = filters.group | filters.channel
         handler = MessageHandler(self._on_message, message_filter)
         self._handlers.append(self.client.add_handler(handler, group=self.HANDLER_GROUP))
+        if self._trash_task is None or self._trash_task.done():
+            # 🔴 这个轮询任务是**永不结束**的循环，绝不能放进 ``self._tasks``：
+            # ``close()`` 会 ``gather(*self._tasks)``，放进去就等于关服务时永远等下去
+            # （测试里的 ``drain()`` 也会一起挂死）。它由 ``close()`` 单独 cancel。
+            self._trash_task = asyncio.create_task(self._trash_cleanup_loop(), name="forward-trash-cleanup")
 
         if any(prepared.rule.include_edited for prepared in self.rules):
             edited = EditedMessageHandler(self._on_edited, message_filter)
@@ -1297,6 +1389,9 @@ class ForwardEngine:
             with contextlib.suppress(Exception):
                 self.client.remove_handler(handler, group)
         self._handlers.clear()
+        if self._trash_task is not None:
+            self._trash_task.cancel()
+            self._trash_task = None
 
         for buffer in list(self._media_groups.values()):
             if buffer.task is not None:
@@ -1722,6 +1817,33 @@ class ForwardEngine:
                 self._recent.add(fingerprint, target, text)
                 for sent_id in sent_ids:
                     delivered.append((target, sent_id))
+                # 只追踪目标频道发出的消息；forward 的链接是**最后**补发的那条
+                # （_send_to_target 里 `sent = [*sent, *await _forward_link_note()]`），
+                # 其余 id 才是内容本身。记录落盘是因为 reaction 可能数小时后才出现，
+                # 且进程随时会重启。
+                if rule.trash_cleanup and sent_ids:
+                    # 轮询需要 chat_id 数字；@username 目标无法可靠反查，跳过（当前目标都是数字 id）。
+                    try:
+                        target_chat_id = int(target)
+                    except (TypeError, ValueError):
+                        target_chat_id = None
+                    if target_chat_id is not None:
+                        link_id = (
+                            sent_ids[-1]
+                            if rule.mode == "forward" and rule.include_source_link and len(sent_ids) >= 2
+                            else None
+                        )
+                        content_ids = [int(i) for i in (sent_ids[:-1] if link_id is not None else sent_ids)]
+                        # 相册会转发成多条：**每条都记一笔**（都指向同一组待删 id），
+                        # 这样用户在相册的任意一条上点踩都能整组删掉，而不是只删掉第一条。
+                        for content_id in content_ids:
+                            self._trash_store.record(
+                                target_chat_id,
+                                content_id,
+                                link_message_id=link_id,
+                                rule_id=rule.id,
+                                delete_ids=content_ids,
+                            )
 
                 pipeline_ms = _pipeline_ms(message)
                 self.alog.info(

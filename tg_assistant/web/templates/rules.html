@@ -309,6 +309,26 @@
                             <span>附带来源链接（copy / text 写在正文末尾；forward 在下方单独补一条）</span>
                         </label>
                     </div>
+                    <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);">
+                        <label class="tg-checkbox">
+                            <input id="rule-trash-cleanup" type="checkbox" checked />
+                            <span class="tg-checkmark"></span>
+                            <span>被踩 💩 达到人数就删除</span>
+                        </label>
+                        <p class="form-hint" style="margin-top: 4px;">
+                            达到该人数的不同用户在目标频道点了这个表情后，会删掉那条转发消息以及它下方那条「🔗原文链接」；只删目标频道这两条，不动源频道原消息。
+                        </p>
+                        <div class="form-grid" style="margin-top: 10px;">
+                            <div class="tg-input-group">
+                                <label>触发删除表情</label>
+                                <input id="rule-trash-emoji" type="text" value="💩" placeholder="💩" />
+                            </div>
+                            <div class="tg-input-group">
+                                <label>触发删除人数（不同用户数 ≥）</label>
+                                <input id="rule-trash-threshold" type="number" value="2" min="1" step="1" />
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -723,7 +743,10 @@
                             <span class="tg-checkmark"></span>
                         </label>
                         <div>
-                            <div class="rule-name">${escapeHtml(rule.name || rule.id)}</div>
+                            <div class="rule-name">
+                                ${escapeHtml(rule.name || rule.id)}
+                                ${rule.trash_cleanup !== false ? `<span class="rule-tag" style="margin-left:6px;" title="被踩 ${escapeHtml(rule.trash_emoji || '💩')} ≥ ${escapeHtml(rule.trash_threshold !== undefined && rule.trash_threshold !== null ? rule.trash_threshold : 2)} 人自动清理">💩清理 ≥${escapeHtml(rule.trash_threshold !== undefined && rule.trash_threshold !== null ? rule.trash_threshold : 2)}</span>` : ''}
+                            </div>
                             <div class="rule-id">${escapeHtml(rule.id)}</div>
                         </div>
                     </div>
@@ -1501,6 +1524,9 @@
         document.getElementById('rule-silent').checked = false;
         document.getElementById('rule-media-group').checked = true;
         document.getElementById('rule-include-link').checked = true;
+        document.getElementById('rule-trash-cleanup').checked = true;
+        document.getElementById('rule-trash-emoji').value = '💩';
+        document.getElementById('rule-trash-threshold').value = '2';
         document.getElementById('test-text').value = '';
         document.getElementById('test-result').innerHTML = '';
         clearAllTags();
@@ -1543,6 +1569,9 @@
         document.getElementById('rule-silent').checked = rule.silent || false;
         document.getElementById('rule-media-group').checked = rule.media_group !== false;
         document.getElementById('rule-include-link').checked = rule.include_source_link !== false;
+        document.getElementById('rule-trash-cleanup').checked = rule.trash_cleanup !== false;
+        document.getElementById('rule-trash-emoji').value = rule.trash_emoji !== undefined && rule.trash_emoji !== null ? rule.trash_emoji : '💩';
+        document.getElementById('rule-trash-threshold').value = rule.trash_threshold !== undefined && rule.trash_threshold !== null ? rule.trash_threshold : 2;
         document.getElementById('test-text').value = '';
         document.getElementById('test-result').innerHTML = '';
         // fields
@@ -1613,7 +1642,13 @@
             notify: document.getElementById('rule-notify').checked,
             silent: document.getElementById('rule-silent').checked,
             media_group: document.getElementById('rule-media-group').checked,
-            include_source_link: document.getElementById('rule-include-link').checked
+            include_source_link: document.getElementById('rule-include-link').checked,
+            trash_cleanup: document.getElementById('rule-trash-cleanup').checked,
+            trash_emoji: document.getElementById('rule-trash-emoji').value.trim() || '💩',
+            trash_threshold: (() => {
+                const parsed = parseInt(document.getElementById('rule-trash-threshold').value, 10);
+                return isNaN(parsed) || parsed < 1 ? 2 : parsed;
+            })()
         };
 
         // 编辑：先把「内容」写到仍在监听的账号，再把勾选框的**差集**落成增 / 删。

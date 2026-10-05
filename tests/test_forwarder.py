@@ -3683,3 +3683,161 @@ class TestDuplicateRegression:
         await drain(engine)
         assert len(client.forwarded) == 1, "🔴 目标里已经有这条内容了，不能再发一遍"
         assert engine.stats["pair_blocked"] == 2, "同内容的群组消息再来一条，照样拦掉"
+
+
+class TestTrashCleanup:
+    """被踩 💩 达到人数就删：目标频道那条转发 + 它下方那条 🔗原文链接。
+
+    用户原话：「当有大于2用户点💩删信息，并将原文链接一同删除」，口径定为「含 2」
+    （即 >= 2 个**不同用户**）。
+
+    🔴 检测走**轮询**而不是事件回调：kurigram 2.2.25 的 layer 里没有
+    ``UpdateChannelMessageReactions``，频道里的 reaction 计数更新根本解不出来
+    （``on_message_reaction_count`` 对应的是 ``UpdateBotMessageReactions``，只有 bot
+    收得到）。所以测试直接调 ``_poll_trash_once()``，不依赖任何 handler。
+    """
+
+    @staticmethod
+    def _msg(emoji: str, count: int) -> Any:
+        """伪造 ``message.reactions``。
+
+        🔴 真实结构是**两层**：``message.reactions`` 是 ``MessageReactions`` 对象，
+        里面才是 ``.reactions`` 列表（本机 2.2.25 实测）。只造一层的话轮询读到
+        ``None``，测试会**假绿** —— 什么都删不掉却全过。
+        """
+        return types.SimpleNamespace(
+            reactions=types.SimpleNamespace(
+                reactions=[types.SimpleNamespace(emoji=emoji, count=count)]
+            )
+        )
+
+    @staticmethod
+    def _watching(client: FakeClient, alog, *, message_id: int = 501, link_id: int | None = 502,
+                  delete_ids: Optional[list[int]] = None, **rule_overrides) -> ForwardEngine:
+        engine = ForwardEngine(client, build_config(**rule_overrides), alog)
+        engine._trash_store.record(
+            DST, message_id, link_message_id=link_id, rule_id="r1", delete_ids=delete_ids
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_reaching_threshold_deletes_forward_and_link(self, client, alog):
+        engine = self._watching(client, alog)
+        client.messages[501] = self._msg("💩", 2)
+
+        await engine._poll_trash_once()
+
+        assert client.deleted == [{"chat_id": DST, "message_ids": [501, 502]}], (
+            "必须**同时**删掉那条转发和它下方的原文链接"
+        )
+        assert engine.stats["trash_deleted"] == 1
+        assert engine._trash_store.get(DST, 501) is None, "删完要清记录，否则每轮都重复删"
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_deletes_nothing(self, client, alog):
+        """只有 1 个人踩（阈值 2）时什么都不该发生 —— 记录也必须留着等第二个人。"""
+        engine = self._watching(client, alog)
+        client.messages[501] = self._msg("💩", 1)
+
+        await engine._poll_trash_once()
+
+        assert client.deleted == []
+        assert engine.stats["trash_deleted"] == 0
+        assert engine._trash_store.get(DST, 501) is not None
+
+    @pytest.mark.asyncio
+    async def test_other_emoji_does_not_trigger(self, client, alog):
+        engine = self._watching(client, alog)
+        client.messages[501] = self._msg("👍", 99)
+
+        await engine._poll_trash_once()
+
+        assert client.deleted == []
+
+    @pytest.mark.asyncio
+    async def test_album_deletes_every_message_in_the_group(self, client, alog):
+        """相册会转发成多条：踩任意一条都要**整组**删掉，不能只删第一条。"""
+        engine = self._watching(client, alog, message_id=502, link_id=504, delete_ids=[501, 502, 503])
+        client.messages[502] = self._msg("💩", 2)
+
+        await engine._poll_trash_once()
+
+        assert client.deleted[0]["message_ids"] == [501, 502, 503, 504]
+
+    @pytest.mark.asyncio
+    async def test_message_already_gone_drops_the_record(self, client, alog):
+        """消息被手动删掉后 ``get_messages`` 回 None —— 不能崩，记录也该清掉。"""
+        engine = self._watching(client, alog)  # client.messages 里没有 501
+
+        await engine._poll_trash_once()
+
+        assert client.deleted == []
+        assert engine._trash_store.get(DST, 501) is None
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_keeps_record_for_retry(self, client, alog):
+        """删除失败（权限/限流都可能是一时的）要**保留记录**，下一轮再试。"""
+        client.delete_error = RuntimeError("CHAT_ADMIN_REQUIRED")
+        engine = self._watching(client, alog)
+        client.messages[501] = self._msg("💩", 2)
+
+        await engine._poll_trash_once()
+
+        assert engine._trash_store.get(DST, 501) is not None, "失败就该留着重试"
+
+    @pytest.mark.asyncio
+    async def test_poll_failure_does_not_raise(self, client, alog):
+        """整批读取失败不能让轮询循环挂掉（否则这个功能会静默死掉）。"""
+        client.get_messages_error = RuntimeError("FLOOD_WAIT")
+        engine = self._watching(client, alog)
+
+        await engine._poll_trash_once()  # 不抛异常即通过
+
+    @pytest.mark.asyncio
+    async def test_rule_switched_off_drops_the_record(self, client, alog):
+        engine = self._watching(client, alog, trash_cleanup=False)
+        client.messages[501] = self._msg("💩", 99)
+
+        await engine._poll_trash_once()
+
+        assert client.deleted == []
+        assert engine._trash_store.get(DST, 501) is None
+
+    @pytest.mark.asyncio
+    async def test_forward_success_records_the_link_message_id(self, client, alog):
+        """转发成功后要把「链接那条」记下来 —— 真实链路是
+        ``sent = [*sent, *await _forward_link_note()]``，即链接是**最后**一个 id。
+
+        顺序记错就会把内容消息当成链接删掉（或者反过来漏删）。
+        """
+        engine = ForwardEngine(client, build_config(mode="forward"), alog)
+        engine.register()
+        engine._handle(src_message("关键词123"), edited=False)
+        await drain(engine)
+
+        items = engine._trash_store.items()
+        assert len(items) == 1, "转发成功就该被追踪（默认开启）"
+        item = items[0]
+        assert item["chat_id"] == DST
+        assert item["rule_id"] == "r1"
+        assert item["link_message_id"] == client.next_message_id, (
+            "link_message_id 必须是补发链接那条的 id（假客户端里就是最后一个分配的 id）"
+        )
+        assert item["delete_ids"] == [item["message_id"]]
+        await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_polling_task_is_kept_out_of_tasks_set(self, client, alog):
+        """🔴 回归：轮询任务是**永不结束**的循环，不能放进 ``self._tasks``。
+
+        ``close()`` 会 ``await gather(*self._tasks)`` —— 放进去就等于关服务时永远
+        等下去（测试里的 ``drain()`` 也会一起挂死）。
+        """
+        engine = ForwardEngine(client, build_config(), alog)
+        engine.register()
+
+        assert engine._trash_task is not None
+        assert engine._trash_task not in engine._tasks
+
+        await engine.close()
+        assert engine._trash_task is None, "close() 必须把它 cancel 掉"

@@ -190,6 +190,26 @@ class TestForwardRule:
             id="r2", targets=["me"], match={"mode": "all"}, only_from_bots=True
         ).only_from_bots is True
 
+    def test_trash_cleanup_defaults_match_what_the_user_asked_for(self):
+        """用户原话：「当有大于2用户点💩删信息，并将原文链接一同删除」。
+
+        默认就是用户要的行为（不用改任何配置就生效），口径是「含 2」。
+        """
+        rule = ForwardRule(id="r", targets=["me"], match={"mode": "all"})
+
+        assert rule.trash_cleanup is True
+        assert rule.trash_emoji == "💩"
+        assert rule.trash_threshold == 2
+
+    def test_blank_trash_emoji_falls_back_to_the_default(self):
+        """表情留空必须回落成 💩 —— 空串会让匹配永远不成立（静默失效）。"""
+        assert ForwardRule(
+            id="r", targets=["me"], match={"mode": "all"}, trash_emoji="   "
+        ).trash_emoji == "💩"
+        assert ForwardRule(
+            id="r", targets=["me"], match={"mode": "all"}, trash_emoji=None
+        ).trash_emoji == "💩"
+
 
 class TestAutoRuleId:
     """转发规则的 id 也不必填（用户原话：「ID 不要必填」）。
